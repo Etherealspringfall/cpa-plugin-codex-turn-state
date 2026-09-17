@@ -49,6 +49,9 @@ const (
 	// scripts/probe.py would invite exactly the wrong conclusion from a green
 	// result. See selftestNote.
 	routeSelftest = "/codex-turn-state/selftest"
+	// routeDashboard is relative to the plugin's own resource prefix, so the
+	// browser-facing URL is /v0/resource/plugins/codex-turn-state/dashboard.
+	routeDashboard = "/dashboard"
 )
 
 // managementRegister answers management.register with the route table.
@@ -68,7 +71,12 @@ func managementRegister(raw []byte) ([]byte, error) {
 		},
 		Resources: []pluginapi.ResourceRoute{
 			{
-				Path:        "/",
+				// Not "/". normalizeResourceRoute trims trailing slashes and
+				// rejects the empty result, so registering the plugin root
+				// drops the route with no log line -- the only symptom is a
+				// 404 at request time, long after the registration that
+				// silently discarded it.
+				Path:        routeDashboard,
 				Menu:        "Codex Turn-State",
 				Description: "探测/业务状态看板：桶就绪度、角色、dry_run",
 			},
