@@ -1226,6 +1226,202 @@ func TestStatusBucketLenIsALengthNotAValue(t *testing.T) {
 	}
 }
 
+// --- 6b. upstream error classification -----------------------------------
+//
+// reached is decided in three tiers, and the whole point is to stop a working
+// path being reported as a broken one:
+//
+//	1. an upstream error body parses   -> reached, because only the upstream
+//	                                      produces that schema
+//	2. "failed with status N" is found -> reached, with the code
+//	3. neither                         -> a genuine transport failure
+//
+// handleSelftest bails at the host-availability check long before it gets here,
+// so these exercise the two classifiers directly. They are unexported but in
+// this package, so no seam is needed.
+
+// The messages below were captured from the real deployment, not invented.
+// Keeping the exact strings matters: the classifier is parsing someone else's
+// output, and a plausible-looking paraphrase would test a format nobody sends.
+const (
+	// Observed verbatim on OVH.
+	msgOverloaded = `host_call_failed: {"error":{"type":"service_unavailable_error","code":"server_is_overloaded","message":"Our servers are currently overloaded. Please try again later.","param":null},"sequence_number":2}`
+	// Observed on OVH; the message text was truncated in capture, so it is
+	// completed here. The error fields -- the only part the classifier reads --
+	// are as recorded.
+	msgServerError = `host_call_failed: {"error":{"type":"server_error","code":"server_error","message":"An error occurred while processing your request.","param":null},"sequence_number":1}`
+)
+
+func TestUpstreamErrorClassification(t *testing.T) {
+	cases := []struct {
+		name       string
+		message    string
+		wantBody   bool
+		wantCode   string
+		wantType   string
+		wantStatus int  // 0 when no status should be recovered
+		wantOKStat bool //nolint:revive // mirrors the classifier's second return
+	}{
+		{
+			// The case this whole tier exists for. server_is_overloaded is the
+			// same signal as a 312 degraded state (FINDINGS.md): recovering the
+			// code is what tells an operator to wait rather than to go hunting
+			// for a broken link. Reported as reached=false, it sent people to
+			// check the network while the real answer was "it is overloaded".
+			name:     "overloaded, no status",
+			message:  msgOverloaded,
+			wantBody: true,
+			wantCode: "server_is_overloaded",
+			wantType: "service_unavailable_error",
+		},
+		{
+			name:     "server_error, no status",
+			message:  msgServerError,
+			wantBody: true,
+			wantCode: "server_error",
+			wantType: "server_error",
+		},
+		{
+			name:       "body and status together",
+			message:    `host_call_failed: {"error":{"type":"rate_limit_error","code":"rate_limit_exceeded","message":"slow down"}} failed with status 429`,
+			wantBody:   true,
+			wantCode:   "rate_limit_exceeded",
+			wantType:   "rate_limit_error",
+			wantStatus: 429,
+			wantOKStat: true,
+		},
+		{
+			name:       "status only, no body",
+			message:    "host_call_failed: request failed with status 502",
+			wantBody:   false,
+			wantStatus: 502,
+			wantOKStat: true,
+		},
+		{
+			// Tier 3: nothing recoverable, so reached=false is the honest answer.
+			name:    "transport failure",
+			message: "host_call_failed: dial tcp 127.0.0.1:8317: connect: connection refused",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			body, okBody := upstreamErrorFrom(tc.message)
+			if okBody != tc.wantBody {
+				t.Fatalf("upstreamErrorFrom ok = %t, want %t", okBody, tc.wantBody)
+			}
+			if okBody {
+				if got := strings.TrimSpace(body.Error.Code); got != tc.wantCode {
+					t.Errorf("upstream_error_code = %q, want %q", got, tc.wantCode)
+				}
+				if got := strings.TrimSpace(body.Error.Type); got != tc.wantType {
+					t.Errorf("upstream_error_type = %q, want %q", got, tc.wantType)
+				}
+			}
+
+			status, okStatus := statusFromExecutionError(tc.message)
+			if okStatus != tc.wantOKStat {
+				t.Fatalf("statusFromExecutionError ok = %t, want %t", okStatus, tc.wantOKStat)
+			}
+			if okStatus && status != tc.wantStatus {
+				t.Errorf("status = %d, want %d", status, tc.wantStatus)
+			}
+
+			// The tier rule: either signal means the request arrived.
+			if reached := okBody || okStatus; reached != (tc.wantBody || tc.wantOKStat) {
+				t.Errorf("reached would be %t, want %t", reached, tc.wantBody || tc.wantOKStat)
+			}
+		})
+	}
+}
+
+// An unrelated JSON object appearing in a message is not the upstream
+// answering. Treating it as one would flip reached to true on a pure transport
+// failure -- the opposite of the bug this tier was added to fix, and harder to
+// spot because it reports success.
+func TestUpstreamErrorFromRejectsUnrelatedJSON(t *testing.T) {
+	for _, message := range []string{
+		`host_call_failed: {"foo":"bar"}`,
+		`host_call_failed: {}`,
+		`host_call_failed: {"error":{}}`,
+		`host_call_failed: {"error":{"type":"","code":"","message":""}}`,
+		`host_call_failed: not json at all`,
+		`host_call_failed: {"sequence_number":2}`,
+	} {
+		t.Run(message, func(t *testing.T) {
+			if _, ok := upstreamErrorFrom(message); ok {
+				t.Error("an unrelated JSON object was accepted as an upstream error body")
+			}
+		})
+	}
+}
+
+// The status marker is the complete phrase "failed with status ", not a bare
+// "status ". Upstream messages are now embedded in the same string, and they
+// contain prose: "check status page" would otherwise be mined for an HTTP code.
+// Loosening this match reintroduces that silently, so it is pinned here.
+func TestStatusFromExecutionErrorRequiresTheFullPhrase(t *testing.T) {
+	rejected := []string{
+		// The discriminating case: a digit follows "status " inside upstream
+		// prose, so a matcher keyed on the bare word would mine 503 out of a
+		// sentence and report it as the HTTP result. Only the full phrase
+		// rejects this. If this case is ever softened, the loose matcher passes
+		// again and the misreading returns unannounced.
+		`host_call_failed: {"error":{"type":"service_unavailable_error","code":"server_is_overloaded","message":"Overloaded -- check status 503 page for updates."}}`,
+		"host_call_failed: status 429",
+		"host_call_failed: http status 500",
+		"host_call_failed: failed with status",
+		"host_call_failed: failed with status abc",
+		// Outside the plausible HTTP range: a number that is not a status code.
+		"host_call_failed: failed with status 42",
+		"host_call_failed: failed with status 900",
+	}
+	for _, message := range rejected {
+		t.Run(message, func(t *testing.T) {
+			if status, ok := statusFromExecutionError(message); ok {
+				t.Errorf("recovered status %d from a message that carries none", status)
+			}
+		})
+	}
+
+	// Reverse control: the real phrasing must still be recognised, or every
+	// assertion above would hold for the wrong reason.
+	accepted := map[string]int{
+		"host_call_failed: request failed with status 429": 429,
+		"host_call_failed: request failed with status 500": 500,
+		"host_call_failed: request failed with status 100": 100,
+		"host_call_failed: request failed with status 599": 599,
+	}
+	for message, want := range accepted {
+		t.Run(message, func(t *testing.T) {
+			status, ok := statusFromExecutionError(message)
+			if !ok {
+				t.Fatalf("the documented phrasing was not recognised")
+			}
+			if status != want {
+				t.Errorf("status = %d, want %d", status, want)
+			}
+		})
+	}
+}
+
+// The two upstream fields carry no omitempty, so the response shape is constant
+// whether or not a code was recovered. A field that vanishes when empty makes a
+// dashboard read "undefined" rather than "no code", and makes a missing field
+// indistinguishable from a field that was never implemented.
+func TestSelftestUpstreamFieldsHaveNoOmitempty(t *testing.T) {
+	src, err := os.ReadFile("management.go")
+	if err != nil {
+		t.Fatalf("read management.go: %v", err)
+	}
+	for _, field := range []string{"upstream_error_code", "upstream_error_type"} {
+		tag := `json:"` + field + `"`
+		if !strings.Contains(string(src), tag) {
+			t.Errorf("%s is not declared with a bare %s tag; an omitempty here would make the response shape vary", field, tag)
+		}
+	}
+}
+
 // --- 7. the readiness matrix --------------------------------------------
 
 // Degradation must be visible. A unit test has no host API, so host.auth.list
