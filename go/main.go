@@ -235,11 +235,12 @@ func configure(raw []byte) error {
 	}
 
 	state.mu.Lock()
-	defer state.mu.Unlock()
 	state.config = cfg
 	// Configuration changes invalidate every bucket: lengths or TTL may have
 	// moved, and a stale template must never outlive its own rules.
 	state.buckets = make(map[string]templateEntry)
+	state.mu.Unlock()
+
 	log.Printf(logPrefix+"configured template_length=%d replace_length=%d ttl_seconds=%d dry_run=%t",
 		cfg.TemplateLength, cfg.ReplaceLength, cfg.TTLSeconds, cfg.DryRun)
 	return nil
@@ -293,7 +294,7 @@ func interceptAfterAuth(raw []byte) ([]byte, error) {
 		return nil, errUnmarshal
 	}
 
-	name, value := lookupHeader(req.Headers, turnStateHeader)
+	value := headerValue(req.Headers, turnStateHeader)
 	if value == "" {
 		return noop()
 	}
@@ -315,8 +316,9 @@ func interceptAfterAuth(raw []byte) ([]byte, error) {
 
 	switch len(value) {
 	case cfg.TemplateLength:
-		state.sweepLocked(time.Now())
-		state.buckets[key] = templateEntry{value: value, harvestedAt: time.Now()}
+		now := time.Now()
+		state.sweepLocked(now)
+		state.buckets[key] = templateEntry{value: value, harvestedAt: now}
 		decision, reason = "harvest", "template stored"
 	case cfg.ReplaceLength:
 		entry, found := state.buckets[key]
@@ -342,8 +344,14 @@ func interceptAfterAuth(raw []byte) ([]byte, error) {
 	}
 	// Return only the one header. The host preserves every header not named
 	// here, so this cannot disturb the rest of the request.
+	//
+	// ClearHeaders is applied before Headers and sweeps case-insensitively,
+	// while the Headers merge is a canonicalizing Del+Add. Clearing first is
+	// what guarantees a replacement rather than a second copy alongside a
+	// non-canonically spelled original.
 	return okEnvelope(pluginapi.RequestInterceptResponse{
-		Headers: http.Header{name: []string{replacement}},
+		ClearHeaders: []string{turnStateHeader},
+		Headers:      http.Header{turnStateHeader: []string{replacement}},
 	})
 }
 
@@ -361,20 +369,21 @@ func bucketKey(authID, model string) string {
 	return authID + "\x00" + model
 }
 
-// lookupHeader finds a header case-insensitively and returns the key exactly as
-// the host spelled it, so the replacement overwrites rather than duplicates.
-func lookupHeader(headers http.Header, name string) (string, string) {
+// headerValue finds a header case-insensitively. http.Header.Get would only
+// match the canonical spelling, and these headers reach the plugin through a
+// JSON round trip that preserves whatever key the host used.
+func headerValue(headers http.Header, name string) string {
 	for key, values := range headers {
 		if !strings.EqualFold(key, name) {
 			continue
 		}
 		for _, value := range values {
 			if trimmed := strings.TrimSpace(value); trimmed != "" {
-				return key, trimmed
+				return trimmed
 			}
 		}
 	}
-	return name, ""
+	return ""
 }
 
 func metadataString(metadata map[string]any, key string) string {
