@@ -11,9 +11,19 @@ How this differs from the older probe/harvest_probe.py:
   client to echo a token back on a follow-up turn. This one does not parse logs
   at all. The plugin in `role: probe` intercepts the *upstream response* and
   writes the bucket file itself; this script's only jobs are (a) to point CPA at
-  exactly one account, (b) to fire one minimal request per model, and (c) to
-  wait for the bucket file to appear. Success is "a qualifying file is on disk",
-  never "the HTTP call returned 200".
+  exactly one account, (b) to fire one minimal request per model, and (c) to ask
+  the plugin whether the bucket is ready. Success is "the plugin reports the
+  bucket ready", never "the HTTP call returned 200".
+
+Why readiness comes from the management API and not from the store files:
+  CPA runs as root inside its container, so the bucket files it writes are
+  root:root 0600 inside root:root 0700 per-account directories. This script runs
+  as an ordinary host user and cannot read — or even enter — any of them. Asking
+  the plugin over GET /v0/management/codex-turn-state/status is the only path
+  that works unprivileged, and it is the safer one too: that response reports
+  ready/seconds_left and carries no token values, so this script never holds a
+  turn-state in memory. Reading files directly survives only as a fallback for
+  an older .so that predates the endpoint.
 
 Why we steer by enabling/disabling accounts instead of naming one per request:
   CPA's scheduler picks a credential itself; the wire protocol has no "use this
@@ -42,20 +52,19 @@ ENVIRONMENT
                       /v1/responses. This is a different key from the one above.
   Neither is ever written to disk or printed. Only key *presence* is logged.
 
-The harvested token itself is credential-adjacent: it lives only in the bucket
-file the plugin writes (0600). This script reads it solely to verify the length
-and the embedded timestamp, and never prints it.
+The harvested token itself is credential-adjacent and never enters this process:
+it lives only in the bucket file the plugin writes. Upstream error bodies are
+passed through redact() before they reach the log.
 """
 
 from __future__ import annotations
 
 import argparse
 import atexit
-import base64
 import json
 import os
+import re
 import signal
-import struct
 import sys
 import time
 import urllib.error
@@ -91,7 +100,8 @@ DEFAULT_MODELS = [
 ]
 
 TEMPLATE_LEN = 292   # normal serving state — the only length worth storing
-REPLACE_LEN = 312    # throttled/degraded state — never a template
+REPLACE_LEN = 312    # throttled/degraded state, never a template. Recorded here
+                     # for reference; readiness is the plugin's call, not ours.
 TTL_SECONDS = 3600   # matches the plugin's ttl_seconds
 
 LOG_PREFIX = "[probe]"
@@ -107,18 +117,24 @@ def die(msg: str, code: int = 2) -> NoReturn:
 
 
 # ----------------------------------------------------------------------------
-# Fernet timestamp. The token carries its own issuance time in clear, so expiry
-# can be checked without any key. See FINDINGS.md.
+# Redaction. Upstream error bodies have to be shown verbatim enough to identify
+# a protocol mismatch, but they may echo headers or credentials back at us.
 # ----------------------------------------------------------------------------
 
-def fernet_issued_at(token: str) -> int | None:
-    try:
-        raw = base64.urlsafe_b64decode(token + "=" * (-len(token) % 4))
-    except Exception:
-        return None
-    if len(raw) < 9 or raw[0] != 0x80:
-        return None
-    return struct.unpack(">Q", raw[1:9])[0]
+# A Fernet token base64url-encodes a leading 0x80 version byte, which always
+# renders as the literal prefix "gAAAAA". That makes turn-state values greppable
+# without decoding anything. See FINDINGS.md.
+_TOKEN_RE = re.compile(r"gAAAAA[A-Za-z0-9_\-=]{16,}")
+_APIKEY_RE = re.compile(r"\bsk-[A-Za-z0-9_\-]{8,}")
+_BEARER_RE = re.compile(r"(?i)\b(bearer\s+)[A-Za-z0-9._\-]{16,}")
+
+
+def redact(text: str) -> str:
+    """Strip anything credential-shaped out of text bound for the log."""
+    text = _TOKEN_RE.sub("<turn-state redacted>", text)
+    text = _APIKEY_RE.sub("<api-key redacted>", text)
+    text = _BEARER_RE.sub(r"\1<redacted>", text)
+    return text
 
 
 def parse_rfc3339(value: str) -> int | None:
@@ -163,6 +179,7 @@ def http_call(
     token: str,
     payload: dict | None = None,
     timeout: int = 30,
+    extra_headers: dict[str, str] | None = None,
 ) -> HTTPResult:
     data = None
     headers = {"Accept": "application/json"}
@@ -171,6 +188,8 @@ def http_call(
         headers["Content-Type"] = "application/json"
     if token:
         headers["Authorization"] = f"Bearer {token}"
+    if extra_headers:
+        headers.update(extra_headers)
 
     request = urllib.request.Request(url, data=data, headers=headers, method=method)
     try:
@@ -232,6 +251,36 @@ class CPA:
             return False
         return True
 
+    # -- plugin status -----------------------------------------------------
+
+    def plugin_status(self) -> dict | None:
+        """GET the plugin's read-only status, or None when it is not there.
+
+        This is the authoritative source of bucket readiness. The bucket files
+        themselves are written by CPA running as root inside the container and
+        land as root-owned 0600 files under root-owned 0700 directories, so a
+        probe running as an ordinary host user cannot read them at all. The
+        status endpoint reports ready/seconds_left and deliberately carries no
+        token values, so it is both the only reliable path and the safer one.
+
+        None means HTTP 404: an older .so is loaded that has no management API.
+        Every other failure is fatal — degrading to the filesystem on, say, a
+        401 would just produce a confusing permission error downstream.
+        """
+        url = f"{self.base_url}/v0/management/codex-turn-state/status"
+        # Send both accepted forms: this CPA build takes Authorization: Bearer,
+        # and the plugin's own handler documents X-Management-Key.
+        result = http_call("GET", url, self.mgmt_key,
+                           extra_headers={"X-Management-Key": self.mgmt_key})
+        if result.status == 404:
+            return None
+        if result.status != 200:
+            die(explain_status(result, "GET /v0/management/codex-turn-state/status"))
+        doc = result.json()
+        if not isinstance(doc, dict):
+            die("plugin status endpoint returned a non-object body")
+        return doc
+
     # -- auth files --------------------------------------------------------
 
     def list_auth_files(self) -> list[dict]:
@@ -289,7 +338,12 @@ class CPA:
 
         A non-2xx here is not fatal. The plugin harvests from the response
         headers, and those are present on error responses too; the authority on
-        success is the bucket file, checked by the caller.
+        success is the plugin's status endpoint, checked by the caller.
+
+        The error body is reported at length (redacted) rather than summarised:
+        the very first real run exists to confirm that /v1/responses is the
+        protocol Codex actually speaks here, and "failed" with no body is
+        useless for telling a wrong route from a wrong payload shape.
         """
         if self.dry_run:
             log(f"DRY-RUN would POST /v1/responses model={model}")
@@ -308,79 +362,146 @@ class CPA:
             result = http_call("POST", url, self.api_key, payload, timeout=timeout)
         except ConnectionError as exc:
             return 0, str(exc)
-        note = "ok" if 200 <= result.status < 300 else \
-            result.body.decode("utf-8", errors="replace")[:160]
-        return result.status, note
+        if 200 <= result.status < 300:
+            return result.status, "ok"
+        body = redact(result.body.decode("utf-8", errors="replace").strip())
+        if len(body) > 600:
+            body = body[:600] + f" ...[+{len(body) - 600} chars]"
+        return result.status, body or "(empty body)"
 
 
 # ----------------------------------------------------------------------------
-# Store inspection. The plugin writes these files; we only read them.
+# Bucket readiness.
+#
+# The source of truth is the plugin's management API, NOT the store files. CPA
+# runs as root inside its container, so the bucket files it writes are root:root
+# 0600 inside root:root 0700 per-account directories. A probe running as an
+# ordinary host user gets EACCES on every one of them — and a readiness check
+# that silently treats EACCES as "not ready" would loop forever while blaming
+# the upstream for never issuing a 292.
+#
+# The API is also strictly safer: it reports ready/seconds_left and no token
+# values, so this script never holds a turn-state in memory at all.
 # ----------------------------------------------------------------------------
 
 class Bucket:
-    def __init__(self, auth_id: str, model: str, length: int, issued_at: int) -> None:
+    def __init__(self, auth_id: str, model: str, ready: bool,
+                 seconds_left: int, issued_at: int) -> None:
         self.auth_id = auth_id
         self.model = model
-        self.length = length
+        self.ready = ready
+        self.seconds_left = seconds_left
+        # Epoch seconds, used only to tell a freshly minted token from the one
+        # that was already in the bucket before we fired.
         self.issued_at = issued_at
-
-    def seconds_left(self, now: int, ttl: int = TTL_SECONDS) -> int:
-        return max(0, (self.issued_at + ttl) - now)
-
-    def ready(self, now: int, ttl: int = TTL_SECONDS) -> bool:
-        return self.length == TEMPLATE_LEN and self.seconds_left(now, ttl) > 0
 
 
 def bucket_path(store_dir: Path, auth_id: str, model: str) -> Path:
     return store_dir / auth_id / f"{model}.json"
 
 
-def read_bucket(store_dir: Path, auth_id: str, model: str) -> Bucket | None:
-    """Parse one bucket file, or None when it is missing/unusable.
+class Readiness:
+    """Snapshot of every bucket's state, from the API or (legacy) from disk."""
 
-    The stored `issued_at` is cross-checked against the token's own Fernet
-    timestamp. They should agree; when they do not, the token wins, because the
-    upstream enforces its window against the signed timestamp and nothing else.
-    """
-    path = bucket_path(store_dir, auth_id, model)
-    try:
-        doc = json.loads(path.read_text(encoding="utf-8"))
-    except FileNotFoundError:
-        return None
-    except Exception as exc:
-        log(f"bucket unreadable auth={auth_id} model={model}: {exc}")
-        return None
+    def __init__(self, buckets: dict[tuple[str, str], Bucket], source: str) -> None:
+        self.buckets = buckets
+        self.source = source
 
-    value = str(doc.get("value") or "")
-    length = int(doc.get("len") or len(value))
-    issued = parse_rfc3339(str(doc.get("issued_at") or "")) or 0
-    from_token = fernet_issued_at(value)
-    if from_token and from_token != issued:
-        log(f"bucket issued_at disagrees with token auth={auth_id} model={model}"
-            f" (file={issued} token={from_token}); trusting the token")
-        issued = from_token
-    if issued <= 0:
-        return None
-    # auth_id comes from the *file*, not from the path we looked under, so the
-    # caller can catch a token that CPA attributed to a different account than
-    # the one we enabled (spec §10: 只启用一个号时写入的 auth_id 就是该号).
-    recorded_auth = str(doc.get("auth_id") or "").strip() or auth_id
-    return Bucket(auth_id=recorded_auth, model=model, length=length, issued_at=issued)
+    def get(self, auth_id: str, model: str) -> Bucket | None:
+        return self.buckets.get((auth_id, model))
+
+    def missing(self, auths: list[str], models: list[str]) -> list[tuple[str, str]]:
+        out = []
+        for auth_id in auths:
+            for model in models:
+                bucket = self.get(auth_id, model)
+                if bucket is None or not bucket.ready:
+                    out.append((auth_id, model))
+        return out
 
 
-def targets(auths: list[str], models: list[str]) -> list[tuple[str, str]]:
-    return [(a, m) for a in auths for m in models]
+def readiness_from_status(doc: dict) -> Readiness:
+    """Build a Readiness from the plugin status document."""
+    buckets: dict[tuple[str, str], Bucket] = {}
+    for item in doc.get("buckets") or []:
+        if not isinstance(item, dict):
+            continue
+        auth_id = str(item.get("auth_id") or "").strip()
+        model = str(item.get("model") or "").strip()
+        if not auth_id or not model:
+            continue
+        buckets[(auth_id, model)] = Bucket(
+            auth_id=auth_id,
+            model=model,
+            ready=bool(item.get("ready")),
+            seconds_left=int(item.get("seconds_left") or 0),
+            issued_at=parse_rfc3339(str(item.get("issued_at") or "")) or 0,
+        )
+    return Readiness(buckets, "management API")
 
 
-def missing_buckets(
+def readiness_from_disk(
     store_dir: Path, auths: list[str], models: list[str], now: int
-) -> list[tuple[str, str]]:
-    out = []
-    for auth_id, model in targets(auths, models):
-        bucket = read_bucket(store_dir, auth_id, model)
-        if bucket is None or not bucket.ready(now):
-            out.append((auth_id, model))
-    return out
+) -> Readiness:
+    """Legacy fallback for an old .so with no management API.
+
+    Only `len`, `issued_at` and `auth_id` are read; the `value` field is never
+    touched, so the token stays out of this process even on this path.
+
+    A permission error is fatal rather than "not ready": it means the files are
+    root-owned and this user cannot see them, which is a deployment problem, not
+    an upstream one. Saying so plainly here saves an hour of chasing the wrong
+    thing.
+    """
+    buckets: dict[tuple[str, str], Bucket] = {}
+    for auth_id in auths:
+        for model in models:
+            path = bucket_path(store_dir, auth_id, model)
+            try:
+                doc = json.loads(path.read_text(encoding="utf-8"))
+            except FileNotFoundError:
+                continue
+            except PermissionError:
+                die(f"cannot read {path}: permission denied.\n"
+                    f"  CPA runs as root in its container, so bucket files are\n"
+                    f"  root-owned 0600 under root-owned 0700 directories, and\n"
+                    f"  this script is running as "
+                    f"{os.environ.get('USER') or os.environ.get('USERNAME') or 'a non-root user'}.\n"
+                    f"  This is NOT 'the upstream issued no 292'.\n"
+                    f"  Fix by deploying the .so that serves\n"
+                    f"    GET /v0/management/codex-turn-state/status\n"
+                    f"  (the supported path), or re-run this script under sudo.")
+            except Exception as exc:
+                log(f"bucket unreadable auth={auth_id} model={model}: {exc}")
+                continue
+
+            length = int(doc.get("len") or 0)
+            issued = parse_rfc3339(str(doc.get("issued_at") or "")) or 0
+            if issued <= 0:
+                continue
+            seconds_left = max(0, (issued + TTL_SECONDS) - now)
+            # auth_id comes from the file, not the path we looked under, so a
+            # token CPA attributed to a different account is still catchable
+            # (spec §10: 只启用一个号时写入的 auth_id 就是该号).
+            recorded = str(doc.get("auth_id") or "").strip() or auth_id
+            buckets[(auth_id, model)] = Bucket(
+                auth_id=recorded,
+                model=model,
+                ready=(length == TEMPLATE_LEN and seconds_left > 0),
+                seconds_left=seconds_left,
+                issued_at=issued,
+            )
+    return Readiness(buckets, "store files (legacy fallback)")
+
+
+def read_readiness(
+    cpa: CPA, store_dir: Path, auths: list[str], models: list[str]
+) -> Readiness:
+    """Current bucket state, preferring the API and falling back only on 404."""
+    doc = cpa.plugin_status()
+    if doc is not None:
+        return readiness_from_status(doc)
+    return readiness_from_disk(store_dir, auths, models, int(time.time()))
 
 
 # ----------------------------------------------------------------------------
@@ -523,36 +644,42 @@ def probe_bucket(
     model: str,
     args: argparse.Namespace,
 ) -> bool:
-    """Fire requests for one bucket until a qualifying file lands, or give up."""
-    before = read_bucket(store_dir, auth_id, model)
+    """Fire requests for one bucket until it reports ready, or give up."""
+    before = read_readiness(cpa, store_dir, [auth_id], [model]).get(auth_id, model)
     before_issued = before.issued_at if before else 0
 
     for attempt in range(1, args.retries + 1):
         status, note = cpa.fire(model, timeout=args.http_timeout)
         if cpa.dry_run:
             return True
-        log(f"  attempt {attempt}/{args.retries} model={model} http={status}"
-            + ("" if status and 200 <= status < 300 else f" note={note}"))
+        if status and 200 <= status < 300:
+            log(f"  attempt {attempt}/{args.retries} model={model} http={status}")
+        else:
+            # Full body, not a summary: on the first real run this is how a
+            # wrong route or payload shape gets identified.
+            log(f"  attempt {attempt}/{args.retries} model={model} http={status}"
+                f" body={note}")
 
-        # Poll for the plugin's write. HTTP status is deliberately not a gate:
-        # the header rides on error responses too, and the file is the contract.
+        # Poll the plugin for its own view. HTTP status is deliberately not a
+        # gate: the header rides on error responses too, and readiness is the
+        # contract. Polling is per-second because each check is now an API call.
         deadline = time.time() + args.timeout
         while time.time() < deadline:
-            now = int(time.time())
-            bucket = read_bucket(store_dir, auth_id, model)
+            bucket = read_readiness(cpa, store_dir, [auth_id], [model]).get(auth_id, model)
             if bucket and bucket.issued_at > before_issued:
-                if bucket.length == TEMPLATE_LEN and bucket.ready(now):
-                    log(f"  stored auth={auth_id} model={model} len={bucket.length}"
-                        f" ttl_left={bucket.seconds_left(now)}s")
+                if bucket.ready:
+                    log(f"  ready auth={auth_id} model={model}"
+                        f" ttl_left={bucket.seconds_left}s")
                     return True
-                if bucket.length == REPLACE_LEN:
-                    log(f"  got degraded len={REPLACE_LEN} auth={auth_id} model={model}"
-                        f" — not a template, will retry")
-                    before_issued = bucket.issued_at
-                    break
-            time.sleep(0.5)
+                # A new token landed but the plugin does not call it ready —
+                # a degraded 312, which is never a template. Retry.
+                log(f"  new state for auth={auth_id} model={model} is not a"
+                    f" template (not ready) — will retry")
+                before_issued = bucket.issued_at
+                break
+            time.sleep(1.0)
         else:
-            log(f"  timeout after {args.timeout}s waiting for a bucket file"
+            log(f"  timeout after {args.timeout}s waiting for a ready bucket"
                 f" auth={auth_id} model={model}")
 
     return False
@@ -585,21 +712,21 @@ def probe_account(
         time.sleep(args.settle)
 
     results: dict[str, bool] = {}
-    now = int(time.time())
+    current = read_readiness(cpa, store_dir, [auth_id], models)
     for model in models:
-        existing = read_bucket(store_dir, auth_id, model)
-        if existing and existing.ready(now) and not args.force:
+        existing = current.get(auth_id, model)
+        if existing and existing.ready and not args.force:
             log(f"  skip auth={auth_id} model={model}: live template,"
-                f" {existing.seconds_left(now)}s left")
+                f" {existing.seconds_left}s left")
             results[model] = True
             continue
         results[model] = probe_bucket(cpa, store_dir, auth_id, model, args)
 
         # Sanity check the spec's acceptance criterion: with one account
-        # enabled, the written bucket must belong to that account.
-        written = read_bucket(store_dir, auth_id, model)
+        # enabled, the stored bucket must belong to that account.
+        written = read_readiness(cpa, store_dir, [auth_id], [model]).get(auth_id, model)
         if written and written.auth_id and written.auth_id != auth_id:
-            log(f"  WARNING bucket file records auth_id={written.auth_id}"
+            log(f"  WARNING bucket records auth_id={written.auth_id}"
                 f" but we enabled {auth_id} — do not trust this store")
     return results
 
@@ -616,9 +743,8 @@ def run_pass(
     for entry in auths:
         probe_account(cpa, guard, store_dir, entry, models, args)
 
-    now = int(time.time())
     names = [str(e.get("name")) for e in auths]
-    missing = missing_buckets(store_dir, names, models, now)
+    missing = read_readiness(cpa, store_dir, names, models).missing(names, models)
     total = len(names) * len(models)
     log(f"pass complete: {total - len(missing)}/{total} buckets ready")
     for auth_id, model in missing:
@@ -672,8 +798,10 @@ def build_parser() -> argparse.ArgumentParser:
                         help="re-apply an account-state snapshot and exit "
                              "(manual recovery after a failed restore)")
     parser.add_argument("--store-dir", default=str(DEFAULT_STORE_DIR),
-                        help="host path of the plugin's store_dir "
-                             f"(default: {DEFAULT_STORE_DIR})")
+                        help="host path of the plugin's store_dir. Only used by "
+                             "the legacy fallback when the plugin has no "
+                             "management API; readiness normally comes from the "
+                             f"API (default: {DEFAULT_STORE_DIR})")
     parser.add_argument("--auths-dir", default=str(DEFAULT_AUTHS_DIR),
                         help=f"auth file directory, used as a cross-check "
                              f"(default: {DEFAULT_AUTHS_DIR})")
@@ -749,6 +877,35 @@ def main(argv: list[str]) -> int:
     if not cpa.healthy():
         die("CPA is not answering on /healthz; refusing to touch account state")
 
+    # Pre-flight the plugin before touching any account state. In `business`
+    # role the plugin harvests nothing, so a probe run would disable four
+    # accounts, spend quota on 25 requests and come back with an empty store.
+    # Failing here costs nothing; failing at the end costs a probe window.
+    status = cpa.plugin_status()
+    if status is None:
+        log("note: no codex-turn-state management API (404) — the loaded .so"
+            " predates it. Falling back to reading store files directly, which"
+            " requires this user to be able to read them.")
+        log(f"note: fallback will read {args.store_dir}")
+    else:
+        role = str(status.get("role") or "").strip().lower()
+        log(f"plugin: role={role or '(unset)'} dry_run={status.get('dry_run')}"
+            f" inject_mode={status.get('inject_mode')}"
+            f" store_dir={status.get('store_dir')}")
+        if role != "probe":
+            die(f"plugin role is {role or '(unset)'}, not 'probe'.\n"
+                f"  A probe run in this role harvests nothing: only role=probe\n"
+                f"  intercepts upstream responses and writes the store.\n"
+                f"  Set role: probe in plugins.configs.codex-turn-state and let\n"
+                f"  CPA reload before re-running. Refusing to touch account\n"
+                f"  state or spend quota.")
+        plugin_models = [str(m) for m in (status.get("models") or [])]
+        if plugin_models:
+            unknown = [m for m in models if m not in plugin_models]
+            if unknown:
+                log(f"note: {unknown} not in the plugin's configured model list"
+                    f" {plugin_models}")
+
     auths = cpa.list_codex_auths()
     if not auths:
         die("no Codex auth files reported by CPA")
@@ -813,9 +970,9 @@ def main(argv: list[str]) -> int:
         return 0
     if args.until_complete:
         # Exit code is the contract: 0 only when the store is genuinely complete,
-        # so DEPLOY.md step "先做完再开业务" can gate on it.
-        now = int(time.time())
-        missing = missing_buckets(store_dir, names, models, now)
+        # so DEPLOY.md step "先做完再开业务" can gate on it. Re-read rather than
+        # trusting the loop's last result.
+        missing = read_readiness(cpa, store_dir, names, models).missing(names, models)
         if missing:
             log(f"incomplete: {len(missing)} bucket(s) still missing")
             return 1

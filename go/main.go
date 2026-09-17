@@ -34,12 +34,31 @@ typedef struct {
 	size_t len;
 } cliproxy_buffer;
 
+typedef int (*cliproxy_host_call_fn)(void*, const char*, const uint8_t*, size_t, cliproxy_buffer*);
+typedef void (*cliproxy_host_free_fn)(void*, size_t);
+
 typedef struct {
 	uint32_t abi_version;
 	void* host_ctx;
-	void* call;
-	void* free_buffer;
+	cliproxy_host_call_fn call;
+	cliproxy_host_free_fn free_buffer;
 } cliproxy_host_api;
+
+// cliproxy_invoke_host calls back into the host. The host owns the response
+// buffer, so every non-NULL ptr it hands back must go to cliproxy_release_host.
+static int cliproxy_invoke_host(const cliproxy_host_api* host, const char* method, const uint8_t* request, size_t request_len, cliproxy_buffer* response) {
+	if (host == NULL || host->call == NULL) {
+		return 1;
+	}
+	return host->call(host->host_ctx, method, request, request_len, response);
+}
+
+static void cliproxy_release_host(const cliproxy_host_api* host, void* ptr, size_t len) {
+	if (host == NULL || host->free_buffer == NULL || ptr == NULL) {
+		return;
+	}
+	host->free_buffer(ptr, len);
+}
 
 typedef int (*cliproxy_plugin_call_fn)(char*, uint8_t*, size_t, cliproxy_buffer*);
 typedef void (*cliproxy_plugin_free_fn)(void*, size_t);
@@ -67,9 +86,11 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unsafe"
 
@@ -103,8 +124,70 @@ const indexFileName = "index.json"
 const storeIndexVersion = 1
 
 var state = pluginState{
-	config:  defaultConfig(),
-	buckets: make(map[string]templateEntry),
+	config:   defaultConfig(),
+	buckets:  make(map[string]templateEntry),
+	countsAt: time.Now(),
+}
+
+// hostAPI is the *C.cliproxy_host_api the host passes to cliproxy_plugin_init,
+// kept so the management handlers can call back into the host. It is written
+// once during init and read from handler goroutines, hence the atomic.
+var hostAPI unsafe.Pointer
+
+// hostAPIAvailable reports whether the host handed over a callback table. It is
+// worth asking separately from just letting hostCall fail: "the plugin cannot
+// make any outbound call" and "the upstream did not answer" are different
+// findings, and a diagnostic that reported the first as the second would send
+// the operator looking at the network when the problem is the load.
+func hostAPIAvailable() bool {
+	return atomic.LoadPointer(&hostAPI) != nil
+}
+
+// hostCall invokes a host callback and returns its raw RPC envelope. A nil host
+// API means the plugin was loaded by something that never handed one over, which
+// is a configuration problem rather than a request failure -- the management
+// routes that need it say so rather than pretending the call returned nothing.
+func hostCall(method string, request []byte) ([]byte, error) {
+	raw := atomic.LoadPointer(&hostAPI)
+	if raw == nil {
+		return nil, fmt.Errorf("host API unavailable: this plugin was initialised without one")
+	}
+	host := (*C.cliproxy_host_api)(raw)
+
+	cMethod := C.CString(method)
+	defer C.free(unsafe.Pointer(cMethod))
+
+	var requestPtr *C.uint8_t
+	if len(request) > 0 {
+		requestPtr = (*C.uint8_t)(unsafe.Pointer(&request[0]))
+	}
+
+	var response C.cliproxy_buffer
+	rc := C.cliproxy_invoke_host(host, cMethod, requestPtr, C.size_t(len(request)), &response)
+	// request is Go memory handed to C for the duration of the call; the host
+	// copies it out before returning, but it must not be collected mid-call.
+	runtime.KeepAlive(request)
+
+	if response.ptr != nil {
+		defer C.cliproxy_release_host(host, response.ptr, response.len)
+	}
+	if rc != 0 {
+		return nil, fmt.Errorf("host call %s failed with code %d", method, int(rc))
+	}
+	if response.ptr == nil || response.len == 0 {
+		return nil, nil
+	}
+	return C.GoBytes(response.ptr, C.int(response.len)), nil
+}
+
+// decisionCounters tallies what the plugin did, for the management status page.
+// Lengths and outcomes only -- never a value.
+type decisionCounters struct {
+	Harvest    int64 `json:"harvest"`
+	Substitute int64 `json:"substitute"`
+	Inject     int64 `json:"inject"`
+	Pass       int64 `json:"pass"`
+	Skip       int64 `json:"skip"`
 }
 
 type pluginState struct {
@@ -121,6 +204,10 @@ type pluginState struct {
 	store        map[string]templateEntry
 	storeMod     time.Time
 	storeChecked time.Time
+	// counts and countsAt back the management status page. They are reset when a
+	// role change invalidates what the tallies describe.
+	counts   decisionCounters
+	countsAt time.Time
 }
 
 // templateEntry is one harvested template, scoped to a single bucket.
@@ -259,14 +346,21 @@ type registrationCapability struct {
 	ResponseInterceptor       bool `json:"response_interceptor"`
 	StreamChunkInterceptor    bool `json:"response_stream_interceptor"`
 	WebSocketResponseObserver bool `json:"websocket_response_observer"`
+	ManagementAPI             bool `json:"management_api"`
 }
 
 func main() {}
 
 //export cliproxy_plugin_init
-func cliproxy_plugin_init(_ *C.cliproxy_host_api, plugin *C.cliproxy_plugin_api) C.int {
+func cliproxy_plugin_init(host *C.cliproxy_host_api, plugin *C.cliproxy_plugin_api) C.int {
 	if plugin == nil {
 		return 1
+	}
+	// The host API is how the management handlers reach host.auth.list and
+	// host.model.execute. It is handed over exactly once, before any other call,
+	// and the host owns the allocation for the plugin's lifetime.
+	if host != nil {
+		atomic.StorePointer(&hostAPI, unsafe.Pointer(host))
 	}
 	plugin.abi_version = C.uint32_t(pluginabi.ABIVersion)
 	plugin.call = C.cliproxy_plugin_call_fn(C.cliproxyPluginCall)
@@ -335,6 +429,10 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 		return interceptStreamChunk(request)
 	case pluginabi.MethodWebSocketResponseEvent:
 		return observeWebSocketEvent(request)
+	case pluginabi.MethodManagementRegister:
+		return managementRegister(request)
+	case pluginabi.MethodManagementHandle:
+		return managementHandle(request)
 	default:
 		return errorEnvelope("unknown_method", "unknown method: "+method), nil
 	}
@@ -433,12 +531,20 @@ func configure(raw []byte) error {
 	// template at unpredictable moments and leave the cache permanently
 	// empty, so only a change that invalidates templates clears them.
 	cleared := templatesInvalidatedBy(state.config, cfg)
+	roleChanged := !strings.EqualFold(state.config.Role, cfg.Role)
 	state.config = cfg
 	if cleared {
 		state.buckets = make(map[string]templateEntry)
 		state.store = nil
 		state.storeMod = time.Time{}
 		state.storeChecked = time.Time{}
+	}
+	// Tallies describe one role's behaviour. Carrying a probe's harvest count
+	// into a business generation would make the status page read as though the
+	// business role had been harvesting, which is the one thing it must not do.
+	if roleChanged {
+		state.counts = decisionCounters{}
+		state.countsAt = time.Now()
 	}
 	state.mu.Unlock()
 
@@ -478,7 +584,9 @@ func pluginRegistration() registration {
 	// request hook, where it deliberately does nothing: declaring it keeps the
 	// two roles on one code path and makes "probe rewrote a request" a thing the
 	// logs can rule out rather than a thing the host never offered.
-	capabilities := registrationCapability{RequestInterceptor: true}
+	// The management routes are declared in both roles: the status page is how an
+	// operator checks a role switch actually took, so it must survive the switch.
+	capabilities := registrationCapability{RequestInterceptor: true, ManagementAPI: true}
 	if probe {
 		capabilities.ResponseInterceptor = true
 		capabilities.StreamChunkInterceptor = true
@@ -993,6 +1101,31 @@ func scanStoreRecords(dir string) ([]storeRecord, error) {
 	return records, nil
 }
 
+// recordIssuedAt parses a stored bucket's issuance time. It is separate from
+// recordUsable because a bucket that is past its window still has a meaningful
+// issued_at to display: "probed once, now stale" and "never probed" must not
+// look the same to whoever is deciding whether to open business.
+func recordIssuedAt(rec storeRecord) (time.Time, bool) {
+	issued, errParse := time.Parse(time.RFC3339, rec.IssuedAt)
+	if errParse != nil {
+		return time.Time{}, false
+	}
+	return issued, true
+}
+
+// recordUsable is the one rule deciding whether a stored bucket may be used.
+//
+// Three callers need it: the loader that feeds live substitution, the index
+// writer, and the management status page. They must not each carry their own
+// copy. A status page that judged a bucket ready when the loader would refuse it
+// reports a readiness the business role does not have -- and on this deployment
+// that page is the only way the host-side probe script can see into a store
+// written as root:root 0600, so a disagreement there is not cosmetic: it would
+// let the probe declare itself complete against buckets that cannot be used.
+func recordUsable(rec storeRecord, issued, now time.Time, ttl time.Duration, templateLength int) bool {
+	return rec.Len == templateLength && len(rec.Value) == rec.Len && templateUsable(issued, now, ttl)
+}
+
 // loadStore returns every still-live template in the store, keyed by bucketKey.
 // Expired records and anything that is not a template length are left out, so a
 // caller cannot accidentally substitute one.
@@ -1006,8 +1139,8 @@ func loadStore(dir string, now time.Time, ttl time.Duration, templateLength int)
 		if rec.Len != templateLength || len(rec.Value) != rec.Len {
 			continue
 		}
-		issued, errParse := time.Parse(time.RFC3339, rec.IssuedAt)
-		if errParse != nil {
+		issued, okIssued := recordIssuedAt(rec)
+		if !okIssued {
 			log.Printf(logPrefix+"store load: unparsable issued_at, skipping bucket auth=%s model=%s", rec.AuthID, rec.Model)
 			continue
 		}
@@ -1015,7 +1148,7 @@ func loadStore(dir string, now time.Time, ttl time.Duration, templateLength int)
 		// not trusted either -- see templateUsable. The upstream rejects a
 		// replayed token past its window, so either kind of bad timestamp makes
 		// the template worse than none.
-		if !templateUsable(issued, now, ttl) {
+		if !recordUsable(rec, issued, now, ttl, templateLength) {
 			continue
 		}
 		out[bucketKey(rec.AuthID, rec.Model)] = templateEntry{value: rec.Value, issuedAt: issued}
@@ -1042,14 +1175,13 @@ func writeStoreIndex(dir string, now time.Time, ttl time.Duration, templateLengt
 	}
 	for _, rec := range records {
 		entry := indexEntry{AuthID: rec.AuthID, Model: rec.Model}
-		issued, errParse := time.Parse(time.RFC3339, rec.IssuedAt)
-		if errParse == nil {
+		if issued, okIssued := recordIssuedAt(rec); okIssued {
 			expires := issued.Add(ttl)
 			entry.IssuedAt = issued.UTC().Format(time.RFC3339)
 			entry.ExpiresAt = expires.UTC().Format(time.RFC3339)
 			// Same usability rule as the loader, so index.json never advertises
 			// a bucket as ready that the business role would refuse to load.
-			entry.Ready = rec.Len == templateLength && len(rec.Value) == rec.Len && templateUsable(issued, now, ttl)
+			entry.Ready = recordUsable(rec, issued, now, ttl, templateLength)
 		}
 		index.Entries = append(index.Entries, entry)
 	}
@@ -1181,10 +1313,27 @@ func orDash(value string) string {
 // logDecision records lengths and bucket identity only. The state value itself
 // is a credential-adjacent secret and never reaches the logs.
 func logDecision(decision, authID, model string, valueLen int, reason string) {
+	if decision == "" {
+		return
+	}
 	state.mu.Lock()
 	enabled := state.config.LogDecisions
+	// Counted regardless of log_decisions: the status page should still report
+	// what the plugin is doing when the operator has quietened the log.
+	switch decision {
+	case "harvest":
+		state.counts.Harvest++
+	case "substitute":
+		state.counts.Substitute++
+	case "inject":
+		state.counts.Inject++
+	case "pass":
+		state.counts.Pass++
+	case "skip":
+		state.counts.Skip++
+	}
 	state.mu.Unlock()
-	if !enabled || decision == "" {
+	if !enabled {
 		return
 	}
 	log.Printf(logPrefix+"%s auth=%s model=%s len=%d (%s)", decision, orDash(authID), orDash(model), valueLen, reason)

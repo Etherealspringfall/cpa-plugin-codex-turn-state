@@ -44,7 +44,7 @@ CPA Turn-State：探测 / 业务分离。
 
 ---
 
-## 第 0 步：先做这四件，再写业务逻辑
+## 第 0 步：先做这五件，再写业务逻辑
 
 ### 0.1 备份 `.so` 和 `config.yaml`
 
@@ -68,8 +68,7 @@ chmod 0700 /home/dnc/cpamp-deploy/cpa-data/turn-state-store
 ls -ld /home/dnc/cpamp-deploy/cpa-data/turn-state-store
 ```
 
-要求：目录 `0700`、文件 `0600`，**属主必须让 CPA 进程读写得到**。确认容器里
-CPA 以哪个 uid 跑，必要时 `chown`：
+要求：目录 `0700`、文件 `0600`，**属主必须让 CPA 进程读写得到**。
 
 ```bash
 docker exec cli-proxy-api id
@@ -81,6 +80,32 @@ docker exec cli-proxy-api touch /data/turn-state-store/.wtest \
 
 最后一条要真的通过再往下走。写不进去的话，后面探测会静默采不到东西。
 
+#### ⚠️ 属主不对等：CPA 是 root，你不是
+
+实测结果：
+
+| | 值 |
+|---|---|
+| CPA 容器里的进程 | `uid=0(root)`（`docker exec cli-proxy-api id`） |
+| 宿主上 `cpa-data` 的属主 | `dnc:dnc` |
+
+所以**插件写出来的桶文件是 `root:root 0600`**——宿主上以普通用户身份跑的脚本
+**读不了**它们。
+
+这正是 `scripts/probe.py` 改成**走 `status` 接口拿就绪度、不再直接读文件**的
+原因：探测脚本以普通用户跑，读不到 root 写的桶文件，只能问插件自己。这个设计不
+是绕远路，是属主决定的。
+
+需要在宿主上直接看文件时（降级手段），加 `sudo`：
+
+```bash
+sudo find /home/dnc/cpamp-deploy/cpa-data/turn-state-store -name '*.json' | sort
+sudo cat /home/dnc/cpamp-deploy/cpa-data/turn-state-store/index.json
+```
+
+同源问题还有一处：`auths/` 下也有 root 属主的账号文件，普通用户清点会**静默漏
+号**。见 0.4。**凡是清点 CPA 自己管理的状态，优先走接口。**
+
 ### 0.3 确认能编、产物能被容器加载
 
 ```bash
@@ -90,18 +115,72 @@ bash scripts/build.sh        # -> build/linux/amd64/codex-turn-state.so
 ls -la build/linux/amd64/
 ```
 
-`scripts/build.sh` 在一次性 Go 容器里编，宿主只要有 Docker。必须对上的是
-`pluginabi.ABIVersion`（1）和 `pluginabi.SchemaVersion`（6），来自 `go/go.mod`
-里钉住的 `CLIProxyAPI/v7 v7.3.4`——和 CPA 镜像 `eceasy/cli-proxy-api:latest`
-的版本要一致。
+**宿主不需要装 Go。** `scripts/build.sh` 在一次性 `golang:1.26` 容器里编，宿主
+只要有 Docker。实测编译耗时约 **2.5 秒**（模块缓存已暖）。
+
+必须对上的是 `pluginabi.ABIVersion`（1）和 `pluginabi.SchemaVersion`（6），
+来自 `go/go.mod` 里钉住的 `CLIProxyAPI/v7 v7.3.4`——和 CPA 镜像
+`eceasy/cli-proxy-api:latest` 的版本要一致。
+
+#### glibc 兼容性检查（每次都要做）
+
+这是 cgo `c-shared` 产物，动态链接 glibc。编译镜像和运行镜像的 glibc 版本不是
+一回事：
+
+| | 发行版 | glibc |
+|---|---|---|
+| 编译用 `golang:1.26` | Debian 13 (trixie) | 2.41 |
+| 运行用 CPA 容器 | Debian 12 (bookworm) | 2.36 |
+
+**高版本 glibc 编出来的东西，在低版本上可能跑不起来。** 当前这一组合已经验证过
+依赖解析干净、无 `version not found`，但**将来 Go 镜像基底再往上跳时这个前提会
+失效**。
+
+所以每次编完，都要**在和 CPA 完全相同的镜像里**验一次：
+
+```bash
+docker run --rm \
+  -v /home/dnc/cpa-plugin-codex-turn-state/build/linux/amd64:/chk:ro \
+  --entrypoint ldd \
+  eceasy/cli-proxy-api:latest /chk/codex-turn-state.so
+```
+
+输出里每一行都要解析到具体路径。出现 `not found` 或
+`version 'GLIBC_2.xx' not found` 就是不兼容，**不要部署**——换低版本 Go 镜像
+重编（`GO_IMAGE=golang:1.25-bookworm scripts/build.sh`）。
+
+这是唯一能在部署前发现这类问题的手段。真部署上去才发现的话，表现是 CPA 启动时
+插件加载失败，而那时业务已经重启过了。
 
 ### 0.4 记下 5 个账号文件名
 
+**用管理 API 查，不要 `ls` 读文件：**
+
 ```bash
-ls /home/dnc/cpamp-deploy/cpa-data/auths/codex-*.json | grep -v '\.bak'
+curl -s -H "Authorization: Bearer $KEY" \
+  http://127.0.0.1:8317/v0/management/auth-files
 ```
 
-把输出的 5 个文件名填进下表。**只填文件名，不要写 token、不要贴文件内容。**
+#### ⚠️ 为什么不能读文件
+
+实测发现：`cpa-data/auths/` 下**有账号文件是 root 属主**——CPA 以 root 身份刷新
+token 时把属主改掉了。宿主上以普通用户去读会 `PermissionError`。
+
+坏就坏在它的**失败方式**：清点会少一个号，而且**不报错**，只是那一行读不出来。
+很容易被当成「文件损坏」去查，实际上文件好好的，只是你没权限。
+
+管理 API 不受属主影响，是**权威来源**。
+
+这和 0.2 里 store 目录那个 root 属主问题**同源**：CPA 是 root，你不是。凡是要
+清点 CPA 自己管理的状态，优先走接口，不要在宿主上读文件。
+
+实在要读文件时加 `sudo`：
+
+```bash
+sudo ls /home/dnc/cpamp-deploy/cpa-data/auths/codex-*.json | grep -v '\.bak'
+```
+
+把查到的 5 个文件名填进下表。**只填文件名，不要写 token、不要贴文件内容。**
 
 | # | 账号 JSON 文件名 | 探测完成 |
 |---|---|---|
@@ -113,6 +192,52 @@ ls /home/dnc/cpamp-deploy/cpa-data/auths/codex-*.json | grep -v '\.bak'
 
 这 5 个是 `auths/` 下现有的全部 Codex 账号。**实际这次要探几个号，见第 8 步
 之前的确认要求**——不要默认就是 5 个。
+
+### 0.5 验证看板页面可达
+
+> **执行时机：第 6 步部署完新 `.so` 并重启 CPA 之后。** 页面是新 `.so` 带来
+> 的，部署前它还不存在。列在第 0 步是为了不漏掉这项验收。
+
+插件注册了一个看板页面和三条数据接口，详见 [README.md](README.md) 的
+「管理 API 与看板页面」。
+
+**先用命令行确认接口活着**（`X-Management-Key` 或 `Authorization: Bearer`，
+没有 cookie、不接受 query 参数）：
+
+```bash
+# 外壳页面：不鉴权，应返回 HTML
+curl -s -o /dev/null -w '%{http_code}\n' \
+  http://127.0.0.1:8317/v0/resource/plugins/codex-turn-state/
+
+# status：鉴权，不带密钥应 401
+curl -s -o /dev/null -w '%{http_code}\n' \
+  http://127.0.0.1:8317/v0/management/codex-turn-state/status
+
+# status：带密钥应 200 + JSON
+curl -s -H 'X-Management-Key: <管理密钥>' \
+  http://127.0.0.1:8317/v0/management/codex-turn-state/status
+```
+
+三条的预期分别是 `200`、`401`、`200 + JSON`。**第二条必须是 401**——如果不带
+密钥也能拿到数据，说明数据路由被降级成公开的了，参见 README 里
+「数据路由绝对不能带 `Menu` 字段」那一节，立即停下来查路由注册。
+
+**再用浏览器确认页面**：
+
+CPA 只监听 `127.0.0.1:8317`，浏览器要访问得先开隧道：
+
+```bash
+ssh -N -L 8317:127.0.0.1:8317 ovh
+```
+
+然后在 CPAMP 菜单里找到 **`Codex Turn-State`**，点开，粘管理密钥，确认能拉到
+status 数据（桶数、`role`、`dry_run` 当前值）。密钥只存 `sessionStorage`，
+关标签页就没了，每次打开都要重新粘。
+
+> ⚠️ 页面上的「连通性自检」按钮**能打通上游、会消耗额度，但永远不产生桶**——
+> 宿主的防递归设计让插件自己发的请求不经过自己的响应钩子。它只能证明账号和
+> 协议通不通。**真正的采集只有第 9 步的 `scripts/probe.py` 一条路**，不要点着
+> 自检等桶出现。详见 README。
 
 ---
 
@@ -167,6 +292,9 @@ CPA 不热加载新的 `.so`，进程必须重启。日志里应当出现
 此时 config 里还没有 `role`，按第 2 条须知会落到 `business`，且 `store_dir`
 未配 → 纯 no-op。这是预期状态。
 
+**部署完这里就去做第 0.5 步**（验证看板页面可达 + 三条接口鉴权正确）。页面是
+这个新 `.so` 带来的，到这一步才存在。
+
 ### 7. yaml 设 `role: probe`
 
 改 `/home/dnc/cpamp-deploy/cpa-data/config.yaml` 的
@@ -208,6 +336,15 @@ docker logs cli-proxy-api --since 2m 2>&1 | grep -i "codex-turn-state.*configure
 理由：探测要精确知道每个 292 属于哪个账号。CPA 的调度只会在**已启用**的账号里
 选，不要假定能在请求层面指定账号。
 
+> **「自检不是能指定 `auth_id` 吗，为什么探测还要停号？」**
+>
+> 因为两条路不一样：自检走插件的 host 调用，有 `AuthID` 字段能锁定凭据，但那条
+> 路的响应**会被宿主跳过本插件的拦截器**，所以采不到、不落桶。`probe.py` 必须
+> 走公开代理接口才能让响应经过插件钩子，而那条路径**没有**指定账号的字段。
+>
+> **能定向的采不到，能采到的不能定向。** 详见 [README.md](README.md) 的
+> 「⚠️ 不对称」一节。所以这一步的停号**不能省**。
+
 ### 9. 跑 `probe --until-complete`
 
 ```bash
@@ -233,9 +370,21 @@ complete。
 
 ### 10. 人工检查 store：5×5
 
+**首选走 `status` 接口**——桶文件是 `root:root 0600`，普通用户读不了（见
+0.2）：
+
 ```bash
-find /home/dnc/cpamp-deploy/cpa-data/turn-state-store -name '*.json' | sort
-cat /home/dnc/cpamp-deploy/cpa-data/turn-state-store/index.json
+curl -s -H 'X-Management-Key: <管理密钥>' \
+  http://127.0.0.1:8317/v0/management/codex-turn-state/status
+```
+
+或者直接在看板页面上看（第 0.5 步开的隧道）。
+
+需要落到文件层面核对时，加 `sudo`：
+
+```bash
+sudo find /home/dnc/cpamp-deploy/cpa-data/turn-state-store -name '*.json' | sort
+sudo cat /home/dnc/cpamp-deploy/cpa-data/turn-state-store/index.json
 ```
 
 要确认：
@@ -315,6 +464,14 @@ docker logs cli-proxy-api --since 2m 2>&1 | grep -i "codex-turn-state.*configure
 - [ ] 过期文件不再替换
 - [ ] 业务请求带 292 时 store 内容不变
 - [ ] 无头请求不被强灌 292
+
+以上 9 项是规格第 10 节的原文。以下是管理 API / 看板页面带来的补充项
+（规格写定之后才加的功能）：
+
+- [ ] `ldd` 在 CPA 同款镜像里检查 `.so`，依赖全部解析干净、无 `version not found`
+- [ ] CPAMP 菜单里出现 `Codex Turn-State`，粘密钥后能拉到 status
+- [ ] **不带密钥请求 `/v0/management/codex-turn-state/status` 返回 401**
+      （返回 200 说明数据路由被降级成公开的了，立即停下来查 `Menu` 字段）
 
 给同事的回执只需要：账号文件名、模型、长度、决定、时间。**不要贴 state。**
 

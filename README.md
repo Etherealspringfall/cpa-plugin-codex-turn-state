@@ -262,6 +262,157 @@ gpt-6-astra
 **值本身永远不进日志。** `X-Codex-Turn-State` 是凭据相邻的机密：不打进日志、
 不提交进仓库、不贴进 PR、不贴进聊天。
 
+## 管理 API 与看板页面
+
+插件注册了一个看板页面和三条数据接口。页面在 CPAMP 菜单里叫
+**`Codex Turn-State`**。
+
+| 路由 | 前缀 | 鉴权 |
+|---|---|---|
+| `/`（菜单项 `Codex Turn-State`） | `/v0/resource/plugins/codex-turn-state/` | **否** |
+| `GET /codex-turn-state/status` | `/v0/management/` | 是 |
+| `POST /codex-turn-state/buckets/clear` | `/v0/management/` | 是 |
+| `POST /codex-turn-state/selftest` | `/v0/management/` | 是 |
+
+密钥走 `X-Management-Key` 头或 `Authorization: Bearer`，**没有 cookie、也不接受
+query 参数**（`handlers/management/handler.go:277-287`）。页面让用户手动粘密钥，
+只存进 `sessionStorage`——关掉标签页就没了，不落盘、不进 URL。
+
+### 为什么外壳页面不鉴权
+
+浏览器地址栏导航**带不上** `Authorization` 头。所以任何需要用浏览器直接打开的
+页面，都不能挂在鉴权路由下面，否则点开就是 401。
+
+CPA 自己的 `/management.html` 就是这么处理的：`server_routes.go:54` 直接挂在
+engine 上，没有套 `h.Middleware()`。
+
+本插件照搬这个模式：外壳是**零数据**的 HTML + JS，本身不含任何桶、账号或令牌
+信息；所有数据都由页面在浏览器里带着密钥去调上表那三条鉴权接口拿。外壳公开
+可读，但读它什么也读不到。
+
+### ⚠️ 数据路由绝对不能带 `Menu` 字段
+
+这是个很隐蔽的脚枪。CPA 的 `routeDeclaresLegacyMenuResource`
+（`internal/pluginhost/management.go:156`）会把**带 `Menu` 字段的 GET 路由降级
+注册到不鉴权的 resource 前缀下**。
+
+也就是说：给 `GET /codex-turn-state/status` 加一个 `Menu` 字段，它就从鉴权接口
+变成**公开接口**了——桶的就绪情况、账号文件名全部公开可读。
+
+规则：
+
+- **只有**外壳路由带 `Menu`（它本来就该是公开的、且零数据）。
+- 三条数据路由**一个都不许带 `Menu`**。
+
+已有测试守着这一条，改路由注册时不要绕过它。
+
+### ⚠️ 「连通性自检」不会产生桶
+
+`POST /codex-turn-state/selftest` 按钮**能打通上游、会消耗额度，但永远不产生
+桶**。
+
+原因是宿主的防递归设计：插件通过 `host.model.execute` 发出的请求，会被宿主标记
+为**跳过调用方插件自己的拦截器**（`host_callbacks_unix.go:43` →
+`host_callbacks.go:304` → `:306`）。插件自己发的请求不会再回到插件自己手里，
+否则就无限套娃了。
+
+后果是：自检请求的响应**不经过本插件的响应钩子**，所以采不到那个 292，也就写不
+出桶文件。
+
+**这个按钮的用途是把两类故障分开：**
+
+| 自检结果 | 说明 |
+|---|---|
+| 通 | 账号可用、协议对、上游可达。问题在采集链路上 |
+| 不通 | 账号或协议本身就有问题，先修这个，探测跑了也白跑 |
+
+**真正的采集只有 `scripts/probe.py` 一条路。** 不要点着自检按钮等桶出现——
+它永远不会出现。
+
+### 自检可以定点到某个账号
+
+自检接受一个**可选**的 `auth_id`，用来定点检查某个「账号 + 模型」组合：
+
+```http
+POST /v0/management/codex-turn-state/selftest
+Content-Type: application/json
+
+{"model": "gpt-5.6-sol", "auth_id": "codex-x.json"}
+```
+
+`auth_id` 不传就是「不指定，随调度器挑」。响应：
+
+```json
+{
+  "reached": true,
+  "status_code": 200,
+  "model": "gpt-5.6-sol",
+  "auth_id": "codex-x.json",
+  "targeted": true,
+  "harvested": false,
+  "note": "...",
+  "error": ""
+}
+```
+
+定向能力来自 `pluginapi.HostModelExecutionRequest.AuthID`——注释写的是
+*optionally locks execution to an exact credential ID*，
+`internal/pluginhost/host_callbacks.go:330` 的 `modelExecutionRequestFromPlugin`
+把它原样透传下去。
+
+`targeted` 字段要单独说一下：**不传 `auth_id` 时，我们无法得知实际用了哪个号**
+——`HostModelExecutionResponse` 里不含账号标识。所以 `targeted: false` 表达的是
+「**我们没问、也问不出来**」，它和「调度器没选到号」是两回事，不要混为一谈。
+
+`harvested` 恒为 `false`，原因见上一节。
+
+### ⚠️ 不对称：能定向的采不到，能采到的不能定向
+
+这条一定要看明白，否则会反复纠结「为什么自检不用停号，探测却非要停」。
+
+| | 自检 `POST /selftest` | 采集 `scripts/probe.py` |
+|---|---|---|
+| 走哪条路 | 插件的 host 调用 `host.model.execute` | CPA 的**公开代理接口** |
+| 能否指定账号 | **能**，有 `AuthID` 字段锁定凭据 | **不能**，那条路径没有这个字段 |
+| 要不要停用其它号 | **不需要** | **需要**，只能靠停用别的号来定向 |
+| 响应过不过本插件的钩子 | **不过**（宿主跳过调用方自己的拦截器） | **过**，所以采得到 |
+| 能不能落桶 | 不能 | 能 |
+
+两句话概括：
+
+- **自检能定向，但采不到。** 它走的 host 调用会被宿主跳过本插件的响应拦截器
+  （`host_callbacks_unix.go:43` → `host_callbacks.go:304` → `:306`），
+  这和上一节自检不落盘是**同一个原因**。
+- **采集能采到，但不能定向。** `probe.py` 走公开代理接口才能让响应经过本插件的
+  钩子，而那条路径没有 `AuthID` 这种东西。
+
+**所以采集不能改走插件的 host 调用来图省事**——改了就采不到任何东西了。
+
+结论：规格第 7 节那句「CPA 调度只会选已启用的号，**不要假定能指定账号**」对
+`probe.py` **仍然成立**。`probe.py` 里的账号启用状态**快照 + 恢复**机制是必需
+的，不是冗余设计，不要因为「自检都能定向了」就把它删掉。
+
+### 切 `role` 之后可能需要重启
+
+能力声明（`response_interceptor` 等）是**注册时**上报的，而 `probe` 和
+`business` 声明的能力集不一样。配置热重载不一定会重新协商能力。
+
+所以切完 `role` 后，如果看板上的 `role` 没变、或者探测跑起来一个桶都不出，
+**重启一次 `cli-proxy-api`**。页面上也有这条提示。
+
+### 插件不能持久化自己的配置
+
+宿主没有给插件提供保存配置的接口——`host.*` 系列方法里只有 `host.auth.save`，
+没有对应的 config 保存。
+
+所以页面上翻 `dry_run`、切 `role` 走的不是插件自己的接口，而是 CPA 原生的：
+
+```
+PATCH /v0/management/plugins/codex-turn-state/config
+```
+
+这是**浅合并**：只提交要改的键，没提交的键保持原值。
+
 ## 构建
 
 构建在一次性 Go 容器里跑，宿主只需要 Docker：

@@ -1,0 +1,967 @@
+<!DOCTYPE html>
+<!--
+  codex-turn-state 看板。
+
+  这个文件由 go:embed 嵌进插件二进制（见 go/management.go），改完必须重新跑
+  scripts/build.sh 编出新的 .so 并重启 CPA 才会生效 —— 它不是从磁盘读的，
+  编辑服务器上的 ui.html 不会有任何效果。
+
+  页面自身由 /v0/resource/plugins/codex-turn-state/ 伺服，那条路由【不鉴权】，
+  所以这里不包含任何数据：一切都靠带 X-Management-Key 头去调 /v0/management/
+  下的接口现取。不要往这个文件里写任何密钥、账号名或 token。
+-->
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<title>codex-turn-state</title>
+<style>
+:root {
+  --bg: #ffffff;
+  --fg: #16181d;
+  --muted: #6b7280;
+  --faint: #9aa1ab;
+  --border: #e0e3e8;
+  --card: #f7f8fa;
+  --raised: #ffffff;
+  --ok: #0a7d33;
+  --ok-bg: #e7f5ec;
+  --warn: #8a5a00;
+  --warn-bg: #fff3df;
+  --bad: #b3261e;
+  --bad-bg: #fdecea;
+  --accent: #1a56db;
+  --accent-bg: #e8f0fe;
+  --shadow: 0 2px 8px rgba(0,0,0,.09);
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #14161a;
+    --fg: #e6e8ec;
+    --muted: #9aa1ab;
+    --faint: #6b7280;
+    --border: #2b2f36;
+    --card: #1a1d22;
+    --raised: #1f232a;
+    --ok: #4ade80;
+    --ok-bg: #12291b;
+    --warn: #fbbf24;
+    --warn-bg: #2e2410;
+    --bad: #f87171;
+    --bad-bg: #2e1615;
+    --accent: #7ba7ff;
+    --accent-bg: #16233d;
+    --shadow: 0 2px 10px rgba(0,0,0,.5);
+  }
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; padding: 0; }
+body {
+  background: var(--bg);
+  color: var(--fg);
+  font: 14px/1.5 ui-sans-serif, system-ui, -apple-system, "Segoe UI", "Noto Sans CJK SC", "Microsoft YaHei", sans-serif;
+  padding: 18px;
+}
+code, .mono, td.cell, th.model, .kv b {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+}
+h1 { font-size: 17px; margin: 0; font-weight: 650; letter-spacing: .2px; }
+h2 { font-size: 13px; margin: 0 0 8px; font-weight: 650; color: var(--muted);
+     text-transform: uppercase; letter-spacing: .6px; }
+.wrap { max-width: 1100px; margin: 0 auto; }
+.row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+.spacer { flex: 1 1 auto; }
+section { margin-bottom: 18px; }
+.card {
+  background: var(--card); border: 1px solid var(--border);
+  border-radius: 8px; padding: 12px 14px;
+}
+
+/* ---------- 密钥输入门 ---------- */
+#gate { max-width: 520px; margin: 8vh auto; }
+#gate p { color: var(--muted); margin: 8px 0 14px; }
+#gate input {
+  width: 100%; padding: 9px 11px; font-family: inherit; font-size: 14px;
+  background: var(--raised); color: var(--fg);
+  border: 1px solid var(--border); border-radius: 6px;
+}
+#gate input:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+
+/* ---------- 顶栏 ---------- */
+header.bar { margin-bottom: 14px; }
+.badges { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 10px; }
+.badge {
+  display: inline-flex; align-items: baseline; gap: 6px;
+  padding: 4px 9px; border-radius: 6px; border: 1px solid var(--border);
+  background: var(--raised); font-size: 12px;
+}
+.badge span { color: var(--muted); }
+.badge b { font-weight: 650; font-size: 12px; }
+.badge.role-probe { background: var(--accent-bg); border-color: var(--accent); }
+.badge.role-probe b { color: var(--accent); }
+.badge.role-business { background: var(--ok-bg); border-color: var(--ok); }
+.badge.role-business b { color: var(--ok); }
+.badge.dry-on { background: var(--warn-bg); border-color: var(--warn); }
+.badge.dry-on b { color: var(--warn); }
+.badge.dry-off { background: var(--bad-bg); border-color: var(--bad); }
+.badge.dry-off b { color: var(--bad); }
+.freshness { font-size: 12px; color: var(--muted); text-align: right; }
+.freshness.stale { color: var(--bad); }
+
+/* ---------- 桶矩阵 ---------- */
+.summary { font-size: 13px; color: var(--muted); margin-bottom: 8px; }
+.summary b { color: var(--fg); font-size: 15px; }
+.tablewrap { overflow-x: auto; }
+table { border-collapse: collapse; width: 100%; font-size: 12.5px; }
+th, td { border: 1px solid var(--border); padding: 5px 8px; text-align: left; }
+th { background: var(--raised); font-weight: 600; white-space: nowrap; }
+th.model { font-size: 12px; text-align: center; }
+td.acct { white-space: nowrap; color: var(--muted); max-width: 260px;
+          overflow: hidden; text-overflow: ellipsis; }
+td.cell { text-align: center; padding: 0; position: relative; }
+/* 自检入口。做成角标而不是改格子的点击语义：左键点格子仍然是「清空此桶」，
+   而且缺桶的格子主按钮是 disabled 的 —— 但那正是最需要自检的格子
+   （「这个桶为什么一直采不到」的第一步），所以角标在任何状态下都可点。
+   平时不显示，hover 或键盘聚焦时才出现，免得把矩阵刷成一片图标。 */
+.cellprobe {
+  position: absolute; top: 1px; right: 1px;
+  font-size: 10px; line-height: 1.1; padding: 1px 3px;
+  border: 1px solid var(--border); border-radius: 3px;
+  background: var(--raised); color: var(--muted);
+  cursor: pointer; opacity: 0; transition: opacity .1s;
+}
+td.cell:hover .cellprobe, .cellprobe:focus { opacity: 1; }
+.cellprobe:hover { color: var(--accent); border-color: var(--accent); }
+td.cell button {
+  width: 100%; height: 100%; min-height: 30px;
+  border: 0; background: transparent; cursor: pointer;
+  font: inherit; font-family: ui-monospace, Menlo, Consolas, monospace;
+  padding: 5px 4px; color: inherit;
+}
+td.cell button:hover { outline: 2px solid var(--accent); outline-offset: -2px; }
+td.cell button:disabled { cursor: default; }
+td.cell button:disabled:hover { outline: 0; }
+.st-ok { background: var(--ok-bg); color: var(--ok); }
+.st-warn { background: var(--warn-bg); color: var(--warn); }
+.st-miss { background: transparent; color: var(--faint); }
+.legend { margin-top: 8px; font-size: 12px; color: var(--muted);
+          display: flex; gap: 16px; flex-wrap: wrap; }
+.swatch { display: inline-block; width: 10px; height: 10px; border-radius: 2px;
+          margin-right: 5px; vertical-align: -1px; border: 1px solid var(--border); }
+
+/* ---------- 计数 ---------- */
+.counters { display: flex; gap: 10px; flex-wrap: wrap; }
+.counter { flex: 1 1 110px; background: var(--raised); border: 1px solid var(--border);
+           border-radius: 7px; padding: 9px 11px; }
+.counter .n { font-size: 20px; font-weight: 650;
+              font-family: ui-monospace, Menlo, Consolas, monospace; }
+.counter .l { font-size: 11.5px; color: var(--muted); text-transform: uppercase;
+              letter-spacing: .5px; }
+.since { font-size: 12px; color: var(--muted); margin-top: 8px; }
+
+/* ---------- 按钮 ---------- */
+button.btn {
+  font: inherit; padding: 6px 12px; border-radius: 6px; cursor: pointer;
+  border: 1px solid var(--border); background: var(--raised); color: var(--fg);
+}
+button.btn:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
+button.btn:disabled { opacity: .5; cursor: default; }
+button.btn.danger { border-color: var(--bad); color: var(--bad); background: var(--bad-bg); }
+button.btn.primary { border-color: var(--accent); color: #fff; background: var(--accent); }
+button.btn.primary:hover:not(:disabled) { color: #fff; filter: brightness(1.1); }
+/* ghost 是诊断类操作的视觉权重：比主操作轻一档，但不能藏 —— 单号试跑时
+   第一个要点的就是它。 */
+button.btn.ghost { background: transparent; color: var(--muted); }
+button.btn.ghost:hover:not(:disabled) { color: var(--accent); border-color: var(--accent); }
+.subtle { margin-top: 12px; padding-top: 11px; border-top: 1px dashed var(--border); }
+.sublabel { font-size: 11.5px; color: var(--faint); text-transform: uppercase;
+            letter-spacing: .6px; font-weight: 650; }
+select {
+  font: inherit; padding: 6px 9px; border-radius: 6px;
+  border: 1px solid var(--border); background: var(--raised); color: var(--fg);
+}
+.hint { font-size: 12px; color: var(--muted); margin-top: 8px; }
+.hint.warn { color: var(--warn); }
+.warntext { color: var(--warn); }
+.hint code { font-size: 11.5px; padding: 1px 4px; border-radius: 3px;
+             background: var(--raised); border: 1px solid var(--border); }
+
+/* ---------- 通知 ---------- */
+.notice {
+  border-radius: 7px; padding: 9px 12px; margin-bottom: 10px; font-size: 13px;
+  border: 1px solid var(--border); background: var(--raised);
+  display: flex; gap: 10px; align-items: flex-start;
+}
+.notice.err { background: var(--bad-bg); border-color: var(--bad); color: var(--bad); }
+.notice.ok { background: var(--ok-bg); border-color: var(--ok); color: var(--ok); }
+.notice.info { background: var(--accent-bg); border-color: var(--accent); color: var(--accent); }
+/* warn 专门给「链路通了但上游拒绝」这种组合。它既不是成功也不是失败，
+   压成红或绿都会让人看错方向。 */
+.notice.warn { background: var(--warn-bg); border-color: var(--warn); color: var(--warn); }
+.notice .msg { flex: 1 1 auto; white-space: pre-wrap; word-break: break-word; }
+.notice button {
+  border: 0; background: transparent; color: inherit; cursor: pointer;
+  font: inherit; opacity: .65; padding: 0 2px;
+}
+
+/* ---------- 模态确认 ---------- */
+#modal {
+  position: fixed; inset: 0; background: rgba(0,0,0,.45);
+  display: flex; align-items: center; justify-content: center; padding: 20px;
+  z-index: 50;
+}
+#modal .box {
+  background: var(--bg); border: 1px solid var(--border); border-radius: 10px;
+  box-shadow: var(--shadow); max-width: 520px; width: 100%; padding: 18px 20px;
+}
+#modal h3 { margin: 0 0 10px; font-size: 15px; }
+#modal .lines p { margin: 0 0 8px; font-size: 13.5px; color: var(--fg); }
+#modal .lines p.em { color: var(--bad); font-weight: 600; }
+#modal .acts { display: flex; gap: 8px; justify-content: flex-end; margin-top: 16px; }
+[hidden] { display: none !important; }
+</style>
+</head>
+<body>
+
+<!-- 密钥输入门：页面本身不鉴权，数据接口鉴权，所以密钥在这里要。 -->
+<div id="gate" hidden>
+  <h1>codex-turn-state</h1>
+  <p>这个页面本身不鉴权，数据接口鉴权。请粘贴 CPA 管理密钥。<br>
+     密钥只存在本标签页的 sessionStorage 里，关掉标签页即失效，不会写入 URL 或磁盘。</p>
+  <div id="gateNotice"></div>
+  <form id="gateForm" autocomplete="off">
+    <input id="gateKey" type="password" placeholder="管理密钥" autocomplete="off" spellcheck="false">
+    <div class="row" style="margin-top:10px">
+      <button class="btn primary" type="submit">进入</button>
+    </div>
+  </form>
+</div>
+
+<div id="app" class="wrap" hidden>
+  <header class="bar">
+    <div class="row">
+      <h1>codex-turn-state</h1>
+      <div class="spacer"></div>
+      <div class="freshness" id="freshness"></div>
+      <button class="btn" id="btnPause" type="button">暂停刷新</button>
+      <button class="btn" id="btnForget" type="button">清除密钥</button>
+    </div>
+    <div class="badges" id="badges"></div>
+  </header>
+
+  <div id="notices"></div>
+
+  <section>
+    <h2>桶就绪度</h2>
+    <div class="summary" id="summary"></div>
+    <div class="tablewrap"><table id="matrix"></table></div>
+    <div class="legend">
+      <span><i class="swatch st-ok"></i>就绪（显示剩余时长）</span>
+      <span><i class="swatch st-warn"></i>剩余不足 10 分钟</span>
+      <span><i class="swatch st-miss"></i>缺失或已过期</span>
+      <span>点格子可清空该桶</span>
+    </div>
+  </section>
+
+  <section>
+    <h2>决策计数</h2>
+    <div class="counters" id="counters"></div>
+    <div class="since" id="since"></div>
+  </section>
+
+  <section>
+    <h2>操作</h2>
+    <div class="card">
+      <div class="row">
+        <button class="btn" id="btnDryRun" type="button">翻 dry_run</button>
+        <button class="btn" id="btnRole" type="button">切 role</button>
+        <button class="btn danger" id="btnClearAll" type="button">清空全部桶</button>
+      </div>
+      <div class="subtle">
+        <div class="row">
+          <span class="sublabel">诊断</span>
+          <select id="selftestAuth" aria-label="自检账号"></select>
+          <select id="selftestModel" aria-label="自检模型"></select>
+          <button class="btn ghost" id="btnSelftest" type="button">连通性自检</button>
+        </div>
+        <div class="hint">
+          只验证「请求能否打到上游、上游回了什么状态码」。<b>不会产生桶</b> ——
+          宿主会让插件自己发出的请求跳过本插件的响应钩子，所以自检永远采不到模板，
+          采集只能用 <code>scripts/probe.py</code>。<b class="warntext">会消耗额度。</b>
+          定向到具体账号时<b>不需要</b>停用其它账号；也可以在桶矩阵里 hover 任一格子，
+          用右上角的角标直接自检那对（账号, 模型）。
+        </div>
+      </div>
+    </div>
+  </section>
+</div>
+
+<div id="modal" hidden>
+  <div class="box" role="dialog" aria-modal="true" aria-labelledby="modalTitle">
+    <h3 id="modalTitle"></h3>
+    <div class="lines" id="modalLines"></div>
+    <div class="acts">
+      <button class="btn" id="modalCancel" type="button">取消</button>
+      <button class="btn" id="modalOk" type="button"></button>
+    </div>
+  </div>
+</div>
+
+<script>
+"use strict";
+
+// 密钥只放 sessionStorage。localStorage 会跨标签页、跨重启留存，管理密钥不该
+// 有那种寿命；URL 更不行（会进历史记录、Referer 和反代日志）。
+var KEY_STORE = "cts.mgmtKey";
+var POLL_MS = 10000;
+
+var MGMT = "/v0/management";
+var API = MGMT + "/codex-turn-state";
+var CONFIG_API = MGMT + "/plugins/codex-turn-state/config";
+
+var state = {
+  key: null,
+  data: null,         // 最后一次成功的 status
+  lastGood: null,     // 最后一次成功刷新的时刻
+  lastError: null,    // 最近一次刷新失败的原因
+  paused: false,
+  timer: null,
+  busy: false
+};
+
+/* ---------------- DOM 小工具（一律 textContent，不拼 innerHTML） -------------- */
+
+function $(id) { return document.getElementById(id); }
+
+function el(tag, opts, kids) {
+  var n = document.createElement(tag);
+  opts = opts || {};
+  if (opts.cls) { n.className = opts.cls; }
+  if (opts.text !== undefined && opts.text !== null) { n.textContent = String(opts.text); }
+  if (opts.attrs) {
+    Object.keys(opts.attrs).forEach(function (k) { n.setAttribute(k, opts.attrs[k]); });
+  }
+  if (opts.on) {
+    Object.keys(opts.on).forEach(function (k) { n.addEventListener(k, opts.on[k]); });
+  }
+  (kids || []).forEach(function (c) { if (c) { n.appendChild(c); } });
+  return n;
+}
+
+function clear(n) { while (n.firstChild) { n.removeChild(n.firstChild); } }
+
+/* ---------------------------- 格式化 ---------------------------- */
+
+// seconds_left 只在矩阵格子里显示，宽度有限，所以取最短可读形式。
+function fmtLeft(sec) {
+  if (sec === null || sec === undefined || !isFinite(sec) || sec <= 0) { return "—"; }
+  var s = Math.floor(sec);
+  if (s < 60) { return "<1m"; }
+  if (s < 3600) { return Math.floor(s / 60) + "m"; }
+  var h = Math.floor(s / 3600);
+  var m = Math.floor((s % 3600) / 60);
+  return h + "h" + (m < 10 ? "0" : "") + m + "m";
+}
+
+function fmtTime(iso) {
+  if (!iso) { return "—"; }
+  var d = new Date(iso);
+  if (isNaN(d.getTime())) { return String(iso); }
+  return d.toLocaleString();
+}
+
+function fmtAgo(d) {
+  if (!d) { return "从未"; }
+  var s = Math.max(0, Math.round((Date.now() - d.getTime()) / 1000));
+  if (s < 60) { return s + " 秒前"; }
+  if (s < 3600) { return Math.floor(s / 60) + " 分钟前"; }
+  return d.toLocaleTimeString();
+}
+
+/* ---------------------------- 通知条 ---------------------------- */
+
+function notify(kind, message) {
+  var box = $("notices");
+  var line = el("div", { cls: "notice " + kind });
+  line.appendChild(el("div", { cls: "msg", text: message }));
+  var close = el("button", { text: "✕", attrs: { type: "button", "aria-label": "关闭" } });
+  close.addEventListener("click", function () { line.remove(); });
+  line.appendChild(close);
+  box.appendChild(line);
+  // 成功类提示会话性地自己消失；错误留着，等人看。
+  if (kind === "ok") { setTimeout(function () { line.remove(); }, 6000); }
+  return line;
+}
+
+function gateNotice(message) {
+  var box = $("gateNotice");
+  clear(box);
+  if (message) {
+    box.appendChild(el("div", { cls: "notice err" }, [el("div", { cls: "msg", text: message })]));
+  }
+}
+
+/* ---------------------------- 模态确认 ---------------------------- */
+
+function confirmDialog(opts) {
+  return new Promise(function (resolve) {
+    var modal = $("modal");
+    $("modalTitle").textContent = opts.title;
+    var lines = $("modalLines");
+    clear(lines);
+    (opts.lines || []).forEach(function (l) {
+      lines.appendChild(el("p", { cls: l.em ? "em" : "", text: l.text }));
+    });
+    var ok = $("modalOk");
+    var cancel = $("modalCancel");
+    ok.textContent = opts.confirmText || "确认";
+    ok.className = "btn " + (opts.danger ? "danger" : "primary");
+
+    function done(v) {
+      modal.hidden = true;
+      ok.removeEventListener("click", onOk);
+      cancel.removeEventListener("click", onCancel);
+      document.removeEventListener("keydown", onKey);
+      resolve(v);
+    }
+    function onOk() { done(true); }
+    function onCancel() { done(false); }
+    function onKey(e) { if (e.key === "Escape") { done(false); } }
+
+    ok.addEventListener("click", onOk);
+    cancel.addEventListener("click", onCancel);
+    document.addEventListener("keydown", onKey);
+    modal.hidden = false;
+    cancel.focus();
+  });
+}
+
+/* ---------------------------- 鉴权与请求 ---------------------------- */
+
+function setKey(k) {
+  state.key = k;
+  try { sessionStorage.setItem(KEY_STORE, k); } catch (e) { /* 隐私模式下忽略 */ }
+}
+
+function forgetKey(reason) {
+  state.key = null;
+  try { sessionStorage.removeItem(KEY_STORE); } catch (e) { /* 忽略 */ }
+  stopPolling();
+  state.data = null;
+  state.lastGood = null;
+  $("app").hidden = true;
+  $("gate").hidden = false;
+  gateNotice(reason || null);
+  $("gateKey").value = "";
+  $("gateKey").focus();
+}
+
+// ApiError 携带服务端原话。403 的原因有好几种（远程管理关闭、IP 被封 30 分钟），
+// 自己改写成「失败」会把排障线索丢掉，所以一律原样透出。
+function ApiError(status, message) {
+  this.status = status;
+  this.message = message;
+}
+ApiError.prototype = Object.create(Error.prototype);
+
+function api(path, opts) {
+  opts = opts || {};
+  var init = {
+    method: opts.method || "GET",
+    headers: { "X-Management-Key": state.key },
+    cache: "no-store"
+  };
+  if (opts.body !== undefined) {
+    init.headers["Content-Type"] = "application/json";
+    init.body = JSON.stringify(opts.body);
+  }
+  return fetch(path, init).then(function (res) {
+    return res.text().then(function (raw) {
+      var parsed = null;
+      if (raw) { try { parsed = JSON.parse(raw); } catch (e) { parsed = null; } }
+      if (res.ok) { return parsed === null ? {} : parsed; }
+      var msg = (parsed && (parsed.error || parsed.message)) || raw || ("HTTP " + res.status);
+      throw new ApiError(res.status, String(msg));
+    });
+  });
+}
+
+// 401/403 一律退回输入态。401 是密钥本身不对；403 另有原因，把服务端原话带上。
+function handleAuthFailure(err) {
+  if (err.status === 401) {
+    forgetKey("密钥无效或已失效：" + err.message);
+    return true;
+  }
+  if (err.status === 403) {
+    forgetKey("被拒绝（HTTP 403）：" + err.message);
+    return true;
+  }
+  return false;
+}
+
+/* ---------------------------- 渲染 ---------------------------- */
+
+function renderBadges(d) {
+  var box = $("badges");
+  clear(box);
+
+  function badge(label, value, cls) {
+    box.appendChild(el("div", { cls: "badge " + (cls || "") }, [
+      el("span", { text: label }),
+      el("b", { text: value })
+    ]));
+  }
+
+  badge("role", d.role || "—", d.role === "probe" ? "role-probe" : "role-business");
+  // dry_run=true 是安全态（只打日志不改流量），false 才是在动真流量 —— 所以
+  // OFF 用告警色，别让人扫一眼以为「绿灯=没事」。
+  badge("dry_run", d.dry_run ? "ON（只记录，不改流量）" : "OFF（正在改写真实流量）",
+        d.dry_run ? "dry-on" : "dry-off");
+  badge("inject_mode", d.inject_mode || "—");
+  badge("ttl", (d.ttl_seconds || 0) + "s");
+  badge("长度", (d.template_length || 0) + " → 换 " + (d.replace_length || 0));
+  badge("store_dir", d.store_dir || "—");
+}
+
+function renderFreshness() {
+  var n = $("freshness");
+  clear(n);
+  n.className = "freshness" + (state.lastError ? " stale" : "");
+  if (state.lastError) {
+    // 降级态：保留旧数据，但明确告诉人这份数据是什么时候的、为什么没更新。
+    n.appendChild(el("div", { text: "刷新失败：" + state.lastError }));
+    n.appendChild(el("div", { text: "上次成功刷新于 " + fmtAgo(state.lastGood) }));
+  } else {
+    n.appendChild(el("div", { text: "刷新于 " + fmtAgo(state.lastGood) + (state.paused ? "（已暂停）" : "") }));
+  }
+}
+
+// 账号清单没有专门的接口，就从 buckets 里去重得出 —— 矩阵的行和自检的账号
+// 下拉必须是同一份，否则会出现「矩阵里有的号，下拉里选不到」。
+function uniqueAuthIds(buckets) {
+  var out = [];
+  var seen = Object.create(null);
+  (buckets || []).forEach(function (b) {
+    if (b && b.auth_id && !seen[b.auth_id]) { seen[b.auth_id] = true; out.push(b.auth_id); }
+  });
+  out.sort();
+  return out;
+}
+
+function renderMatrix(d) {
+  var models = (d.models || []).slice();
+  var buckets = d.buckets || [];
+
+  // 账号行取自 buckets 里出现过的 auth_id。缺的格子要占位，所以行列先定全，
+  // 再往里填，而不是只画 buckets 里有的那些。
+  var accounts = uniqueAuthIds(buckets);
+
+  var byKey = Object.create(null);
+  buckets.forEach(function (b) {
+    if (b && b.auth_id && b.model) { byKey[b.auth_id + " " + b.model] = b; }
+  });
+
+  var ready = 0;
+  var total = accounts.length * models.length;
+
+  var table = $("matrix");
+  clear(table);
+
+  var thead = el("thead");
+  var hr = el("tr");
+  hr.appendChild(el("th", { text: "账号" }));
+  models.forEach(function (m) { hr.appendChild(el("th", { cls: "model", text: m })); });
+  thead.appendChild(hr);
+  table.appendChild(thead);
+
+  var tbody = el("tbody");
+  accounts.forEach(function (acct) {
+    var tr = el("tr");
+    tr.appendChild(el("td", { cls: "acct", text: acct, attrs: { title: acct } }));
+    models.forEach(function (m) {
+      var b = byKey[acct + " " + m];
+      var isReady = !!(b && b.ready);
+      var left = b ? b.seconds_left : null;
+      if (isReady) { ready++; }
+      var cls = !isReady ? "st-miss" : (left !== null && left < 600 ? "st-warn" : "st-ok");
+      var td = el("td", { cls: "cell" });
+      var label = isReady ? fmtLeft(left) : "—";
+      var title = isReady
+        ? (acct + " / " + m + "\n签发 " + fmtTime(b.issued_at) + "\n过期 " + fmtTime(b.expires_at) + "\n点击清空此桶")
+        : (acct + " / " + m + "\n缺失或已过期");
+      var btn = el("button", {
+        cls: cls, text: label,
+        attrs: { type: "button", title: title },
+        on: { click: function () { if (isReady) { doClearBucket(acct, m); } } }
+      });
+      if (!isReady) { btn.disabled = true; }
+      td.appendChild(btn);
+      // 角标对缺桶的格子同样可用 —— 主按钮 disabled，它不受影响。
+      td.appendChild(el("button", {
+        cls: "cellprobe", text: "试",
+        attrs: { type: "button", title: "自检 " + acct + " / " + m + "（不落盘，耗额度）" },
+        on: {
+          click: function (ev) {
+            ev.stopPropagation();
+            doSelfTest({ auth: acct, model: m });
+          }
+        }
+      }));
+      tr.appendChild(td);
+    });
+    tbody.appendChild(tr);
+  });
+  table.appendChild(tbody);
+
+  var s = $("summary");
+  clear(s);
+  if (total === 0) {
+    s.appendChild(el("span", { text: "store 里还没有任何桶 —— 探测尚未跑过，或 store_dir 为空。" }));
+  } else {
+    s.appendChild(el("span", { text: "就绪 " }));
+    s.appendChild(el("b", { text: ready + "/" + total }));
+    s.appendChild(el("span", { text: "  （" + accounts.length + " 个账号 × " + models.length + " 个模型）" }));
+  }
+}
+
+function renderCounters(d) {
+  var c = d.counters || {};
+  var box = $("counters");
+  clear(box);
+  [["harvest", "harvest"], ["substitute", "substitute"], ["pass", "pass"], ["skip", "skip"]]
+    .forEach(function (pair) {
+      box.appendChild(el("div", { cls: "counter" }, [
+        el("div", { cls: "n", text: (c[pair[0]] === undefined ? "—" : c[pair[0]]) }),
+        el("div", { cls: "l", text: pair[1] })
+      ]));
+    });
+  var since = $("since");
+  clear(since);
+  since.appendChild(el("span", { text: "统计自 " + fmtTime(c.since) + "（进程内计数，重启 CPA 会归零）" }));
+}
+
+function renderSelftestAuths(d) {
+  var sel = $("selftestAuth");
+  var prev = sel.value;
+  var hadOptions = sel.options.length > 0;
+  var accounts = uniqueAuthIds(d.buckets);
+
+  clear(sel);
+  accounts.forEach(function (a) {
+    sel.appendChild(el("option", { text: a, attrs: { value: a } }));
+  });
+  // 「不指定」排在最后且不是默认值：定向才是这个按钮的正常用法，而且不定向
+  // 时连「实际用了哪个号」都拿不到，没什么诊断价值。
+  sel.appendChild(el("option", { text: "不指定（由 CPA 调度决定）", attrs: { value: "" } }));
+
+  if (!hadOptions) {
+    // 首次填充：落在第一个具体账号上。
+    sel.value = accounts.length ? accounts[0] : "";
+  } else if (prev === "" || accounts.indexOf(prev) >= 0) {
+    sel.value = prev;           // 用户的选择（含明确选的「不指定」）要保住
+  } else {
+    sel.value = accounts.length ? accounts[0] : "";
+  }
+}
+
+function renderSelftestModels(d) {
+  var sel = $("selftestModel");
+  var prev = sel.value;
+  clear(sel);
+  (d.models || []).forEach(function (m) {
+    sel.appendChild(el("option", { text: m, attrs: { value: m } }));
+  });
+  if (prev) { sel.value = prev; }
+}
+
+function render() {
+  renderFreshness();
+  if (!state.data) { return; }
+  var d = state.data;
+  renderBadges(d);
+  renderMatrix(d);
+  renderCounters(d);
+  renderSelftestAuths(d);
+  renderSelftestModels(d);
+  $("btnDryRun").textContent = d.dry_run ? "关闭 dry_run（开始改写流量）" : "开启 dry_run（停止改写）";
+  $("btnRole").textContent = "切到 " + (d.role === "probe" ? "business" : "probe");
+}
+
+/* ---------------------------- 轮询 ---------------------------- */
+
+function refresh() {
+  if (!state.key) { return Promise.resolve(); }
+  return api(API + "/status").then(function (d) {
+    state.data = d;
+    state.lastGood = new Date();
+    state.lastError = null;
+    render();
+  }).catch(function (err) {
+    if (err instanceof ApiError && handleAuthFailure(err)) { return; }
+    // 关键：失败时不清 state.data。网络抖一下就把看板刷成空白，会让人以为
+    // 桶全没了 —— 那正是最容易引发误操作的时刻。
+    state.lastError = (err && err.message) ? err.message : String(err);
+    render();
+  });
+}
+
+function startPolling() {
+  stopPolling();
+  if (state.paused) { return; }
+  state.timer = setInterval(function () {
+    if (!state.busy) { refresh(); }
+  }, POLL_MS);
+}
+
+function stopPolling() {
+  if (state.timer) { clearInterval(state.timer); state.timer = null; }
+}
+
+// 即使暂停轮询，「刷新于 N 秒前」也要继续走，否则会停在一个骗人的旧读数上。
+setInterval(renderFreshness, 1000);
+
+/* ---------------------------- 操作 ---------------------------- */
+
+function withBusy(fn) {
+  if (state.busy) { return Promise.resolve(); }
+  state.busy = true;
+  return fn().then(function () { state.busy = false; },
+                   function (e) { state.busy = false; throw e; });
+}
+
+function actionError(err) {
+  if (err instanceof ApiError && handleAuthFailure(err)) { return; }
+  notify("err", (err && err.message) ? err.message : String(err));
+}
+
+function patchConfig(patch) {
+  return api(CONFIG_API, { method: "PATCH", body: patch });
+}
+
+function doToggleDryRun() {
+  var d = state.data;
+  if (!d) { return; }
+  var turningOn = !d.dry_run;   // 目标值
+  var p;
+  if (turningOn) {
+    // 从 OFF 翻回 ON 是回滚到安全态，不拦。
+    p = Promise.resolve(true);
+  } else {
+    p = confirmDialog({
+      title: "关闭 dry_run？",
+      danger: true,
+      confirmText: "关闭 dry_run",
+      lines: [
+        { text: "关闭后插件将开始改写真实业务流量：凡是带 " + (d.replace_length || 312) +
+                " 长度 X-Codex-Turn-State 的请求，都会被替换成 store 里该桶的 " +
+                (d.template_length || 292) + " 再发往上游。" },
+        { text: "在此之前这些替换只出现在日志里，上游收到的仍是原值。", em: true },
+        { text: "回滚方式：把 dry_run 重新打开即可，无需重启。" }
+      ]
+    });
+  }
+  p.then(function (go) {
+    if (!go) { return; }
+    return withBusy(function () {
+      return patchConfig({ dry_run: turningOn }).then(function () {
+        notify("ok", "dry_run 已切换为 " + (turningOn ? "ON（只记录）" : "OFF（改写真实流量）"));
+        return refresh();
+      });
+    }).catch(actionError);
+  });
+}
+
+function doToggleRole() {
+  var d = state.data;
+  if (!d) { return; }
+  var next = d.role === "probe" ? "business" : "probe";
+  confirmDialog({
+    title: "把 role 切到 " + next + "？",
+    danger: true,
+    confirmText: "切到 " + next,
+    lines: [
+      next === "probe"
+        ? { text: "probe 角色只从上游响应采集模板写盘，不会替换任何业务请求的头。切过去之后业务端会停止替换。" }
+        : { text: "business 角色只读 store 并按 replace-only 替换，不再采集。切过去之前请确认 store 里的桶已经探齐。" },
+      { text: "能力声明是插件注册时上报给 CPA 的，热重载不一定会重新协商。切换后若发现响应钩子没有被调用（探测采不到）或替换没发生，需要重启一次 CPA。", em: true }
+    ]
+  }).then(function (go) {
+    if (!go) { return; }
+    return withBusy(function () {
+      return patchConfig({ role: next }).then(function () {
+        notify("info", "role 已切到 " + next +
+          "。若接下来发现钩子没被调用（probe 采不到 / business 不替换），重启一次 cli-proxy-api。");
+        return refresh();
+      });
+    }).catch(actionError);
+  });
+}
+
+function doClearBucket(auth, model) {
+  confirmDialog({
+    title: "清空这个桶？",
+    danger: true,
+    confirmText: "清空",
+    lines: [
+      { text: auth + " / " + model },
+      { text: "清掉之后，在探测重新采到之前，业务端对这个桶会停止替换 —— 降级请求会原样发往上游。", em: true }
+    ]
+  }).then(function (go) {
+    if (!go) { return; }
+    return withBusy(function () {
+      return api(API + "/buckets/clear", { method: "POST", body: { auth_id: auth, model: model } })
+        .then(function (r) {
+          notify("ok", "已清空 " + (r && r.cleared !== undefined ? r.cleared : 1) + " 个桶：" + auth + " / " + model);
+          return refresh();
+        });
+    }).catch(actionError);
+  });
+}
+
+function doClearAll() {
+  confirmDialog({
+    title: "清空全部桶？",
+    danger: true,
+    confirmText: "全部清空",
+    lines: [
+      { text: "store 里所有 (账号, 模型) 的模板都会被删除。" },
+      { text: "在重新探齐之前，业务端将完全停止替换 —— 所有降级请求都会原样发往上游。", em: true },
+      { text: "重新探齐需要停业务跑一轮探测，并且会消耗额度。" }
+    ]
+  }).then(function (go) {
+    if (!go) { return; }
+    return withBusy(function () {
+      return api(API + "/buckets/clear", { method: "POST", body: { all: true } })
+        .then(function (r) {
+          notify("ok", "已清空 " + (r && r.cleared !== undefined ? r.cleared : "全部") + " 个桶。");
+          return refresh();
+        });
+    }).catch(actionError);
+  });
+}
+
+// 自检的结果有两个独立维度，UI 上必须分开呈现：
+//   reached      —— 请求有没有打到上游并拿到响应（链路/协议层面）
+//   status_code  —— 上游回的真实状态码（账号/配额层面）
+// 「reached:true + 4xx」是有意义的组合：链路是通的，是上游拒绝了。把它和
+// 「根本没打通」一起压成「失败」，运维就丢掉了区分这两类故障的唯一线索。
+function selfTestKind(r) {
+  if (!r || !r.reached) { return "err"; }
+  var c = Number(r.status_code);
+  if (c >= 200 && c < 300) { return "ok"; }
+  return "warn";
+}
+
+function selfTestMessage(r, model) {
+  var code = (r && r.status_code !== undefined && r.status_code !== null) ? r.status_code : "—";
+  var lines = [];
+  lines.push(r && r.reached ? "链路：通（已拿到上游响应）" : "链路：不通（没拿到上游响应）");
+  lines.push("上游状态码：" + code);
+  lines.push("模型：" + ((r && r.model) || model));
+  // 没定向就是真的不知道用了哪个号：CPA 的 HostModelExecutionResponse 只有
+  // StatusCode/Headers/Body，不带账号标识。这里必须明说「未知」，填个空串或
+  // 拿请求里的值糊弄，会让人以为自检验证过那个账号。
+  if (r && r.targeted) {
+    lines.push("账号：" + ((r && r.auth_id) || "—") + "（已定向）");
+  } else {
+    lines.push("账号：未知 —— 未指定账号时无法得知实际用了哪个号（CPA 的响应不携带账号标识）");
+  }
+  lines.push("落盘：否 —— 自检不产生桶，采集请用 scripts/probe.py");
+  if (r && r.note) { lines.push(String(r.note)); }
+  if (r && r.error) { lines.push("错误：" + String(r.error)); }
+  return lines.join("\n");
+}
+
+// opts 可选：{auth, model}。矩阵角标走这条，按钮走下拉。注意事件监听器必须
+// 包一层，否则 MouseEvent 会被当成 opts 传进来。
+function doSelfTest(opts) {
+  opts = opts || {};
+  var model = (opts.model !== undefined) ? opts.model : $("selftestModel").value;
+  var auth = (opts.auth !== undefined) ? opts.auth : $("selftestAuth").value;
+  if (!model) { return; }
+
+  var lines = [
+    { text: "会向上游真实发一次请求，消耗额度。" },
+    { text: "只验证链路是否打通，不会产生桶：宿主会让插件自己发出的请求跳过本插件的响应钩子，所以自检永远采不到模板。", em: true },
+    { text: "要真正采集模板，用 scripts/probe.py。" }
+  ];
+  if (auth) {
+    lines.push({ text: "定向到 " + auth + "。定向自检不需要停用其它账号。" });
+  } else {
+    lines.push({ text: "未指定账号：由 CPA 调度决定用哪个号，且结果无法得知实际用的是哪个（响应不携带账号标识）。" });
+  }
+
+  confirmDialog({
+    title: auth
+      ? ("对 " + auth + " / " + model + " 跑一次连通性自检？")
+      : ("对 " + model + " 跑一次连通性自检？（不指定账号）"),
+    confirmText: "开始自检",
+    lines: lines
+  }).then(function (go) {
+    if (!go) { return; }
+    var body = { model: model };
+    if (auth) { body.auth_id = auth; }
+    return withBusy(function () {
+      return api(API + "/selftest", { method: "POST", body: body })
+        .then(function (r) {
+          notify(selfTestKind(r), selfTestMessage(r, model));
+          return refresh();
+        });
+    }).catch(function (err) {
+      if (err instanceof ApiError && handleAuthFailure(err)) { return; }
+      // 服务端的错误原文是排障线索，一律原样透出。400 = 模型名不在清单里。
+      var prefix = (err instanceof ApiError && err.status === 400)
+        ? "自检未执行（模型名不被接受）："
+        : "自检未执行：";
+      notify("err", prefix + ((err && err.message) ? err.message : String(err)));
+    });
+  });
+}
+
+/* ---------------------------- 启动 ---------------------------- */
+
+$("gateForm").addEventListener("submit", function (e) {
+  e.preventDefault();
+  var k = $("gateKey").value.trim();
+  if (!k) { gateNotice("请输入管理密钥。"); return; }
+  setKey(k);
+  gateNotice(null);
+  $("gate").hidden = true;
+  $("app").hidden = false;
+  refresh().then(function () {
+    if (state.key) { startPolling(); }
+  });
+});
+
+$("btnForget").addEventListener("click", function () { forgetKey("密钥已清除。"); });
+
+$("btnPause").addEventListener("click", function () {
+  state.paused = !state.paused;
+  $("btnPause").textContent = state.paused ? "继续刷新" : "暂停刷新";
+  if (state.paused) { stopPolling(); } else { startPolling(); refresh(); }
+  renderFreshness();
+});
+
+$("btnDryRun").addEventListener("click", doToggleDryRun);
+$("btnRole").addEventListener("click", doToggleRole);
+$("btnClearAll").addEventListener("click", doClearAll);
+// 必须包一层：直接传 doSelfTest 会把 MouseEvent 当成 opts。
+$("btnSelftest").addEventListener("click", function () { doSelfTest(); });
+
+(function boot() {
+  var saved = null;
+  try { saved = sessionStorage.getItem(KEY_STORE); } catch (e) { saved = null; }
+  if (saved) {
+    state.key = saved;
+    $("gate").hidden = true;
+    $("app").hidden = false;
+    refresh().then(function () { if (state.key) { startPolling(); } });
+  } else {
+    $("gate").hidden = false;
+    $("gateKey").focus();
+  }
+})();
+</script>
+</body>
+</html>
