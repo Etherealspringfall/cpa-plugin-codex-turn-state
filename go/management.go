@@ -162,26 +162,51 @@ type statusBucket struct {
 	// to tell apart. "harvested a degraded 312" means the path works and the
 	// exit IP is wrong; "nothing on disk" means the path is broken. Both look
 	// like ready=false, and they call for opposite next steps.
-	Len         int    `json:"len"`
-	IssuedAt    string `json:"issued_at,omitempty"`
-	ExpiresAt   string `json:"expires_at,omitempty"`
-	SecondsLeft int64  `json:"seconds_left"`
+	Len       int    `json:"len"`
+	IssuedAt  string `json:"issued_at,omitempty"`
+	ExpiresAt string `json:"expires_at,omitempty"`
+	// Enabled is the credential's state, repeated on every cell of its row so
+	// the page can grey a row out without a second lookup. A disabled account is
+	// still listed: dropping the row during a probe would make a bucket look
+	// lost rather than merely unreachable, and "not harvested because the
+	// account is off" is a different finding from "not harvested".
+	//
+	// When accounts_source is "store" this is not authoritative -- the credential
+	// list was unavailable, so it is reported true rather than inventing a
+	// disabled state nobody observed.
+	Enabled     bool  `json:"enabled"`
+	SecondsLeft int64 `json:"seconds_left"`
 }
 
 type statusResponse struct {
-	Role           string           `json:"role"`
-	DryRun         bool             `json:"dry_run"`
-	InjectMode     string           `json:"inject_mode"`
-	TTLSeconds     int              `json:"ttl_seconds"`
-	TemplateLength int              `json:"template_length"`
-	ReplaceLength  int              `json:"replace_length"`
-	StoreDir       string           `json:"store_dir"`
-	Models         []string         `json:"models"`
-	Buckets        []statusBucket   `json:"buckets"`
+	Role           string         `json:"role"`
+	DryRun         bool           `json:"dry_run"`
+	InjectMode     string         `json:"inject_mode"`
+	TTLSeconds     int            `json:"ttl_seconds"`
+	TemplateLength int            `json:"template_length"`
+	ReplaceLength  int            `json:"replace_length"`
+	StoreDir       string         `json:"store_dir"`
+	Models         []string       `json:"models"`
+	Buckets        []statusBucket `json:"buckets"`
+	TargetsTotal   int            `json:"targets_total"`
+	TargetsReady   int            `json:"targets_ready"`
+	// AccountsSource is "host" when the credential list came from
+	// host.auth.list, and "store" when that was unavailable and the accounts
+	// were inferred from whatever the store already holds. The difference
+	// matters: under "store" a never-probed account is invisible, so an empty
+	// matrix means "we could not ask", not "there is nothing to probe".
+	AccountsSource string           `json:"accounts_source"`
+	AccountsError  string           `json:"accounts_error,omitempty"`
 	Counters       decisionCounters `json:"counters"`
 	CountersSince  string           `json:"counters_since"`
 	GeneratedAt    string           `json:"generated_at"`
 	StoreError     string           `json:"store_error,omitempty"`
+}
+
+// statusAccount is one credential row of the readiness matrix.
+type statusAccount struct {
+	AuthID  string
+	Enabled bool
 }
 
 // handleStatus reports configuration, bucket readiness and decision tallies.
@@ -216,26 +241,31 @@ func handleStatus() pluginapi.ManagementResponse {
 	if errScan != nil {
 		// A store that cannot be read is worth surfacing rather than rendering as
 		// "no buckets ready", which looks identical to a probe that never ran.
+		// The matrix is still built below from the credential list: every cell
+		// reads not-ready, which is the truth -- nothing in an unreadable store
+		// can be used -- and the operator keeps the account list to act on.
 		out.StoreError = errScan.Error()
-		return jsonResponse(http.StatusOK, out)
+		records = nil
 	}
 
 	ttl := cfg.ttl()
-	// Index what is on disk, then walk the configured matrix so a bucket that was
-	// never harvested still appears as a cell -- the dashboard draws the gaps,
-	// and a missing row is the thing the operator most needs to see.
 	onDisk := make(map[string]storeRecord, len(records))
-	authSeen := make(map[string]bool)
 	for _, rec := range records {
 		onDisk[bucketKey(rec.AuthID, rec.Model)] = rec
-		authSeen[rec.AuthID] = true
 	}
 
-	auths := make([]string, 0, len(authSeen))
-	for auth := range authSeen {
-		auths = append(auths, auth)
+	// The matrix is the set of buckets we intend to fill, not the set already
+	// filled. Deriving the accounts from the store alone would make the page
+	// emptiest at the moment it matters most -- straight after a deploy, when
+	// nothing has been harvested and the operator needs to see "0 of 25" and
+	// pick an account to self-test against.
+	accounts, accountsSource, errAccounts := statusAccounts(records)
+	out.AccountsSource = accountsSource
+	if errAccounts != nil {
+		// Degraded, not failed: the store-derived matrix is still worth showing.
+		// Saying so beats the silent empty array this replaced.
+		out.AccountsError = errAccounts.Error()
 	}
-	sort.Strings(auths)
 
 	models := out.Models
 	if len(models) == 0 {
@@ -251,21 +281,120 @@ func handleStatus() pluginapi.ManagementResponse {
 		sort.Strings(models)
 	}
 
-	for _, auth := range auths {
+	enabledByAuth := make(map[string]bool, len(accounts))
+	for _, account := range accounts {
+		enabledByAuth[account.AuthID] = account.Enabled
+	}
+
+	seen := make(map[string]bool, len(accounts)*len(models))
+	for _, account := range accounts {
 		for _, model := range models {
-			out.Buckets = append(out.Buckets, bucketStatus(onDisk, auth, model, now, ttl, cfg.TemplateLength))
+			cell := bucketStatus(onDisk, account.AuthID, model, now, ttl, cfg.TemplateLength)
+			cell.Enabled = account.Enabled
+			out.Buckets = append(out.Buckets, cell)
+			seen[bucketKey(account.AuthID, model)] = true
 		}
 	}
-	// Buckets on disk for a model outside the configured list would otherwise be
-	// invisible; a stale model id is exactly the kind of drift worth showing.
+	// Anything on disk that the matrix above does not cover -- a model no longer
+	// in the configured list, or an account the host did not report -- is still
+	// shown. That drift is exactly the kind worth seeing rather than hiding.
 	for _, rec := range records {
-		if containsFold(models, rec.Model) {
+		key := bucketKey(rec.AuthID, rec.Model)
+		if seen[key] {
 			continue
 		}
-		out.Buckets = append(out.Buckets, bucketStatus(onDisk, rec.AuthID, rec.Model, now, ttl, cfg.TemplateLength))
+		seen[key] = true
+		cell := bucketStatus(onDisk, rec.AuthID, rec.Model, now, ttl, cfg.TemplateLength)
+		enabled, known := enabledByAuth[rec.AuthID]
+		cell.Enabled = !known || enabled
+		out.Buckets = append(out.Buckets, cell)
+	}
+
+	// Stable order, or the page's rows and columns reshuffle on every refresh.
+	sort.Slice(out.Buckets, func(i, j int) bool {
+		if out.Buckets[i].AuthID != out.Buckets[j].AuthID {
+			return out.Buckets[i].AuthID < out.Buckets[j].AuthID
+		}
+		return out.Buckets[i].Model < out.Buckets[j].Model
+	})
+
+	out.TargetsTotal = len(out.Buckets)
+	for _, bucket := range out.Buckets {
+		if bucket.Ready {
+			out.TargetsReady++
+		}
 	}
 
 	return jsonResponse(http.StatusOK, out)
+}
+
+// statusAccounts lists the credentials the readiness matrix should have a row
+// for. It asks the host first, because only the host knows about an account that
+// has never been harvested. When the host cannot answer it falls back to the
+// accounts the store mentions and says so, so a caller can tell a real "no
+// accounts" from "could not ask".
+//
+// Every Codex credential is returned, disabled ones included, each carrying its
+// state -- see statusBucket.Enabled for why a disabled account keeps its row.
+func statusAccounts(records []storeRecord) ([]statusAccount, string, error) {
+	accounts, errList := listCodexAuths()
+	if errList == nil {
+		return accounts, "host", nil
+	}
+
+	seen := make(map[string]bool)
+	var fallback []statusAccount
+	for _, rec := range records {
+		if seen[rec.AuthID] {
+			continue
+		}
+		seen[rec.AuthID] = true
+		// Enabled is unknown on this path. Reported true because a credential
+		// that produced a bucket was working at the time, and marking it
+		// disabled would assert something never observed; accounts_source is
+		// what tells the caller not to trust this field.
+		fallback = append(fallback, statusAccount{AuthID: rec.AuthID, Enabled: true})
+	}
+	sort.Slice(fallback, func(i, j int) bool { return fallback[i].AuthID < fallback[j].AuthID })
+	return fallback, "store", errList
+}
+
+// listCodexAuths returns every Codex credential the host knows about, sorted by
+// name, with the enabled state it reports.
+func listCodexAuths() ([]statusAccount, error) {
+	var listed struct {
+		Files []pluginapi.HostAuthFileEntry `json:"files"`
+	}
+	if errCall := hostCallJSON("host.auth.list", map[string]any{}, &listed); errCall != nil {
+		return nil, errCall
+	}
+	var out []statusAccount
+	for _, file := range listed.Files {
+		if !isCodexAuth(file) {
+			continue
+		}
+		name := strings.TrimSpace(file.Name)
+		if name == "" {
+			continue
+		}
+		// An unavailable credential cannot answer a request either, so it is
+		// reported the same way a disabled one is: the operator's question is
+		// "can this bucket be filled right now", not "which flag is set".
+		out = append(out, statusAccount{AuthID: name, Enabled: !file.Disabled && !file.Unavailable})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].AuthID < out[j].AuthID })
+	return out, nil
+}
+
+func isCodexAuth(file pluginapi.HostAuthFileEntry) bool {
+	if strings.EqualFold(strings.TrimSpace(file.Provider), "codex") ||
+		strings.EqualFold(strings.TrimSpace(file.Type), "codex") {
+		return true
+	}
+	// Provider is not always populated on file-backed credentials; the naming
+	// convention is the fallback scripts/probe.py uses too.
+	name := strings.ToLower(strings.TrimSpace(file.Name))
+	return strings.HasPrefix(name, "codex-") && strings.HasSuffix(name, ".json")
 }
 
 // bucketStatus renders one cell. A record that is expired, future-stamped or the
@@ -416,9 +545,10 @@ type selftestRequest struct {
 
 type selftestResponse struct {
 	// Reached reports whether the request got to the upstream and came back with
-	// an answer. An upstream 429 or 401 still counts as reached: the path works
-	// and the account was refused, which is a different problem from the request
-	// never arriving, and the two call for opposite next steps.
+	// an answer. An upstream 429, 401 or a JSON error body all count as reached:
+	// the path works and the upstream declined, which is a different problem from
+	// the request never arriving, and the two call for opposite next steps --
+	// wait and retry, versus go and look at the network.
 	Reached    bool   `json:"reached"`
 	StatusCode int    `json:"status_code"`
 	Model      string `json:"model"`
@@ -427,10 +557,28 @@ type selftestResponse struct {
 	// merely an empty string. It exists so the two cannot be confused: an empty
 	// auth_id never means "the scheduler chose nothing", it means we did not ask
 	// and cannot find out.
-	Targeted  bool   `json:"targeted"`
-	Harvested bool   `json:"harvested"`
-	Note      string `json:"note"`
-	Error     string `json:"error,omitempty"`
+	Targeted  bool `json:"targeted"`
+	Harvested bool `json:"harvested"`
+	// UpstreamErrorCode is the "code" out of an upstream error body, when there
+	// was one. This is the most actionable field on a failed self-test:
+	// server_is_overloaded is the same signal as a degraded 312 (see
+	// FINDINGS.md), so seeing it means no 292 is available to harvest right now
+	// and the answer is to wait, not to go hunting for a broken link.
+	UpstreamErrorCode string `json:"upstream_error_code"`
+	UpstreamErrorType string `json:"upstream_error_type"`
+	Note              string `json:"note"`
+	Error             string `json:"error,omitempty"`
+}
+
+// upstreamErrorBody is the OpenAI-style error envelope the upstream returns.
+// Receiving one at all is the proof that the request arrived: a transport
+// failure cannot produce the upstream's own error schema.
+type upstreamErrorBody struct {
+	Error struct {
+		Type    string `json:"type"`
+		Code    string `json:"code"`
+		Message string `json:"message"`
+	} `json:"error"`
 }
 
 // The self-test notes.
@@ -454,6 +602,10 @@ const (
 	// would be worse than reporting nothing.
 	selftestNoteUntargeted = selftestNote +
 		" 本次未指定 auth_id，由调度器选号；上游响应不含账号标识，因此无法得知实际使用的是哪个号。要定点检查请传 auth_id。"
+	// Appended when the upstream answered with an error but the host did not
+	// pass its HTTP status through. status_code stays 0 rather than being
+	// invented; this says so, so nobody reads the 0 as "no response".
+	selftestNoteNoStatus = " 上游返回了错误但宿主未透传 HTTP 状态码，故 status_code 为 0；请看 upstream_error_code 和 error 原文。"
 )
 
 // handleSelftest sends one minimal request and reports whether it reached the
@@ -575,27 +727,74 @@ func handleSelftest(body []byte) pluginapi.ManagementResponse {
 		return jsonResponse(http.StatusOK, out)
 	}
 
-	// The host collapses an upstream rejection into an error envelope rather
-	// than a response carrying the status, so recovering "reached but refused"
-	// means reading it back out of the message modelExecutionError formats.
-	// Best-effort by nature: when no status can be recovered the answer is the
-	// honest "did not reach", and the raw message is passed through either way
-	// so the operator is never left with only our classification.
+	// The host collapses an upstream rejection into an error envelope rather than
+	// a response carrying the status, so "reached but refused" has to be
+	// recovered from the message text. Two signals, in order of strength:
+	//
+	//  1. An upstream error body. Observed in practice as
+	//     host_call_failed: {"error":{"type":"service_unavailable_error",
+	//     "code":"server_is_overloaded",...}}. Only the upstream produces that
+	//     schema, so receiving it is proof the request arrived -- this is the
+	//     case that used to be misreported as reached=false, sending operators
+	//     to check the network when the real answer was "it is overloaded".
+	//  2. The host's own "failed with status N" phrasing.
+	//
+	// Neither present means a genuine transport failure, and only then is
+	// reached=false the honest answer. The raw message is passed through in
+	// every branch so the operator is never left with only our classification.
 	out.Error = errCall.Error()
-	if status, okStatus := statusFromExecutionError(out.Error); okStatus {
+	upstream, okUpstream := upstreamErrorFrom(out.Error)
+	status, okStatus := statusFromExecutionError(out.Error)
+	switch {
+	case okUpstream:
+		out.Reached = true
+		out.UpstreamErrorCode = strings.TrimSpace(upstream.Error.Code)
+		out.UpstreamErrorType = strings.TrimSpace(upstream.Error.Type)
+		if okStatus {
+			out.StatusCode = status
+		} else {
+			out.Note += selftestNoteNoStatus
+		}
+	case okStatus:
 		out.Reached = true
 		out.StatusCode = status
 	}
-	log.Printf(logPrefix+"selftest model=%s auth=%s targeted=%t reached=%t status=%d: %v",
-		orDash(model), orDash(authID), out.Targeted, out.Reached, out.StatusCode, errCall)
+	log.Printf(logPrefix+"selftest model=%s auth=%s targeted=%t reached=%t status=%d upstream_code=%s",
+		orDash(model), orDash(authID), out.Targeted, out.Reached, out.StatusCode, orDash(out.UpstreamErrorCode))
 	return jsonResponse(http.StatusOK, out)
+}
+
+// upstreamErrorFrom pulls an upstream error body out of the host's error text,
+// which wraps it in a prefix ("host_call_failed: {...}"). A Decoder is used
+// rather than Unmarshal so trailing text after the JSON value is tolerated.
+//
+// A body counts only if it carries at least one populated field: an unrelated
+// JSON object that happens to appear in a message must not be mistaken for the
+// upstream answering.
+func upstreamErrorFrom(message string) (upstreamErrorBody, bool) {
+	idx := strings.Index(message, "{")
+	if idx < 0 {
+		return upstreamErrorBody{}, false
+	}
+	var body upstreamErrorBody
+	if errDecode := json.NewDecoder(strings.NewReader(message[idx:])).Decode(&body); errDecode != nil {
+		return upstreamErrorBody{}, false
+	}
+	if body.Error.Type == "" && body.Error.Code == "" && body.Error.Message == "" {
+		return upstreamErrorBody{}, false
+	}
+	return body, true
 }
 
 // statusFromExecutionError recovers an upstream status code from the host's
 // error text. modelExecutionError renders a status-bearing failure as
-// "... failed with status <code>"; anything else carries no code to find.
+// "... failed with status <code>".
+//
+// The marker is the full phrase rather than just "status ": the message may now
+// carry an upstream JSON body, and a "status" appearing inside an upstream
+// message string would otherwise be read as an HTTP code.
 func statusFromExecutionError(message string) (int, bool) {
-	const marker = "status "
+	const marker = "failed with status "
 	idx := strings.LastIndex(message, marker)
 	if idx < 0 {
 		return 0, false

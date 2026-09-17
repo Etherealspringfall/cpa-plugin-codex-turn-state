@@ -53,6 +53,7 @@ type mgmtBucket struct {
 	Model       string `json:"model"`
 	Ready       bool   `json:"ready"`
 	Len         int    `json:"len"`
+	Enabled     bool   `json:"enabled"`
 	IssuedAt    string `json:"issued_at"`
 	ExpiresAt   string `json:"expires_at"`
 	SecondsLeft int64  `json:"seconds_left"`
@@ -75,6 +76,15 @@ type mgmtStatus struct {
 	StoreDir       string       `json:"store_dir"`
 	Models         []string     `json:"models"`
 	Buckets        []mgmtBucket `json:"buckets"`
+	TargetsTotal   int          `json:"targets_total"`
+	TargetsReady   int          `json:"targets_ready"`
+	// AccountsSource is "host" when the credential list came from
+	// host.auth.list and "store" when it had to be inferred from what the store
+	// already holds. Under "store" a never-probed account is invisible, so the
+	// distinction is what stops an empty matrix reading as "nothing to probe".
+	AccountsSource string       `json:"accounts_source"`
+	AccountsError  string       `json:"accounts_error"`
+	StoreError     string       `json:"store_error"`
 	Counters       mgmtCounters `json:"counters"`
 }
 
@@ -266,6 +276,27 @@ models:
   - gpt-5.5
   - gpt-5.6-sol
 `, dir)
+}
+
+// probeRoleConfigModels is probeRoleConfig with a caller-chosen model list, so
+// a test can vary the width of the readiness matrix.
+func probeRoleConfigModels(dir string, models ...string) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, `role: probe
+store_dir: %q
+template_length: 292
+replace_length: 312
+ttl_seconds: 3600
+harvest_inband: false
+inject_mode: replace-only
+dry_run: true
+log_decisions: false
+models:
+`, dir)
+	for _, model := range models {
+		fmt.Fprintf(&b, "  - %s\n", model)
+	}
+	return b.String()
 }
 
 // seedMgmtBucket writes one synthetic bucket and returns the token it stored, so a
@@ -842,8 +873,9 @@ func managementFuncBody(t *testing.T, name string) string {
 // auth_id must only ever be echoed from what the caller asked for.
 //
 // CPA reports no credential identity on the way back: HostModelExecutionResponse
-// carries no account field, and the header names an earlier revision guessed at
-// were never confirmed against the CPA source. So any auth_id the plugin did
+// carries only StatusCode, Headers and Body, and a sweep of the CPA source found
+// no auth-id response header of any name. This is settled, not merely
+// unconfirmed -- there is nothing to look for. So any auth_id the plugin did
 // not receive as input is fabricated -- and a fabricated account name in a
 // self-test result is worse than an empty one, because an operator will act on
 // it: check that account's quota, disable it, hand it to a colleague. The empty
@@ -1191,6 +1223,198 @@ func TestStatusBucketLenIsALengthNotAValue(t *testing.T) {
 	}
 	if missing.Len != 0 {
 		t.Errorf("len = %d for a bucket that was never harvested, want 0", missing.Len)
+	}
+}
+
+// --- 7. the readiness matrix --------------------------------------------
+
+// Degradation must be visible. A unit test has no host API, so host.auth.list
+// always fails here and the account list falls back to whatever the store
+// happens to hold -- which is precisely the state where the page is most
+// misleading if it says nothing: a never-probed account is invisible, so an
+// empty or short matrix reads as "there is nothing to probe" when it means "we
+// could not ask what there is".
+//
+// Silent degradation has been the recurring failure on this surface, so this
+// asserts both halves: the source is named, and the reason is carried.
+func TestStatusReportsDegradedAccountSource(t *testing.T) {
+	dir := t.TempDir()
+	mustConfigure(t, probeRoleConfig(dir))
+	seedMgmtBucket(t, dir, "codex-alpha.json", "gpt-5.5", wallClock().Add(-time.Minute))
+
+	status := mustManagementStatus(t)
+	if status.AccountsSource != "store" {
+		t.Errorf("accounts_source = %q with no host API, want %q", status.AccountsSource, "store")
+	}
+	if strings.TrimSpace(status.AccountsError) == "" {
+		t.Error("accounts_error is empty on the degraded path, so the fallback is silent")
+	}
+}
+
+// The matrix is the set of buckets we intend to fill, not the set already
+// filled. Straight after a deploy nothing is harvested, and that is exactly
+// when an operator needs to see "0 of N" and pick something to act on.
+func TestStatusMatrixCoversEveryTarget(t *testing.T) {
+	dir := t.TempDir()
+	mustConfigure(t, probeRoleConfigModels(dir, "gpt-5.5", "gpt-5.6-sol"))
+
+	issued := wallClock().Add(-time.Minute)
+	// Two accounts become visible through the store (the degraded path derives
+	// them from records), crossed with two configured models: a 2x2 matrix of
+	// which only three cells are filled.
+	seedMgmtBucket(t, dir, "codex-alpha.json", "gpt-5.5", issued)
+	seedMgmtBucket(t, dir, "codex-alpha.json", "gpt-5.6-sol", issued)
+	seedMgmtBucket(t, dir, "codex-beta.json", "gpt-5.5", issued)
+
+	status := mustManagementStatus(t)
+	if status.TargetsTotal != len(status.Buckets) {
+		t.Errorf("targets_total = %d but buckets has %d entries", status.TargetsTotal, len(status.Buckets))
+	}
+	if status.TargetsTotal != 4 {
+		t.Errorf("targets_total = %d for 2 accounts x 2 models, want 4", status.TargetsTotal)
+	}
+
+	// The unharvested cell must be present and honest about being empty.
+	gap, ok := mgmtBucketByKey(status, "codex-beta.json", "gpt-5.6-sol")
+	if !ok {
+		t.Fatal("the never-harvested combination is missing from the matrix; the page would not show it as a gap")
+	}
+	if gap.Ready {
+		t.Error("a never-harvested cell reports ready")
+	}
+	if gap.Len != 0 {
+		t.Errorf("a never-harvested cell reports len = %d, want 0", gap.Len)
+	}
+	if gap.IssuedAt != "" || gap.ExpiresAt != "" {
+		t.Errorf("a never-harvested cell carries timestamps: issued=%q expires=%q", gap.IssuedAt, gap.ExpiresAt)
+	}
+	if gap.SecondsLeft != 0 {
+		t.Errorf("a never-harvested cell reports seconds_left = %d, want 0", gap.SecondsLeft)
+	}
+
+	// Reverse control: widen the model list and the matrix must widen with it.
+	// Without this, an implementation that just listed on-disk records would
+	// satisfy every assertion above.
+	mustConfigure(t, probeRoleConfigModels(dir, "gpt-5.5", "gpt-5.6-sol", "gpt-6-astra"))
+	wider := mustManagementStatus(t)
+	if wider.TargetsTotal != 6 {
+		t.Errorf("targets_total = %d after adding a third model to 2 accounts, want 6", wider.TargetsTotal)
+	}
+}
+
+// targets_ready backs the "18 of 25" counter at the top of the page. If it is
+// computed separately from the cells it summarises, the two drift and the
+// number becomes a confident lie.
+func TestStatusTargetsReadyMatchesBuckets(t *testing.T) {
+	dir := t.TempDir()
+	mustConfigure(t, probeRoleConfigModels(dir, "gpt-5.5", "gpt-5.6-sol"))
+
+	fresh := wallClock().Add(-time.Minute)
+	stale := wallClock().Add(-2 * time.Hour)
+	seedMgmtBucket(t, dir, "codex-alpha.json", "gpt-5.5", fresh)
+	seedMgmtBucket(t, dir, "codex-beta.json", "gpt-5.5", fresh)
+	// An expired record keeps its cell but must not be counted ready.
+	writeRawRecord(t, dir, storeRecordFor("codex-alpha.json", "gpt-5.6-sol", stale, 292))
+
+	status := mustManagementStatus(t)
+	counted := 0
+	for _, bucket := range status.Buckets {
+		if bucket.Ready {
+			counted++
+		}
+	}
+	if status.TargetsReady != counted {
+		t.Errorf("targets_ready = %d but %d cells report ready", status.TargetsReady, counted)
+	}
+	if status.TargetsReady != 2 {
+		t.Errorf("targets_ready = %d, want 2 (the expired record must not count)", status.TargetsReady)
+	}
+}
+
+// The page re-fetches on a timer. Unstable ordering would make rows and columns
+// jump under the operator's cursor mid-read.
+func TestStatusBucketOrderIsStable(t *testing.T) {
+	dir := t.TempDir()
+	mustConfigure(t, probeRoleConfigModels(dir, "gpt-5.6-sol", "gpt-5.5"))
+
+	issued := wallClock().Add(-time.Minute)
+	// Seeded out of order on purpose, so a pass-through of map or disk order
+	// would not accidentally come out sorted.
+	seedMgmtBucket(t, dir, "codex-zulu.json", "gpt-5.6-sol", issued)
+	seedMgmtBucket(t, dir, "codex-alpha.json", "gpt-5.5", issued)
+	seedMgmtBucket(t, dir, "codex-mike.json", "gpt-5.6-sol", issued)
+
+	first := mustManagementStatus(t)
+	second := mustManagementStatus(t)
+
+	if len(first.Buckets) != len(second.Buckets) {
+		t.Fatalf("two consecutive calls returned %d and %d buckets", len(first.Buckets), len(second.Buckets))
+	}
+	for i := range first.Buckets {
+		if first.Buckets[i].AuthID != second.Buckets[i].AuthID || first.Buckets[i].Model != second.Buckets[i].Model {
+			t.Fatalf("order changed between calls at index %d: %s/%s then %s/%s",
+				i, first.Buckets[i].AuthID, first.Buckets[i].Model,
+				second.Buckets[i].AuthID, second.Buckets[i].Model)
+		}
+	}
+	// Stable is not enough on its own -- a consistently wrong order is stable
+	// too. The contract is (auth_id, model) lexicographic.
+	for i := 1; i < len(first.Buckets); i++ {
+		prev, cur := first.Buckets[i-1], first.Buckets[i]
+		if prev.AuthID > cur.AuthID || (prev.AuthID == cur.AuthID && prev.Model > cur.Model) {
+			t.Errorf("buckets are not sorted by (auth_id, model): %s/%s precedes %s/%s",
+				prev.AuthID, prev.Model, cur.AuthID, cur.Model)
+		}
+	}
+}
+
+// An empty store must not produce a bare empty array with no explanation. On
+// the degraded path there is genuinely nothing to list -- the accounts can only
+// come from records that do not exist -- so the empty matrix is correct, but it
+// has to arrive labelled. "We could not ask" and "there is nothing to probe"
+// render identically otherwise, and this is the defect that motivated the
+// accounts_source field.
+func TestStatusEmptyStoreStillNamesItsSource(t *testing.T) {
+	dir := t.TempDir()
+	mustConfigure(t, probeRoleConfig(dir))
+
+	status := mustManagementStatus(t)
+	if status.AccountsSource != "store" {
+		t.Errorf("accounts_source = %q, want %q", status.AccountsSource, "store")
+	}
+	if strings.TrimSpace(status.AccountsError) == "" {
+		t.Error("an empty matrix arrived with no accounts_error, so it reads as 'nothing to probe'")
+	}
+	if status.TargetsReady != 0 {
+		t.Errorf("targets_ready = %d on an empty store, want 0", status.TargetsReady)
+	}
+	if status.TargetsTotal != len(status.Buckets) {
+		t.Errorf("targets_total = %d but buckets has %d entries", status.TargetsTotal, len(status.Buckets))
+	}
+}
+
+// A record for a model that is no longer configured still has to appear.
+// Dropping it would hide the drift: an operator who trimmed the model list
+// would never learn that stale buckets are still on disk being served from.
+func TestStatusListsBucketsOutsideTheMatrix(t *testing.T) {
+	dir := t.TempDir()
+	mustConfigure(t, probeRoleConfigModels(dir, "gpt-5.5"))
+
+	issued := wallClock().Add(-time.Minute)
+	seedMgmtBucket(t, dir, "codex-alpha.json", "gpt-5.5", issued)
+	// Not in the configured model list.
+	seedMgmtBucket(t, dir, "codex-alpha.json", "gpt-6-astra", issued)
+
+	status := mustManagementStatus(t)
+	drifted, ok := mgmtBucketByKey(status, "codex-alpha.json", "gpt-6-astra")
+	if !ok {
+		t.Fatal("a bucket for an unconfigured model was dropped from status; the drift becomes invisible")
+	}
+	if !drifted.Ready {
+		t.Error("the drifted bucket is on disk and live, but reports not ready")
+	}
+	if status.TargetsTotal != len(status.Buckets) {
+		t.Errorf("targets_total = %d but buckets has %d entries", status.TargetsTotal, len(status.Buckets))
 	}
 }
 

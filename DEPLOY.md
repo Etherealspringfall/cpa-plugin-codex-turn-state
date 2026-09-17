@@ -8,6 +8,27 @@ CPA Turn-State：探测 / 业务分离。
 
 ---
 
+## 当前进度（截至 2026-09-18）
+
+**已在 OVH 上实测通过**（部署 `5db76ef`）：
+
+- 编译 + `ldd` glibc 兼容性检查
+- `.so` 部署、CPA 重启、插件加载（`configured role=probe …`）
+- 看板外壳可达、三条数据接口鉴权正确（含**无密钥 401** 这条关键回归）
+- `PATCH` 配置热生效、无需重启
+
+**尚未执行**——下面这些步骤里写的仍然是预期行为，不是实测结果：
+
+- 第 8 步 停业务窗口
+- 第 9 步 `probe --until-complete` 采集
+- 第 10 步 store 桶核对
+- 第 11~13 步 切 `role: business`、`dry_run` 翻转、上线验证
+
+**不要把本文当成「整个流程已经验证过」。** 只有上面第一组是实测的，各步骤里凡
+标注「实测」「2026-09-18」的才是跑过的，其余一律按待执行对待。
+
+---
+
 ## 开工前必读的三条
 
 ### ⚠️ 1. 第 8 步「停对外业务」是真实停服窗口，要提前挑时段
@@ -197,6 +218,9 @@ sudo ls /home/dnc/cpamp-deploy/cpa-data/auths/codex-*.json | grep -v '\.bak'
 
 > **执行时机：第 6 步部署完新 `.so` 并重启 CPA 之后。** 页面是新 `.so` 带来
 > 的，部署前它还不存在。列在第 0 步是为了不漏掉这项验收。
+>
+> **本步已于 2026-09-18 在 OVH 上实测通过**（部署 `5db76ef`），下面给的是实测
+> 值不是预期值。重新部署后仍应复跑一遍对照。
 
 插件注册了一个看板页面和三条数据接口，详见 [README.md](README.md) 的
 「管理 API 与看板页面」。
@@ -205,9 +229,9 @@ sudo ls /home/dnc/cpamp-deploy/cpa-data/auths/codex-*.json | grep -v '\.bak'
 没有 cookie、不接受 query 参数）：
 
 ```bash
-# 外壳页面：不鉴权，应返回 HTML
-curl -s -o /dev/null -w '%{http_code}\n' \
-  http://127.0.0.1:8317/v0/resource/plugins/codex-turn-state/
+# 外壳页面：不鉴权，返回 HTML
+curl -s -o /dev/null -w '%{http_code} %{content_type} %{size_download}\n' \
+  http://127.0.0.1:8317/v0/resource/plugins/codex-turn-state/dashboard
 
 # status：鉴权，不带密钥应 401
 curl -s -o /dev/null -w '%{http_code}\n' \
@@ -218,9 +242,30 @@ curl -s -H 'X-Management-Key: <管理密钥>' \
   http://127.0.0.1:8317/v0/management/codex-turn-state/status
 ```
 
-三条的预期分别是 `200`、`401`、`200 + JSON`。**第二条必须是 401**——如果不带
-密钥也能拿到数据，说明数据路由被降级成公开的了，参见 README 里
-「数据路由绝对不能带 `Menu` 字段」那一节，立即停下来查路由注册。
+2026-09-18 实测结果：
+
+| 检查 | 实测 |
+|---|---|
+| 看板外壳 | `200` `text/html; charset=utf-8` 37642 bytes |
+| status 带密钥 | `200` |
+| status 无密钥 | `401` |
+
+**第二条必须是 401。** 如果不带密钥也能拿到数据，说明数据路由被降级成公开的
+了，参见 README「两个路由注册脚枪」的第一条，立即停下来查路由注册。
+
+**注意外壳路径是 `/dashboard`，不是插件根。** 少写这一截实测就是 404——原因是
+`ResourceRoute.Path` 注册成 `"/"` 会被静默丢弃，见 README 同一节的第二条。
+
+插件加载成功时的日志长这样（2026-09-18 实测）：
+
+```
+[codex-turn-state] configured role=probe store_dir="/data/turn-state-store"
+  template_length=292 replace_length=312 ttl_seconds=3600 dry_run=true
+  inject_mode=replace-only harvest_inband=false models=5
+```
+
+顺带实测确认的一条：**用管理密钥 `PATCH` 插件配置返回 200，插件热加载生效、
+不需要重启**。换 `.so` 仍然必须重启（见第 6 步）。
 
 **再用浏览器确认页面**：
 
@@ -285,12 +330,21 @@ docker logs cli-proxy-api --since 2m 2>&1 | grep -i codex-turn-state
 
 **覆盖前一定先拷 `.bak-<时间戳>`。**
 
-CPA 不热加载新的 `.so`，进程必须重启。日志里应当出现
-`plugin loaded plugin_id=codex-turn-state`，以及一行 `configured …` 打出当前
-`role` / `store_dir` / `inject_mode` / `dry_run`。
+**CPA 不热加载新的 `.so`，进程必须重启。** 这一条不因为配置能热改而改变。
 
-此时 config 里还没有 `role`，按第 2 条须知会落到 `business`，且 `store_dir`
-未配 → 纯 no-op。这是预期状态。
+日志里应当出现 `plugin loaded plugin_id=codex-turn-state`，以及一行
+`configured …`。2026-09-18 实测到的那行长这样：
+
+```
+[codex-turn-state] configured role=probe store_dir="/data/turn-state-store"
+  template_length=292 replace_length=312 ttl_seconds=3600 dry_run=true
+  inject_mode=replace-only harvest_inband=false models=5
+```
+
+逐字段核对一遍，尤其是 `inject_mode=replace-only` 和 `harvest_inband=false`。
+
+如果 config 里还没有 `role`，按第 2 条须知会落到 `business`，且 `store_dir`
+未配 → 纯 no-op。这也是正常的中间状态。
 
 **部署完这里就去做第 0.5 步**（验证看板页面可达 + 三条接口鉴权正确）。页面是
 这个新 `.so` 带来的，到这一步才存在。
@@ -310,8 +364,10 @@ CPA 不热加载新的 `.so`，进程必须重启。日志里应当出现
 
 `dry_run` 探测时段随意——探测端不做替换。
 
-CPA 热重载配置，这步**不需要重启**。确认日志里 `configured` 那行的 `role` 已
-经变成 `probe`：
+CPA 热重载配置，这步**不需要重启**——2026-09-18 实测确认（`PATCH` 配置返回
+200，插件当场重新加载）。改 `config.yaml` 和走 `PATCH` 接口是同一套热重载。
+
+确认日志里 `configured` 那行的 `role` 已经变成 `probe`：
 
 ```bash
 docker logs cli-proxy-api --since 2m 2>&1 | grep -i "codex-turn-state.*configured"
@@ -468,10 +524,16 @@ docker logs cli-proxy-api --since 2m 2>&1 | grep -i "codex-turn-state.*configure
 以上 9 项是规格第 10 节的原文。以下是管理 API / 看板页面带来的补充项
 （规格写定之后才加的功能）：
 
-- [ ] `ldd` 在 CPA 同款镜像里检查 `.so`，依赖全部解析干净、无 `version not found`
-- [ ] CPAMP 菜单里出现 `Codex Turn-State`，粘密钥后能拉到 status
-- [ ] **不带密钥请求 `/v0/management/codex-turn-state/status` 返回 401**
+- [x] `ldd` 在 CPA 同款镜像里检查 `.so`，依赖全部解析干净、无 `version not found`
+      —— 2026-09-18 实测通过
+- [x] CPAMP 菜单里出现 `Codex Turn-State`，粘密钥后能拉到 status
+      —— 2026-09-18 实测通过（外壳 `200` `text/html` 37642 bytes）
+- [x] **不带密钥请求 `/v0/management/codex-turn-state/status` 返回 401**
       （返回 200 说明数据路由被降级成公开的了，立即停下来查 `Menu` 字段）
+      —— 2026-09-18 实测 `401`
+
+> 上面 3 项已勾的是 2026-09-18 部署 `5db76ef` 时实测的结果。**规格那 9 项一个都
+> 还没勾**——它们依赖第 8~13 步，那些还没跑。重新部署后这 3 项要复跑。
 
 给同事的回执只需要：账号文件名、模型、长度、决定、时间。**不要贴 state。**
 

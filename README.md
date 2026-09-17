@@ -269,7 +269,7 @@ gpt-6-astra
 
 | 路由 | 前缀 | 鉴权 |
 |---|---|---|
-| `/`（菜单项 `Codex Turn-State`） | `/v0/resource/plugins/codex-turn-state/` | **否** |
+| `/dashboard`（菜单项 `Codex Turn-State`） | `/v0/resource/plugins/codex-turn-state/dashboard` | **否** |
 | `GET /codex-turn-state/status` | `/v0/management/` | 是 |
 | `POST /codex-turn-state/buckets/clear` | `/v0/management/` | 是 |
 | `POST /codex-turn-state/selftest` | `/v0/management/` | 是 |
@@ -290,11 +290,15 @@ engine 上，没有套 `h.Middleware()`。
 信息；所有数据都由页面在浏览器里带着密钥去调上表那三条鉴权接口拿。外壳公开
 可读，但读它什么也读不到。
 
-### ⚠️ 数据路由绝对不能带 `Menu` 字段
+### ⚠️ 两个路由注册脚枪：注册阶段静默出错，运行时才暴露
 
-这是个很隐蔽的脚枪。CPA 的 `routeDeclaresLegacyMenuResource`
-（`internal/pluginhost/management.go:156`）会把**带 `Menu` 字段的 GET 路由降级
-注册到不鉴权的 resource 前缀下**。
+改路由注册的时候要绕开这两条。它们的共性是**注册的那一刻没有任何报错、没有任何
+日志**，症状要等到真去请求时才出现，而且症状看起来都不像是注册的问题。
+
+#### 一、数据路由绝对不能带 `Menu` 字段
+
+CPA 的 `routeDeclaresLegacyMenuResource`（`internal/pluginhost/management.go:156`）
+会把**带 `Menu` 字段的 GET 路由降级注册到不鉴权的 resource 前缀下**。
 
 也就是说：给 `GET /codex-turn-state/status` 加一个 `Menu` 字段，它就从鉴权接口
 变成**公开接口**了——桶的就绪情况、账号文件名全部公开可读。
@@ -304,7 +308,33 @@ engine 上，没有套 `h.Middleware()`。
 - **只有**外壳路由带 `Menu`（它本来就该是公开的、且零数据）。
 - 三条数据路由**一个都不许带 `Menu`**。
 
-已有测试守着这一条，改路由注册时不要绕过它。
+症状：不带密钥请求也能拿到数据（本该 401）。已有测试守着这一条，不要绕过它。
+
+#### 二、`ResourceRoute.Path` 不能注册成 `"/"`
+
+外壳路由的路径必须是**具名子路径**（本插件用 `/dashboard`），不能是插件根
+`"/"`。`internal/pluginhost/management.go:212-214`：
+
+```go
+path = strings.TrimRight(path, "/")
+if path == "" {
+    return "", false
+}
+```
+
+`"/"` 被 `TrimRight` 掉之后是空串，直接 `return false` —— **这条路由压根没被注册
+进去**。
+
+症状：请求 404。而且 404 看起来特别像分发出了 bug、或者路径拼错了，很容易往那个
+方向查半天。实际上是注册阶段就被悄悄丢弃了，日志里一个字都没有。
+
+所以外壳挂在：
+
+```
+/v0/resource/plugins/codex-turn-state/dashboard
+```
+
+不是 `/v0/resource/plugins/codex-turn-state/`（后者实测 404）。
 
 ### ⚠️ 「连通性自检」不会产生桶
 
@@ -412,6 +442,17 @@ PATCH /v0/management/plugins/codex-turn-state/config
 ```
 
 这是**浅合并**：只提交要改的键，没提交的键保持原值。
+
+**改配置是热生效的，不需要重启**（2026-09-18 实测确认：`PATCH` 返回 200，插件
+当场重新加载配置）。
+
+别和 `.so` 搞混——**换 `.so` 必须重启**，插件不热加载 `.so`：
+
+| 改什么 | 要不要重启 |
+|---|---|
+| 配置的键值（`dry_run`、`store_dir` 等） | **不要**，热生效 |
+| `role` | 热生效，但能力集变了可能要重启，见上一节 |
+| `.so` 文件本身 | **必须重启** |
 
 ## 构建
 
