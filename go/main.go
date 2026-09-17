@@ -82,7 +82,7 @@ type pluginState struct {
 
 // templateEntry is one harvested template, scoped to a single bucket.
 type templateEntry struct {
-	value      string
+	value       string
 	harvestedAt time.Time
 }
 
@@ -235,15 +235,36 @@ func configure(raw []byte) error {
 	}
 
 	state.mu.Lock()
+	// The host reconfigures far more often than the config actually changes:
+	// five times during startup alone, and again every time CPA rewrites
+	// config.yaml on its own. Clearing unconditionally would drop every
+	// template at unpredictable moments and leave the cache permanently
+	// empty, so only a change that invalidates templates clears them.
+	cleared := templatesInvalidatedBy(state.config, cfg)
 	state.config = cfg
-	// Configuration changes invalidate every bucket: lengths or TTL may have
-	// moved, and a stale template must never outlive its own rules.
-	state.buckets = make(map[string]templateEntry)
+	if cleared {
+		state.buckets = make(map[string]templateEntry)
+	}
 	state.mu.Unlock()
 
-	log.Printf(logPrefix+"configured template_length=%d replace_length=%d ttl_seconds=%d dry_run=%t",
-		cfg.TemplateLength, cfg.ReplaceLength, cfg.TTLSeconds, cfg.DryRun)
+	templates := "templates kept"
+	if cleared {
+		templates = "templates cleared"
+	}
+	log.Printf(logPrefix+"configured template_length=%d replace_length=%d ttl_seconds=%d dry_run=%t (%s)",
+		cfg.TemplateLength, cfg.ReplaceLength, cfg.TTLSeconds, cfg.DryRun, templates)
 	return nil
+}
+
+// templatesInvalidatedBy reports whether moving from oldCfg to newCfg makes
+// already-harvested templates unusable. A template must never outlive the
+// rules it was harvested under, so the two lengths and the TTL force a clear.
+// dry_run and log_decisions change what the plugin does with a template, not
+// whether the template is still a valid one.
+func templatesInvalidatedBy(oldCfg, newCfg pluginConfig) bool {
+	return oldCfg.TemplateLength != newCfg.TemplateLength ||
+		oldCfg.ReplaceLength != newCfg.ReplaceLength ||
+		oldCfg.TTLSeconds != newCfg.TTLSeconds
 }
 
 func pluginRegistration() registration {
