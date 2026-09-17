@@ -1,0 +1,84 @@
+# 示例插件配置，合并进 CPA 的 config.yaml 的 plugins.configs 下面。
+# 这里只给出 codex-turn-state 这一块。
+#
+# 宿主上的实际文件：/home/dnc/cpamp-deploy/cpa-data/config.yaml
+#
+# 路径口径：store_dir 写的是【容器内】路径。cpa-data 已经挂到容器的 /data，
+# 所以宿主侧的 /home/dnc/cpamp-deploy/cpa-data/turn-state-store/
+# 在容器里就是 /data/turn-state-store/ —— 同一个目录，两个名字。
+# 目录权限 0700、文件 0600，属主要让 CPA 进程读写得到。
+#
+# 改这个文件之前先备份：cp config.yaml config.yaml.bak-$(date +%Y%m%d-%H%M)
+# 完整部署步骤见 DEPLOY.md。
+
+plugins:
+  enabled: true
+  configs:
+    codex-turn-state:
+      enabled: true
+      priority: 100
+
+      # ── 角色 ───────────────────────────────────────────────────────────
+      # probe    = 拿头端。从【上游响应】采 292 写进 store，不改任何请求。
+      # business = 接下游。只读 store，见到 312 才换，从不写盘。
+      #
+      # 下面写的是【探测时段】的值。探测跑完、store 齐活之后，
+      # 改成 business 再放业务流量进来（DEPLOY.md 第 11 步）。
+      #
+      # 两个角色不能同一进程、同一时刻既探测又接下游。
+      #
+      # 缺省行为：这个键【缺失】时按 business 处理（安全侧，纯 no-op）；
+      # 非空但非法的值会拒绝启动。
+      role: probe
+
+      # store 目录，【容器内】路径。空字符串 = 不落盘也不读盘。
+      # 布局：<store_dir>/index.json 和 <store_dir>/<账号JSON文件名>/<模型>.json
+      store_dir: /data/turn-state-store
+
+      # 正常态的值是 292 字符，降级态是 312。两者正好差一个 AES 块（16 字节）。
+      # 详见 FINDINGS.md。
+      template_length: 292
+      replace_length: 312
+
+      # 模板可用时长。注意：过期【从令牌自带的 Fernet 时间戳起算】，
+      # 不是从业务看到它的那一刻再数一小时。
+      ttl_seconds: 3600
+
+      # 业务端是否也从业务流量里顺手采头。
+      #
+      # 【业务必须 false】。业务端不采头是产品规则：从业务流量碰运气采 292，
+      # 在降级时段恰好最不可能成功，而那正是最需要它的时候。采集是探测端的活。
+      # role: business 且这里写 true 时，插件会强制关掉它并打一行错误日志。
+      #
+      # 键名注意：主键名是 harvest_inband，中间【没有】下划线。
+      # 旧版本用过 harvest_in_band，仅作向后兼容别名保留，新配置不要再用。
+      harvest_inband: false
+
+      # 替换模式：
+      #   replace-only — 只改写已经带着 312 的请求，即只纠正观察到的降级态。
+      #                  没这个头、或长度不是 312，一律不动。
+      #   always       — 把库存模板强加到该桶的每一个请求上（没有就加）。
+      #
+      # 【已拍板用 replace-only，不要改成 always。】
+      # always 会在业务请求本来没有这个头时强灌一个 292，这是明令禁止的行为。
+      inject_mode: replace-only
+
+      # 逻辑照走、照打日志，但不真改头。
+      #
+      # 上线顺序：先 true 看日志确认选桶正确（auth/model 对得上、没有跨号跨
+      # 模型），确认之后再改 false。回滚就是改回 true，热重载生效。
+      dry_run: true
+
+      # 每个决定打一行：harvest|substitute|pass|skip + auth + model + len + reason
+      # 值本身永远不进日志。
+      log_decisions: true
+
+      # 目标模型清单，用于完整性核对。
+      # 【必须带横线】，不要写成 gpt5.5。
+      # 探测的 --until-complete 要求这 5 个模型 × 5 个账号 = 25 个桶全部就绪。
+      models:
+        - gpt-5.5
+        - gpt-5.6-luna
+        - gpt-5.6-terra
+        - gpt-5.6-sol
+        - gpt-6-astra

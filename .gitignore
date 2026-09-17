@@ -1,2 +1,16 @@
 build/
 .gocache/
+
+# Build artifacts. The deployable .so is produced by scripts/build.sh into
+# build/, never committed -- it is platform-specific and ~12MB.
+*.exe
+*.so
+
+# Python bytecode from scripts/probe.py
+__pycache__/
+*.pyc
+
+# Probe state. The auth-state snapshot records which accounts were enabled
+# before a probe run; it is operational state, not source, and naming accounts
+# in git serves no purpose.
+auth-state-snapshot.json

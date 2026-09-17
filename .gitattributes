@@ -1,0 +1,8 @@
+# These are executed on the Linux host (OVH). A CRLF line ending on the shebang
+# line fails with "bad interpreter: /bin/bash^M", which reads like a missing
+# shell rather than a line-ending problem -- force LF regardless of the
+# checkout platform's core.autocrlf.
+*.sh text eol=lf
+*.py text eol=lf
+*.go text eol=lf
+*.yaml text eol=lf
