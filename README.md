@@ -119,8 +119,16 @@ before the plugin appears.
 | `dry_run` | false | log decisions without rewriting the header |
 | `log_decisions` | true | emit one line per harvest/substitute decision |
 
-Changing any of these clears every bucket, so a template can never outlive the
-rules it was harvested under.
+Changing `template_length`, `replace_length` or `ttl_seconds` clears every
+bucket, so a template can never outlive the rules it was harvested under.
+`dry_run` and `log_decisions` do not: they govern what the plugin does with a
+template, not whether it is still a valid one. Templates harvested during a
+dry run therefore survive the switch to `dry_run: false`.
+
+This matters because the host reconfigures far more often than the config
+changes — five times during startup alone, and again whenever CPA rewrites
+`config.yaml`. Clearing on every such call would leave the cache permanently
+empty.
 
 Start with `dry_run: true`. It exercises the whole path — bucketing, TTL,
 length matching — and reports what it *would* do, while leaving live traffic
