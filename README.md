@@ -10,7 +10,13 @@ These are enforced in code and are not configurable:
 1. A state value is never shared across accounts.
 2. A state value is never shared across models.
 3. Reuse inside one bucket is allowed regardless of client IP.
-4. A harvested template expires after `ttl_seconds` (default 3600).
+4. A harvested template expires after `ttl_seconds` (default 3600), measured
+   from the token's own embedded Fernet timestamp — not from when the proxy
+   observed it.
+
+See [FINDINGS.md](FINDINGS.md) for what an `X-Codex-Turn-State` value actually
+is (a Fernet token with an embedded issuance timestamp), why the two lengths
+differ by exactly one AES block, and how expiry is derived.
 
 The plugin never fabricates a value. Substitution only ever uses a value that
 was previously observed on a genuine request belonging to the same bucket.

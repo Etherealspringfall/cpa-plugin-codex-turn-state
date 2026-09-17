@@ -46,6 +46,8 @@ extern void cliproxyPluginShutdown(void);
 import "C"
 
 import (
+	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -82,8 +84,14 @@ type pluginState struct {
 
 // templateEntry is one harvested template, scoped to a single bucket.
 type templateEntry struct {
-	value       string
-	harvestedAt time.Time
+	value string
+	// issuedAt is the token's own issuance time, decoded from the embedded
+	// Fernet timestamp, or the harvest time when the value is not a decodable
+	// Fernet token. Expiry is keyed on this rather than on when the proxy
+	// observed the value: the upstream enforces a server-side validity window
+	// from the token's timestamp, so a template harvested late in its life must
+	// not be treated as fresh for a further full ttl.
+	issuedAt time.Time
 }
 
 type pluginConfig struct {
@@ -335,23 +343,35 @@ func interceptAfterAuth(raw []byte) ([]byte, error) {
 	var replacement string
 	var decision, reason string
 
+	ttl := time.Duration(cfg.TTLSeconds) * time.Second
 	switch len(value) {
 	case cfg.TemplateLength:
 		now := time.Now()
 		state.sweepLocked(now)
-		state.buckets[key] = templateEntry{value: value, harvestedAt: now}
-		decision, reason = "harvest", "template stored"
+		issued, ok := fernetIssuedAt(value)
+		if !ok {
+			issued = now
+		}
+		if now.Sub(issued) > ttl {
+			// Already past its server-side window on arrival; storing it would
+			// only produce a "could not be decrypted" error on reuse.
+			decision, reason = "pass", "template already expired on arrival"
+		} else {
+			state.buckets[key] = templateEntry{value: value, issuedAt: issued}
+			remaining := time.Until(issued.Add(ttl)).Truncate(time.Second)
+			decision, reason = "harvest", "template stored, expires in "+remaining.String()
+		}
 	case cfg.ReplaceLength:
 		entry, found := state.buckets[key]
 		switch {
 		case !found:
 			decision, reason = "pass", "no template for bucket"
-		case time.Since(entry.harvestedAt) > time.Duration(cfg.TTLSeconds)*time.Second:
+		case time.Since(entry.issuedAt) > ttl:
 			delete(state.buckets, key)
 			decision, reason = "pass", "template expired"
 		default:
 			replacement = entry.value
-			decision, reason = "substitute", "template age "+time.Since(entry.harvestedAt).Truncate(time.Second).String()
+			decision, reason = "substitute", "template age "+time.Since(entry.issuedAt).Truncate(time.Second).String()
 		}
 	default:
 		decision, reason = "pass", "length not configured"
@@ -380,10 +400,25 @@ func interceptAfterAuth(raw []byte) ([]byte, error) {
 func (s *pluginState) sweepLocked(now time.Time) {
 	ttl := time.Duration(s.config.TTLSeconds) * time.Second
 	for key, entry := range s.buckets {
-		if now.Sub(entry.harvestedAt) > ttl {
+		if now.Sub(entry.issuedAt) > ttl {
 			delete(s.buckets, key)
 		}
 	}
+}
+
+// fernetIssuedAt extracts the issuance time embedded in a Codex
+// X-Codex-Turn-State value. These are Fernet tokens: a 0x80 version byte
+// followed by an 8-byte big-endian Unix timestamp, base64url-encoded. The
+// upstream enforces a validity window measured from this timestamp, so it is
+// the correct basis for expiry. The bool is false when the value is not a
+// decodable Fernet token, in which case the caller falls back to harvest time.
+func fernetIssuedAt(value string) (time.Time, bool) {
+	raw, err := base64.RawURLEncoding.DecodeString(strings.TrimRight(value, "="))
+	if err != nil || len(raw) < 9 || raw[0] != 0x80 {
+		return time.Time{}, false
+	}
+	secs := binary.BigEndian.Uint64(raw[1:9])
+	return time.Unix(int64(secs), 0), true
 }
 
 func bucketKey(authID, model string) string {
