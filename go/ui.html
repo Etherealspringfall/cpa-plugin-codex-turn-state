@@ -440,11 +440,10 @@ select {
       </div>
       <div id="probeLines"></div>
       <div class="hint">
-        按探测范围逐个桶采集：每次只启用被探的那一个账号（CPA 的调度器自己挑号，
-        这是把采到的令牌归属到已知账号的唯一办法），按代理清单顺序换出口，
-        每个桶发一条最小请求。<b class="warntext">会消耗额度。</b>
-        跑之前应当先停掉业务流量。结束时账号启用状态和 <code>proxy_url</code> 会自动还原
-        —— 先还原出口再还原启用位，顺序反了会把日常流量送进探测代理。
+        读每个账号自己的 token 直连上游采集，<b>不经过 CPA、不改 CPA 任何状态</b>
+        （启用位、<code>proxy_url</code> 都不动），所以账号全程照常跑业务、<b>无需停服</b>，
+        多个账号并行。每个桶按代理清单顺序换出口、发一条最小请求。<b class="warntext">会消耗额度。</b>
+        初始采齐后续期循环常驻，卡到期前 5 分钟自动重采；停止探测没有任何账号状态要还原。
       </div>
     </div>
   </section>
@@ -495,8 +494,8 @@ var POLL_MS = 10000;
 // /ops/choices 比 status 冷得多（CPA 手里的凭据一天也未必变一次），所以它不跟着
 // status 每 10 秒刷一次，最快 60 秒一次。另外两种情况干脆不读：
 //   · 表单被动过     —— 清单一换，勾选框就要重建，会打断正在点的人。
-//   · 探测跑着的时候 —— 探测会逐个开关账号的启用位，那段时间读到的 disabled 是
-//                      过程量，刷进清单只会让标签闪个不停。
+//   · 探测跑着的时候 —— 范围已定死、表单是锁的（见 renderProbe），此时重建勾选框
+//                      既没意义又会打断，索性不读。
 var CHOICES_MS = 60000;
 
 // 不鉴权、GET-only。这个页面【只】用这一个前缀：status、四个操作、保存范围。
@@ -1923,7 +1922,7 @@ function doClearAll() {
     lines: [
       { text: "store 里所有 (账号, 模型) 的模板都会被删除。" },
       { text: "在重新探齐之前，业务端将完全停止替换 —— 所有降级请求都会原样发往上游。", em: true },
-      { text: "重新探齐需要停业务跑一轮探测，并且会消耗额度。" }
+      { text: "重新探齐要跑一轮探测（无需停业务），并且会消耗额度。" }
     ]
   }).then(function (go) {
     if (!go) { return; }
@@ -1949,13 +1948,8 @@ function doProbeStart() {
   lines.push({ text: "范围：" + accounts.length + " 账号 × " + models.length + " 模型；" +
                      "已就绪的桶会跳过，这一轮大约要采 " + Math.max(0, pending) + " 个。" });
   lines.push({ text: "出口：" + (proxies ? (proxies + " 条代理，按清单顺序逐条试") : "没有配代理，直接用账号当前的出口") });
-  lines.push({ text: "跑的时候每次只启用被探的那一个账号 —— CPA 的调度器自己挑号，" +
-                     "这是把采到的令牌归属到已知账号的唯一办法。请先停掉业务流量。", em: true });
+  lines.push({ text: "直连上游采集，不经过 CPA、不改任何账号状态；账号照常跑业务，无需停服。", em: true });
   lines.push({ text: "会消耗额度：每个还没就绪的桶至少一条上游请求。", em: true });
-  lines.push({ text: "结束（含中途停止）时会自动还原：先还原 proxy_url，再还原账号启用位。" });
-  if (d.role !== "probe") {
-    lines.push({ text: "注意：当前 role 是 " + (d.role || "—") + "，不是 probe。插件会拒绝这次请求。", em: true });
-  }
 
   confirmDialog({
     title: "开始探测？",
@@ -1980,13 +1974,13 @@ function doProbeCancel() {
     confirmText: "停止",
     lines: [
       { text: "已经采到的桶会留下，没采的这一轮就不采了。" },
-      { text: "账号启用位和 proxy_url 仍然会被还原 —— 停止不会把账号留在探测态。" }
+      { text: "续期循环也会一并停 —— 卡到期后桶会空，改由业务流量顺带采集接管（有空窗）。", em: true }
     ]
   }).then(function (go) {
     if (!go) { return; }
     return withBusy(function () {
       return resAction("/ops/probe/cancel", {}).then(function () {
-        notify("info", "已要求停止。正在还原账号状态，稍等一次刷新。");
+        notify("info", "已要求停止。探测会跑完当前这次采集后退出，稍等一次刷新。");
         return refresh();
       });
     }).catch(actionError);
