@@ -57,6 +57,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -109,6 +110,19 @@ const (
 var (
 	probeRenewInterval  = 60 * time.Second
 	probeRenewThreshold = 5 * time.Minute
+
+	// probeExitCooldown is the minimum gap between two upstream calls on the same
+	// (exit, account, model) triple, and it is the whole answer to the defect this
+	// replaced: a bucket that could not be filled was re-fired every tick forever.
+	// Measured on 2026-09-18, that was 540 upstream calls an hour, every one of
+	// them a 312, all against credentials that were already being throttled --
+	// which is precisely the pattern a rate limiter punishes.
+	//
+	// 55 minutes rather than 60 on purpose. A harvested template lives ttl (3600s)
+	// and the renewal loop refreshes it once it drops under probeRenewThreshold,
+	// i.e. at T+55m. A 60-minute cooldown would block that refresh and let the card
+	// lapse for five minutes on every cycle; 55 lines the two up exactly.
+	probeExitCooldown = 55 * time.Minute
 )
 
 // probeRunState is the snapshot the dashboard polls. It carries progress and
@@ -330,7 +344,13 @@ func probeSweep(ctx context.Context, cfg pluginConfig, accounts, models, proxies
 	probeRunUpdate(func(run *probeRunState) { run.Total = len(targets) })
 	probeRunLog("offline harvest: %d account(s) x %d model(s) = %d bucket(s) to fill, %d exit(s) in pool", len(accounts), len(models), len(targets), len(proxies))
 	if len(targets) > 0 {
-		probeFireBatch(ctx, cfg, pool, creds, targets, idxOf, proxies, true)
+		if cooling := probeFireBatch(ctx, cfg, pool, creds, targets, idxOf, proxies, true); cooling > 0 {
+			// Said once per pass rather than per bucket per tick: the common case
+			// after a recent sweep is that most buckets are still inside the
+			// window, and an operator who just pressed the button needs to be told
+			// why nothing happened.
+			probeRunLog("%d bucket(s) skipped: every exit already tried within the %s cooldown", cooling, probeExitCooldown)
+		}
 	} else {
 		probeRunLog("every selected bucket already holds a live template")
 	}
@@ -363,7 +383,8 @@ func probeAccountIndex(accounts []string) map[string]int {
 // probeMaxInFlight. countDone advances the progress bar (the initial fill wants
 // it; a renewal tick does not, having no fixed Total). It is the shared fan-out
 // for both callers so the concurrency rule lives in one place.
-func probeFireBatch(ctx context.Context, cfg pluginConfig, pool *probeClientPool, creds map[string]probeCredential, targets []probeTarget, idxOf map[string]int, proxies []string, countDone bool) {
+func probeFireBatch(ctx context.Context, cfg pluginConfig, pool *probeClientPool, creds map[string]probeCredential, targets []probeTarget, idxOf map[string]int, proxies []string, countDone bool) int {
+	var cooling atomic.Int64
 	sem := make(chan struct{}, probeMaxInFlight)
 	var wg sync.WaitGroup
 	for _, target := range targets {
@@ -384,75 +405,107 @@ func probeFireBatch(ctx context.Context, cfg pluginConfig, pool *probeClientPool
 		go func(target probeTarget, cred probeCredential) {
 			defer wg.Done()
 			defer func() { <-sem }()
-			probeHarvestBucket(ctx, cfg, pool, cred, target.model, proxies, idxOf[target.account])
+			if !probeHarvestBucket(ctx, cfg, pool, cred, target.model, proxies, idxOf[target.account]) {
+				cooling.Add(1)
+			}
 			if countDone {
 				probeRunUpdate(func(run *probeRunState) { run.Done++ })
 			}
 		}(target, cred)
 	}
 	wg.Wait()
+	return int(cooling.Load())
 }
 
-// probeHarvestBucket fills one bucket: it fires the account's assigned exit,
-// falling through the rest of the pool only on a transport failure, and stores a
-// 292. It is the one harvest path; the initial fill and the renewal loop both
-// call it, and the claim guard keeps them off each other's buckets.
-func probeHarvestBucket(ctx context.Context, cfg pluginConfig, pool *probeClientPool, cred probeCredential, model string, proxies []string, accountIdx int) {
+// probeHarvestBucket fills one bucket by walking the account's exit sequence:
+// every exit that is out of cooldown gets one try, and the walk stops at the
+// first 292. It is the one harvest path; the initial fill and the renewal loop
+// both call it, and the claim guard keeps them off each other's buckets.
+//
+// It reports whether any upstream call was actually made. A bucket whose every
+// exit is still inside probeExitCooldown returns false without a word, which is
+// what keeps the renewal loop from narrating the same skip once a minute.
+func probeHarvestBucket(ctx context.Context, cfg pluginConfig, pool *probeClientPool, cred probeCredential, model string, proxies []string, accountIdx int) bool {
 	key := bucketKey(cred.name, model)
 	if !probeClaim(key) {
 		// Another fire (the other loop, or an overtaking renewal tick) is already
 		// on this exact bucket. Firing a second upstream call for it would spend
 		// quota to overwrite a value with a near-identical one.
-		return
+		return false
 	}
 	defer probeRelease(key)
 
 	short := probeShortAuth(cred.name)
+	fired := false
 	for _, exit := range probeExits(proxies, accountIdx) {
 		if ctx.Err() != nil {
-			return
+			return fired
+		}
+		now := time.Now()
+		if !probeCooldownReady(exit, cred.name, model, now) {
+			// Spent within the window. Silent on purpose: saying so would put one
+			// line per bucket per tick into a forty-line transcript.
+			continue
 		}
 		client, errClient := pool.get(exit)
 		if errClient != nil {
 			probeRunLog("%s %s: exit %s unusable, trying next: %s", short, model, probeShowProxy(exit), probeRedact(errClient.Error()))
 			continue
 		}
+
+		// Marked before the call rather than after: a request that times out, or
+		// whose goroutine dies, still spent an attempt on this triple, and the
+		// guarantee being kept is that the upstream sees at most one call per
+		// triple per window.
+		probeCooldownMark(exit, cred.name, model, now)
+		fired = true
+
 		status, value, errFire := probeFireUpstream(ctx, client, cred, model)
 		if errFire != nil {
 			// A transport failure means this exit did not carry the request at all;
-			// the next one might. A rejected token or a throttle comes back as an
-			// HTTP status, not an error, so this really is the exit's fault.
+			// the next one might.
 			probeRunLog("%s %s: exit %s failed at transport, trying next: %s", short, model, probeShowProxy(exit), probeRedact(errFire.Error()))
 			continue
 		}
-		probeConsume(cfg, cred.name, short, model, status, value, exit)
-		return
+		if probeConsume(cfg, cred.name, short, model, status, value, exit) {
+			return true
+		}
+		// Not stored -- a 312, or a rejection. That is THIS EXIT's IP being
+		// throttled for this account and model, not the bucket being unfillable,
+		// so the next exit is a different IP and gets its turn. This is the fix
+		// for the defect where a 312 ended the attempt outright and the rest of
+		// the pool was never dialed at all.
 	}
-	probeRunLog("%s %s: every configured exit failed at the transport level; nothing harvested", short, model)
+	return fired
 }
 
 // probeConsume decides what one upstream response means. Only a 200 carrying a
 // template-length turn-state is stored; a degraded length is the throttle this
 // plugin exists to route around and is logged, not stored.
-func probeConsume(cfg pluginConfig, name, short, model string, status int, value, exit string) {
+// It reports whether a template was stored, which is what tells the caller to
+// stop walking the pool: anything else means this exit did not work out and the
+// next one deserves a turn.
+func probeConsume(cfg pluginConfig, name, short, model string, status int, value, exit string) bool {
 	if status != http.StatusOK {
 		probeRunLog("%s %s: http=%d via %s, no template (token rejected or upstream error)", short, model, status, probeShowProxy(exit))
-		return
+		return false
 	}
 	switch {
 	case len(value) == cfg.TemplateLength:
 		if errStore := probeStore(cfg, name, model, value); errStore != nil {
 			probeRunLog("%s %s: harvested len=%d but store failed: %s", short, model, len(value), probeRedact(errStore.Error()))
-			return
+			return false
 		}
-		probeRunLog("%s %s: harvested len=%d, fresh template stored", short, model, len(value))
+		probeRunLog("%s %s: harvested len=%d via %s, fresh template stored", short, model, len(value), probeShowProxy(exit))
+		return true
 	case len(value) == cfg.ReplaceLength:
-		probeRunLog("%s %s: upstream returned degraded state len=%d (throttled or honeymoon closed), not stored", short, model, len(value))
+		probeRunLog("%s %s: degraded len=%d via %s (this exit's IP is throttled for this bucket), trying next exit", short, model, len(value), probeShowProxy(exit))
 	case value == "":
-		probeRunLog("%s %s: http=200 but no turn-state header, nothing to harvest", short, model)
+		probeRunLog("%s %s: http=200 but no turn-state header via %s, nothing to harvest", short, model, probeShowProxy(exit))
 	default:
-		probeRunLog("%s %s: unexpected turn-state len=%d, not stored", short, model, len(value))
+		probeRunLog("%s %s: unexpected turn-state len=%d via %s, not stored", short, model, len(value), probeShowProxy(exit))
 	}
+	return false
 }
 
 // probeStore writes one harvested template to the same store the business role
@@ -552,20 +605,30 @@ func probeRenewLoop(ctx context.Context, pool *probeClientPool) {
 		}
 
 		now := time.Now()
+		idxOf := probeAccountIndex(accounts)
 		var due []probeTarget
 		involved := make(map[string]bool)
 		for _, account := range accounts {
 			for _, model := range models {
 				remaining, live := probeBucketRemaining(cfg, account, model, now)
-				if !live || remaining < probeRenewThreshold {
-					due = append(due, probeTarget{account: account, model: model})
-					involved[account] = true
+				if live && remaining >= probeRenewThreshold {
+					continue
 				}
+				// Wants a card -- but only queue it if some exit is actually
+				// allowed to fire. Without this the loop would download
+				// credentials and claim buckets once a minute only to find every
+				// triple still cooling, which is the busy-work half of the defect
+				// probeExitCooldown exists to end.
+				if !probeBucketHasEligibleExit(proxies, idxOf[account], account, model, now) {
+					continue
+				}
+				due = append(due, probeTarget{account: account, model: model})
+				involved[account] = true
 			}
 		}
 		if len(due) == 0 {
 			probeRunUpdate(func(run *probeRunState) {
-				run.Current = fmt.Sprintf("all buckets fresh; next check in %s", probeRenewInterval)
+				run.Current = fmt.Sprintf("nothing due (fresh, or every exit cooling); next check in %s", probeRenewInterval)
 			})
 			continue
 		}
@@ -583,7 +646,7 @@ func probeRenewLoop(ctx context.Context, pool *probeClientPool) {
 		}
 		client := newProbeClient(cfg)
 		creds := probeDownloadCreds(ctx, client, accountList, now)
-		probeFireBatch(ctx, cfg, pool, creds, due, probeAccountIndex(accounts), proxies, false)
+		probeFireBatch(ctx, cfg, pool, creds, due, idxOf, proxies, false)
 		client.http.CloseIdleConnections()
 	}
 }
@@ -671,6 +734,56 @@ func probeRelease(key string) {
 	probeActive.mu.Lock()
 	defer probeActive.mu.Unlock()
 	delete(probeActive.set, key)
+}
+
+// probeCooldown records when each (exit, account, model) triple last had an
+// upstream call spent on it.
+//
+// The exit belongs in the key because a 312 is the IP being throttled for that
+// account and model, not the bucket being unfillable -- which is the entire
+// reason a pool of exits exists. So a 312 on one exit says nothing about the
+// next one, and only when every exit has had its turn is the bucket genuinely
+// out of options for this window.
+//
+// Keying on the exit URL has a second, useful property: correcting a typo in a
+// proxy changes the string, so the fixed exit is a new triple with no cooldown
+// and is retried at once instead of sitting out the window.
+var probeCooldown = struct {
+	mu   sync.Mutex
+	last map[string]time.Time
+}{last: map[string]time.Time{}}
+
+func probeCooldownKey(exit, account, model string) string {
+	return exit + "\x00" + account + "\x00" + model
+}
+
+// probeCooldownReady reports whether this triple may be fired now. A triple that
+// has never been fired is always ready, which is what makes a newly added exit
+// eligible the moment it appears in the pool.
+func probeCooldownReady(exit, account, model string, now time.Time) bool {
+	probeCooldown.mu.Lock()
+	defer probeCooldown.mu.Unlock()
+	last, seen := probeCooldown.last[probeCooldownKey(exit, account, model)]
+	return !seen || now.Sub(last) >= probeExitCooldown
+}
+
+func probeCooldownMark(exit, account, model string, now time.Time) {
+	probeCooldown.mu.Lock()
+	defer probeCooldown.mu.Unlock()
+	probeCooldown.last[probeCooldownKey(exit, account, model)] = now
+}
+
+// probeBucketHasEligibleExit reports whether any exit is allowed to fire for this
+// bucket. The renewal loop checks this before queueing anything: without it, a
+// scope whose every triple is cooling would still download credentials and claim
+// buckets once a minute just to discover it may do nothing.
+func probeBucketHasEligibleExit(proxies []string, accountIdx int, account, model string, now time.Time) bool {
+	for _, exit := range probeExits(proxies, accountIdx) {
+		if probeCooldownReady(exit, account, model, now) {
+			return true
+		}
+	}
+	return false
 }
 
 // probeSleep waits for the given duration and reports whether the run is still

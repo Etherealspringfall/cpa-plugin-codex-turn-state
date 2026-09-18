@@ -5,10 +5,12 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -167,6 +169,8 @@ type fakeUpstream struct {
 	// a harvestable template; 312 is the degraded state; a non-200 is a rejection.
 	status int
 	tsLen  int
+	// tsLenSeq, when set, overrides tsLen per call index (last entry repeats).
+	tsLenSeq []int
 }
 
 func newFakeUpstream(t *testing.T) *fakeUpstream {
@@ -183,6 +187,7 @@ func (u *fakeUpstream) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	_ = json.NewDecoder(r.Body).Decode(&body)
 	u.mu.Lock()
+	index := len(u.calls)
 	u.calls = append(u.calls, upstreamCall{
 		model:         body.Model,
 		authorization: r.Header.Get("Authorization"),
@@ -191,6 +196,16 @@ func (u *fakeUpstream) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		sentTurnState: r.Header.Get(turnStateHeader) != "",
 	})
 	status, tsLen := u.status, u.tsLen
+	// tsLenSeq shapes the answer per call, which is how "this exit's IP is
+	// throttled but the next one's is not" is expressed: the exits are
+	// indistinguishable to the fake, but the order they arrive in is not.
+	if len(u.tsLenSeq) > 0 {
+		if index < len(u.tsLenSeq) {
+			tsLen = u.tsLenSeq[index]
+		} else {
+			tsLen = u.tsLenSeq[len(u.tsLenSeq)-1]
+		}
+	}
 	u.mu.Unlock()
 
 	// The turn-state begins with the real Fernet prefix so the redaction path is
@@ -291,6 +306,13 @@ func resetProbeRunner(t *testing.T) {
 		probeActive.mu.Lock()
 		probeActive.set = make(map[string]bool)
 		probeActive.mu.Unlock()
+		// The cooldown table is process-global and keyed by (exit, account,
+		// model). Left behind, one case's fire silently suppresses the next
+		// case's -- which shows up as "the transcript says nothing happened",
+		// not as an obvious cross-test leak.
+		probeCooldown.mu.Lock()
+		probeCooldown.last = make(map[string]time.Time)
+		probeCooldown.mu.Unlock()
 		state.mu.Lock()
 		state.buckets = make(map[string]templateEntry)
 		state.store = nil
@@ -314,13 +336,18 @@ func setUpstream(t *testing.T, rawURL string) {
 	t.Cleanup(func() { probeUpstreamURL = previous })
 }
 
-// fastRenew shrinks the renewal cadence for one test. Production never writes
-// these; a real run checks once a minute.
-func fastRenew(t *testing.T, interval, threshold time.Duration) {
+// fastRenew shrinks the renewal cadence and the per-triple cooldown for one
+// test. Production never writes these; a real run checks once a minute and
+// spends at most one call per triple per 55 minutes. The cooldown has to shrink
+// alongside the cadence: leave it at 55 minutes and a renewal tick correctly
+// refuses to re-fire, so a renewal test would time out proving nothing.
+func fastRenew(t *testing.T, interval, threshold, cooldown time.Duration) {
 	t.Helper()
-	prevInterval, prevThreshold := probeRenewInterval, probeRenewThreshold
-	probeRenewInterval, probeRenewThreshold = interval, threshold
-	t.Cleanup(func() { probeRenewInterval, probeRenewThreshold = prevInterval, prevThreshold })
+	prevInterval, prevThreshold, prevCooldown := probeRenewInterval, probeRenewThreshold, probeExitCooldown
+	probeRenewInterval, probeRenewThreshold, probeExitCooldown = interval, threshold, cooldown
+	t.Cleanup(func() {
+		probeRenewInterval, probeRenewThreshold, probeExitCooldown = prevInterval, prevThreshold, prevCooldown
+	})
 }
 
 // waitForProbeRun blocks until no run is marked running. It is for the failure
@@ -604,6 +631,153 @@ func TestProbeExitsAssignInOrderWithFallback(t *testing.T) {
 	}
 }
 
+// newFakeProxy stands up a forwarding HTTP proxy so a test can hold two
+// genuinely distinct working exits. The pool needs real dialable URLs: "" is the
+// only other exit that works, and every "" collapses onto one cooldown key, so
+// the pool-walking rules cannot be exercised without this.
+func newFakeProxy(t *testing.T, hits *atomic.Int64) string {
+	t.Helper()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		// A proxied request carries an absolute URL, so this forwards verbatim.
+		outbound, errNew := http.NewRequest(r.Method, r.URL.String(), r.Body)
+		if errNew != nil {
+			http.Error(w, errNew.Error(), http.StatusBadGateway)
+			return
+		}
+		outbound.Header = r.Header.Clone()
+		response, errDo := http.DefaultTransport.RoundTrip(outbound)
+		if errDo != nil {
+			http.Error(w, errDo.Error(), http.StatusBadGateway)
+			return
+		}
+		defer func() { _ = response.Body.Close() }()
+		for name, values := range response.Header {
+			for _, value := range values {
+				w.Header().Add(name, value)
+			}
+		}
+		w.WriteHeader(response.StatusCode)
+		_, _ = io.Copy(w, response.Body)
+	}))
+	t.Cleanup(server.Close)
+	return server.URL
+}
+
+// harvestTestConfig is a minimal config for driving probeHarvestBucket directly,
+// which is how the pool rules are tested: going through probeRunStart would put
+// the exits through normaliseProbeScope and lose the shape each case needs.
+func harvestTestConfig(t *testing.T) (pluginConfig, probeCredential, *probeClientPool) {
+	t.Helper()
+	cfg := pluginConfig{
+		StoreDir:       t.TempDir(),
+		TemplateLength: 292,
+		ReplaceLength:  312,
+		TTLSeconds:     3600,
+	}
+	cred := probeCredential{name: probeTestAccount, accessToken: "token-a", accountID: "acct-a"}
+	pool := newProbeClientPool()
+	t.Cleanup(pool.closeIdle)
+	return cfg, cred, pool
+}
+
+func TestProbeAdvancesToNextExitOn312(t *testing.T) {
+	// The defect this pins: a 312 used to end the whole attempt, so the second
+	// exit was never dialed and the pool was decorative. A 312 is THIS EXIT's IP
+	// being throttled for this bucket, so the next exit must get its turn.
+	resetProbeRunner(t)
+	upstream := newFakeUpstream(t)
+	upstream.tsLenSeq = []int{312, 292} // first exit throttled, second not
+	setUpstream(t, upstream.server.URL)
+
+	var hitsA, hitsB atomic.Int64
+	exitA := newFakeProxy(t, &hitsA)
+	exitB := newFakeProxy(t, &hitsB)
+	cfg, cred, pool := harvestTestConfig(t)
+
+	if !probeHarvestBucket(context.Background(), cfg, pool, cred, probeTestModel, []string{exitA, exitB}, 0) {
+		t.Fatal("probeHarvestBucket reported no upstream call at all")
+	}
+
+	if _, ok := storedBucket(probeTestAccount, probeTestModel); !ok {
+		t.Fatal("bucket not filled: the 312 on the first exit ended the attempt instead of moving to the second")
+	}
+	if got := upstream.count(); got != 2 {
+		t.Fatalf("upstream calls = %d, want 2 (one per exit)", got)
+	}
+	if hitsA.Load() != 1 || hitsB.Load() != 1 {
+		t.Fatalf("exit hits A=%d B=%d, want 1 each -- the pool was not walked in order", hitsA.Load(), hitsB.Load())
+	}
+}
+
+func TestProbeStopsAfterWalkingThePoolAndCoolsDown(t *testing.T) {
+	// Once every exit has been tried the bucket is out of options for the window.
+	// Re-firing it was the 540-calls-an-hour defect, so a second attempt inside
+	// the cooldown must spend nothing at all.
+	resetProbeRunner(t)
+	upstream := newFakeUpstream(t)
+	upstream.tsLen = 312 // every exit throttled
+	setUpstream(t, upstream.server.URL)
+
+	var hitsA, hitsB atomic.Int64
+	exitA := newFakeProxy(t, &hitsA)
+	exitB := newFakeProxy(t, &hitsB)
+	exits := []string{exitA, exitB}
+	cfg, cred, pool := harvestTestConfig(t)
+
+	if !probeHarvestBucket(context.Background(), cfg, pool, cred, probeTestModel, exits, 0) {
+		t.Fatal("the first pass made no upstream call")
+	}
+	if got := upstream.count(); got != 2 {
+		t.Fatalf("first pass made %d upstream calls, want 2 (one per exit)", got)
+	}
+
+	if probeHarvestBucket(context.Background(), cfg, pool, cred, probeTestModel, exits, 0) {
+		t.Fatal("a second pass inside the cooldown still fired; this is the runaway-retry defect")
+	}
+	if got := upstream.count(); got != 2 {
+		t.Fatalf("upstream calls grew to %d inside the cooldown, want it pinned at 2", got)
+	}
+}
+
+func TestProbeNewExitIsEligibleImmediately(t *testing.T) {
+	// The operator's workflow: the pool is exhausted, they add a proxy, and that
+	// new exit must be tried at once rather than waiting out a window it was
+	// never part of. It falls out of keying the cooldown on the exit URL.
+	resetProbeRunner(t)
+	upstream := newFakeUpstream(t)
+	upstream.tsLenSeq = []int{312, 312, 292} // the two old exits, then the new one
+	setUpstream(t, upstream.server.URL)
+
+	var hitsA, hitsB, hitsC atomic.Int64
+	exitA := newFakeProxy(t, &hitsA)
+	exitB := newFakeProxy(t, &hitsB)
+	cfg, cred, pool := harvestTestConfig(t)
+
+	probeHarvestBucket(context.Background(), cfg, pool, cred, probeTestModel, []string{exitA, exitB}, 0)
+	if upstream.count() != 2 {
+		t.Fatalf("setup: expected the pool to be walked once, got %d calls", upstream.count())
+	}
+
+	exitC := newFakeProxy(t, &hitsC)
+	if !probeHarvestBucket(context.Background(), cfg, pool, cred, probeTestModel, []string{exitA, exitB, exitC}, 0) {
+		t.Fatal("adding an exit did not make the bucket fireable again")
+	}
+
+	if _, ok := storedBucket(probeTestAccount, probeTestModel); !ok {
+		t.Fatal("the new exit did not fill the bucket")
+	}
+	if got := upstream.count(); got != 3 {
+		t.Fatalf("upstream calls = %d, want 3: only the new exit should have fired", got)
+	}
+	if hitsA.Load() != 1 || hitsB.Load() != 1 {
+		t.Fatalf("a cooling exit was re-dialed: A=%d B=%d, want 1 each", hitsA.Load(), hitsB.Load())
+	}
+	if hitsC.Load() != 1 {
+		t.Fatalf("the new exit was dialed %d times, want 1", hitsC.Load())
+	}
+}
+
 func TestProbeFallsThroughToNextExitOnTransportFailure(t *testing.T) {
 	// A dead first exit must not lose the harvest: the account falls through to the
 	// next exit in its sequence. The pool is handed straight to probeHarvestBucket
@@ -645,7 +819,7 @@ func TestProbeRenewsBucketNearingExpiry(t *testing.T) {
 	// a large threshold the freshly filled bucket is immediately due, so a second
 	// upstream call is proof the renewal loop is running.
 	resetProbeRunner(t)
-	fastRenew(t, 15*time.Millisecond, 2*time.Hour)
+	fastRenew(t, 15*time.Millisecond, 2*time.Hour, time.Millisecond)
 	fake := newFakeCPA(t, fakeCredSeed{name: probeTestAccount, accountID: "acct-a"})
 	upstream := newFakeUpstream(t)
 	setUpstream(t, upstream.server.URL)
