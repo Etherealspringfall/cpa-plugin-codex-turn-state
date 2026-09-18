@@ -73,12 +73,66 @@ plugins:
       # 值本身永远不进日志。
       log_decisions: true
 
-      # 目标模型清单，用于完整性核对。
+      # 目标模型清单。
       # 【必须带横线】，不要写成 gpt5.5。
-      # 探测的 --until-complete 要求这 5 个模型 × 5 个账号 = 25 个桶全部就绪。
+      #
+      # 这是【探测范围】的一半，另一半是下面的 probe_accounts。
+      # 目标桶数 = len(probe_accounts) × len(models)，
+      # probe.py --until-complete 以这些桶全部就绪为准。
       models:
         - gpt-5.5
         - gpt-5.6-luna
         - gpt-5.6-terra
         - gpt-5.6-sol
         - gpt-6-astra
+
+      # ── 探测范围（下面两项只影响探测，不影响业务替换）──────────────────
+      #
+      # 这一点很容易搞反，所以说清楚：probe_accounts 和 probe_proxies
+      # 【不是白名单】。业务端一行都不读它们。
+      #
+      #   业务替换的判据只有三条，从头到尾没有这两份名单的事：
+      #     1. 请求带 X-Codex-Turn-State
+      #     2. 长度是 replace_length（312）
+      #     3. 该 (账号, 模型) 桶里有未过期的 292
+      #
+      #   所以把某个账号从 probe_accounts 里去掉，【不会】让它停止被替换 ——
+      #   只是没人给它采桶，它自然就没得换（空窗）。反过来，加进来也不会
+      #   凭空生成桶，采集只有 probe.py 一条路。
+
+      # 这一轮探测要覆盖哪几个账号。填账号 JSON 的【文件名】。
+      #
+      # 空着 = 没选 → probe.py 【拒绝开跑】，不会默认打全量。
+      # 这是刻意的：探测要停对外业务、每个桶烧一次上游请求，
+      # 「没选就等于全选」是唯一事后补救不了的错误。
+      #
+      # 非法项（不是 codex-*.json 的形状）会被丢弃并记进 config_errors，
+      # 但【不会】让插件拒绝启动 —— 探测范围写错不该把业务角色拖下线。
+      probe_accounts:
+        - codex-xxxxxxxx-someone@example.com-pro.json
+
+      # 探测时按顺序尝试的出口，作用在【当前被探账号自己】的代理字段上。
+      #
+      # 为什么需要：规则 3 说同账号同模型的 292 可以跨 IP 用，所以出口只要在
+      # 「领卡」那几秒是好的就行，之后业务走日常线路照样认。这就是房卡比喻里
+      # 的「前台办入住用身份证，开门只刷卡」。
+      #
+      # 逐桶故障转移：代理 1 拿不到 292（超时 / 回 312 / 过载）就换代理 2，
+      # 全部失败则该桶标 missing 并继续下一个模型，不中断整轮。
+      #
+      # 空着 = 不改任何代理，走各账号现有出口。这是安全的默认值。
+      #
+      # ⚠️ 两条硬规矩：
+      #   1. 【绝不】改全局 proxy-url —— 那条线上跑着 Kimi、xAI 和所有日常流量。
+      #   2. 这里的值带密码，是本段配置里唯一的机密。它【不会】出现在匿名
+      #      status、日志或 index.json 里，只以 socks5h://***@host:port 的
+      #      形式露出；完整值只在鉴权的 GET /v0/management/codex-turn-state/config
+      #      里回传，供看板回填。不要把真实密码提交进 git 或贴进聊天。
+      #
+      # ⚠️ 现状（2026-09-18）：CPA 的 auth-files 接口【不回显】任何 per-account
+      #    代理字段，所以 probe.py 无法确认写入是否生效、也无法快照原值用于恢复。
+      #    在这种情况下配了 probe_proxies 会被【拒绝开跑】。要用这个功能，
+      #    先确认这台 CPA 到底支不支持 per-account 代理、字段名是什么。
+      probe_proxies: []
+      #  - socks5h://user:pass@exit-1.example:1080
+      #  - http://user:pass@exit-2.example:8080

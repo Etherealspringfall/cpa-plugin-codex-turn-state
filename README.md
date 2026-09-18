@@ -200,7 +200,69 @@ gpt-6-astra
 | `harvest_inband` | false | 业务端是否也从业务流量采。**业务角色强制 false** |
 | `dry_run` | false | 逻辑照走、照打日志，但不真改头 |
 | `log_decisions` | true | 每个决定打一行 |
-| `models` | `[]` | 目标模型清单，用于完整性核对 |
+| `models` | `[]` | 目标模型清单。和 `probe_accounts` 一起构成探测范围 |
+| `probe_accounts` | `[]` | 探测覆盖哪几个账号（文件名）。**只影响探测** |
+| `probe_proxies` | `[]` | 探测时逐桶尝试的出口。**只影响探测**，带密码 |
+
+### `probe_accounts` / `probe_proxies` —— 只影响探测
+
+这两项**不是白名单**。业务路径一行都不读它们，`interceptAfterAuth` 和
+`decideHeader` 里没有任何地方引用，有测试守着这条。
+
+业务替换的判据从头到尾只有三条：
+
+1. 请求带 `X-Codex-Turn-State`
+2. 长度等于 `replace_length`（312）
+3. 该 `(账号, 模型)` 桶里有未过期的 292
+
+所以把一个账号从 `probe_accounts` 里去掉，**不会**让它停止被替换 —— 只是没人
+给它采桶，它自然就没得换（空窗）。反过来，加进来也不会凭空生成桶：采集只有
+`scripts/probe.py` 一条路。
+
+改这两项**不会清空已有模板**（`templatesInvalidatedBy` 不含它们）。这点是刻意
+的：在看板上勾选范围是 `configure` 最常见的触发源，在那里清模板等于操作员每勾
+一次框就扔掉一批还能用的卡。
+
+**空范围 = 拒绝开跑。** `probe.py` 在 `probe_accounts` 或 `models` 为空时以非 0
+退出，不会退化成打全量。探测要停对外业务、每个桶烧一次上游请求，「没选就等于
+全选」是唯一事后补救不了的错误。
+
+#### `probe_proxies` 是这段配置里唯一的机密
+
+值里带密码，所以它的暴露面是被刻意收窄的：
+
+| 出口 | 回传什么 |
+|---|---|
+| 匿名 `/v0/resource/plugins/codex-turn-state/status` | 只有 `probe_proxy_count` 和 `probe_proxies_masked` |
+| 鉴权 `GET /v0/management/codex-turn-state/status` | **同样只有脱敏形式** |
+| 鉴权 `GET /v0/management/codex-turn-state/config` | 完整值，供看板回填编辑 |
+| 日志 / `index.json` / 决策行 | 永不出现 |
+
+> ### ⚠️ 往 `statusResponse` 里加字段前先读这段
+>
+> `handleStatus` 同时服务**匿名**的 resource 路由和鉴权的 management 路由，
+> 两边返回**同一个结构体**，没有按路由做过滤。
+>
+> 所以：**加进 `statusResponse` 的任何东西都是公开的。** 这就是为什么完整代理
+> 列表在 `configResponse` 而不在这里。加错地方不会报错、不会有日志，只会把密码
+> 发出去。
+
+脱敏统一走 `maskProxyURL`：userinfo 整段换成 `***`（不做「留前两位」，密码长度
+本身就是线索），**解析不了的返回固定占位符而不是原值** —— 解析失败的那条往往正
+是密码里混了怪字符的那条。
+
+#### ⚠️ 现状：这台 CPA 上代理轮换还开不起来
+
+2026-09-18 实测：`GET /v0/management/auth-files` 的条目里**没有任何 per-account
+代理字段**（字段名按字母序输出，`proxy_url` 该在 `provider` 和 `quota` 之间，
+那里是空的）。
+
+后果是 `probe.py` 既无法确认写入生效，**也无法快照账号原来的出口**，也就无法恢
+复。所以配了 `probe_proxies` 时它会**拒绝开跑**，而不是盲切。
+
+要启用这个功能，得先确认这台 CPA 到底支不支持 per-account 代理、字段名是什么，
+再改 `CPA.PROXY_ROUTE` / `CPA.PROXY_FIELD`。在那之前把 `probe_proxies` 留空，
+走各账号现有出口，其余功能不受影响。
 
 ### `inject_mode`
 

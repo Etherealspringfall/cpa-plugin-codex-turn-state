@@ -966,7 +966,7 @@ func managementFuncBody(t *testing.T, name string) string {
 // Asserted at source level because the response is only built after the
 // host-availability check, which a unit test cannot get past.
 func TestSelftestAuthIDIsNeverFabricated(t *testing.T) {
-	body := managementFuncBody(t, "handleSelftest")
+	body := managementFuncBody(t, "runSelftest")
 
 	assignments := 0
 	for idx := 0; ; {
@@ -993,13 +993,13 @@ func TestSelftestAuthIDIsNeverFabricated(t *testing.T) {
 		// guess dressed up as an answer.
 		if !strings.HasPrefix(value, "authID") {
 			line := strings.Count(body[:at], "\n")
-			t.Errorf("handleSelftest assigns AuthID from %q (about %d lines into the function); "+
+			t.Errorf("runSelftest assigns AuthID from %q (about %d lines into the function); "+
 				"it must come from the caller-supplied authID, because CPA reports no credential on the response",
 				truncateMgmtLog([]byte(value[:min(50, len(value))])), line)
 		}
 	}
 	if assignments == 0 {
-		t.Error("no assignment to AuthID found in handleSelftest; this test would pass vacuously")
+		t.Error("no assignment to AuthID found in runSelftest; this test would pass vacuously")
 	}
 }
 
@@ -1017,11 +1017,11 @@ func TestSelftestAuthIDIsNeverFabricated(t *testing.T) {
 // Source level for the same reason as the tests around it: the response is
 // built after the host-availability check, which a unit test cannot pass.
 func TestSelftestEchoesTargetingHonestly(t *testing.T) {
-	body := managementFuncBody(t, "handleSelftest")
+	body := managementFuncBody(t, "runSelftest")
 
 	at := strings.Index(body, "selftestResponse{")
 	if at < 0 {
-		t.Fatal("handleSelftest builds no selftestResponse; this test would pass vacuously")
+		t.Fatal("runSelftest builds no selftestResponse; this test would pass vacuously")
 	}
 	end := strings.Index(body[at:], "\n\t}")
 	if end < 0 {
@@ -1056,11 +1056,11 @@ func TestSelftestEchoesTargetingHonestly(t *testing.T) {
 // (internal/pluginhost/host_callbacks.go:330), so setting it is all that is
 // required.
 func TestSelftestTargetingIsActuallyApplied(t *testing.T) {
-	body := managementFuncBody(t, "handleSelftest")
+	body := managementFuncBody(t, "runSelftest")
 
 	at := strings.Index(body, "HostModelExecutionRequest{")
 	if at < 0 {
-		t.Fatal("handleSelftest builds no HostModelExecutionRequest; this test would pass vacuously")
+		t.Fatal("runSelftest builds no HostModelExecutionRequest; this test would pass vacuously")
 	}
 	end := strings.Index(body[at:], "\n\t}")
 	if end < 0 {
@@ -2066,8 +2066,15 @@ func TestStatusListsBucketsOutsideTheMatrix(t *testing.T) {
 	if !drifted.Ready {
 		t.Error("the drifted bucket is on disk and live, but reports not ready")
 	}
-	if status.TargetsTotal != len(status.Buckets) {
-		t.Errorf("targets_total = %d but buckets has %d entries", status.TargetsTotal, len(status.Buckets))
+	// The drifted bucket is listed, but it is not a target. targets_total counts
+	// the matrix we intend to fill; a bucket left over from a wider earlier
+	// scope would otherwise inflate the denominator and make the page report
+	// progress against a target nobody chose.
+	if status.TargetsTotal != 1 {
+		t.Errorf("targets_total = %d, want 1 (one account x one configured model)", status.TargetsTotal)
+	}
+	if len(status.Buckets) != 2 {
+		t.Errorf("buckets has %d entries, want 2 (the matrix cell plus the drifted one)", len(status.Buckets))
 	}
 }
 

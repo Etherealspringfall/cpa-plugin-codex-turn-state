@@ -1,4 +1,4 @@
-module github.com/arden-aaai/cpa-plugin-codex-turn-state
+module github.com/ncdeng/cpa-plugin-codex-turn-state
 
 go 1.26.0
 

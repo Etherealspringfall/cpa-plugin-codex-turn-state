@@ -25,6 +25,30 @@ Why readiness comes from the management API and not from the store files:
   turn-state in memory. Reading files directly survives only as a fallback for
   an older .so that predates the endpoint.
 
+Where the scope comes from:
+  probe_accounts, models and probe_proxies are read from the plugin's own config
+  (GET /v0/management/codex-turn-state/config), so the dashboard and this script
+  cannot disagree about what "complete" means. There is no built-in fallback: an
+  empty selection is refused, not silently widened to everything. Probing is a
+  stop-the-world operation that spends an upstream request per bucket, and
+  "it defaulted to all of them" is the one mistake that cannot be undone.
+
+Why each bucket is tried through several exits:
+  Rule 3 says a template harvested on one IP works from another, so the exit only
+  has to be good for the few seconds it takes to mint the token. probe_proxies is
+  that list of exits, tried in order, per bucket, by PATCHing the probed
+  account's OWN proxy field. A candidate that times out or yields a degraded 312
+  is not an error -- it means that exit is not in a honeymoon, which is what the
+  next candidate is for. The global proxy-url is never touched: it carries Kimi,
+  xAI and all daily traffic.
+
+  ⚠ The route and field used for that PATCH are UNVERIFIED against a running CPA
+  (see CPA.PROXY_ROUTE / CPA.PROXY_FIELD). If they are wrong the write silently
+  does nothing and every candidate then "fails", while the real cause is that the
+  exit never changed. Two guards exist because of that: the run refuses to start
+  when the field cannot be read back, and a PATCH that cannot be confirmed aborts
+  rather than counting as a failed candidate.
+
 Why we steer by enabling/disabling accounts instead of naming one per request:
   CPA's scheduler picks a credential itself; the wire protocol has no "use this
   auth" knob, and guessing would break the whole point of per-account bucketing.
@@ -127,6 +151,11 @@ def die(msg: str, code: int = 2) -> NoReturn:
 _TOKEN_RE = re.compile(r"gAAAAA[A-Za-z0-9_\-=]{16,}")
 _APIKEY_RE = re.compile(r"\bsk-[A-Za-z0-9_\-]{8,}")
 _BEARER_RE = re.compile(r"(?i)\b(bearer\s+)[A-Za-z0-9._\-]{16,}")
+# Userinfo in any URL, which in this script means a proxy's credentials. Matched
+# on the scheme://...@ shape rather than against the configured proxy list: a URL
+# echoed back inside an upstream error body has to be caught too, and that one is
+# never in any list we hold.
+_URLAUTH_RE = re.compile(r"(?i)\b([a-z0-9+.\-]+://)[^/\s@]+@")
 
 
 def redact(text: str) -> str:
@@ -134,7 +163,32 @@ def redact(text: str) -> str:
     text = _TOKEN_RE.sub("<turn-state redacted>", text)
     text = _APIKEY_RE.sub("<api-key redacted>", text)
     text = _BEARER_RE.sub(r"\1<redacted>", text)
+    text = _URLAUTH_RE.sub(r"\1***@", text)
     return text
+
+
+def mask_proxy(url: str) -> str:
+    """Render one proxy URL safe to log.
+
+    Mirrors maskProxyURL in go/main.go, deliberately: the two sides describe the
+    same exits to the same operator, and a proxy that reads differently in the
+    dashboard and in the probe log is one the operator has to reconcile by hand.
+
+    A value this cannot make sense of is replaced wholesale rather than passed
+    through. Something too malformed to contain "://" is exactly the entry most
+    likely to be a mistyped password, and echoing it back "because it did not
+    look like a URL" would publish the thing this function exists to hide.
+    """
+    text = (url or "").strip()
+    if not text:
+        return ""
+    if "://" not in text:
+        return "<unparsable proxy url>"
+    scheme, _, rest = text.partition("://")
+    if "@" not in rest.split("/", 1)[0]:
+        return text
+    _, _, hostpart = rest.partition("@")
+    return f"{scheme}://***@{hostpart}"
 
 
 def parse_rfc3339(value: str) -> int | None:
@@ -280,6 +334,130 @@ class CPA:
         if not isinstance(doc, dict):
             die("plugin status endpoint returned a non-object body")
         return doc
+
+    def plugin_config(self) -> dict | None:
+        """GET the plugin's editable config, or None when the route is absent.
+
+        This is the only place the full proxy list can be read: the status
+        document deliberately carries just a count and masked forms, because it
+        is also served anonymously. Here the management key is required, and this
+        script has one by construction -- it cannot enable or disable an account
+        without it -- so the authenticated route is free to use regardless of how
+        the dashboard is configured.
+        """
+        url = f"{self.base_url}/v0/management/codex-turn-state/config"
+        result = http_call("GET", url, self.mgmt_key,
+                           extra_headers={"X-Management-Key": self.mgmt_key})
+        if result.status == 404:
+            return None
+        if result.status != 200:
+            die(explain_status(result, "GET /v0/management/codex-turn-state/config"))
+        doc = result.json()
+        if not isinstance(doc, dict):
+            die("plugin config endpoint returned a non-object body")
+        return doc
+
+    # -- per-account exit --------------------------------------------------
+    #
+    # ⚠ THE ROUTE AND FIELD NAME BELOW ARE UNVERIFIED.
+    #
+    # They come from the handover document. GET /v0/management/auth-files was
+    # observed returning no proxy-shaped field at all, so nothing has confirmed
+    # end to end that CPA accepts this write. Both are isolated here so a
+    # correction is a one-line change.
+    #
+    # All the failure handling follows from that uncertainty. If the route or the
+    # field is wrong the PATCH silently does nothing, every candidate then fails
+    # to produce a 292, and the run reports "every proxy is bad" while the real
+    # cause is that the exit never changed. That misdiagnosis costs an entire
+    # stop-the-world probe window, so a PATCH that cannot be shown to have taken
+    # effect aborts the run rather than being counted as a failed candidate.
+
+    PROXY_FIELD = "proxy_url"
+    PROXY_ROUTE = "/v0/management/auth-files/fields"
+
+    def _proxy_failure(self, name: str, shown: str, detail: str) -> str:
+        return (
+            f"could not switch the exit for {name} to {shown}: {detail}\n"
+            f"  ABORTING. The proxy was NOT changed, so any result from this run\n"
+            f"  would say nothing about the proxies -- it would only show that the\n"
+            f"  account's existing exit did or did not yield a 292.\n"
+            f"  Route and field are unverified against this CPA build:\n"
+            f"    PATCH {self.PROXY_ROUTE}  field {self.PROXY_FIELD!r}\n"
+            f"  Confirm both before re-running; correct them in CPA.PROXY_ROUTE /\n"
+            f"  CPA.PROXY_FIELD if they differ."
+        )
+
+    def _read_proxy(self, name: str) -> str | None:
+        """The exit CPA reports for one account, or None when it reports none."""
+        for entry in self.list_auth_files():
+            if str(entry.get("name") or "") != name:
+                continue
+            if self.PROXY_FIELD not in entry:
+                return None
+            return str(entry.get(self.PROXY_FIELD) or "")
+        return None
+
+    def proxy_field_is_readable(self) -> bool:
+        """Whether CPA echoes the proxy field, i.e. whether a write can be checked.
+
+        This gates the whole rotation feature (see main). Without a read-back
+        there is no way to tell a working PATCH from one CPA ignored, and no way
+        to snapshot what an account's exit was before the run -- so no way to put
+        it back afterwards.
+        """
+        return any(self.PROXY_FIELD in entry for entry in self.list_auth_files())
+
+    def set_proxy(self, entry: dict, proxy_url: str, fatal: bool = True) -> None:
+        """Point one account at one exit. An empty value clears the override.
+
+        Only ever the probed account's own field. The global proxy-url in CPA's
+        config is never touched: it carries Kimi, xAI and all daily traffic, and
+        repointing that would move far more than this run.
+
+        fatal=False is for the restore path, which must keep going and put every
+        remaining account back rather than exiting on the first problem.
+        """
+        name = str(entry.get("name") or "")
+        auth_index = str(entry.get("auth_index") or "")
+        shown = mask_proxy(proxy_url) or "(none)"
+        if self.dry_run:
+            log(f"DRY-RUN would set {name} {self.PROXY_FIELD}={shown}")
+            return
+
+        def fail(detail: str) -> None:
+            message = self._proxy_failure(name, shown, detail)
+            if fatal:
+                die(message)
+            raise RuntimeError(message)
+
+        payload: dict[str, Any] = {"name": name, self.PROXY_FIELD: proxy_url}
+        if auth_index:
+            payload["auth_index"] = auth_index
+        url = f"{self.base_url}{self.PROXY_ROUTE}"
+        try:
+            result = http_call("PATCH", url, self.mgmt_key, payload)
+        except ConnectionError as exc:
+            fail(str(exc))
+            return
+        if result.status != 200:
+            fail(explain_status(result, f"PATCH {self.PROXY_ROUTE}"))
+            return
+
+        observed = self._read_proxy(name)
+        if observed is None:
+            # Should be unreachable: main refuses to rotate when the field is not
+            # readable. Kept because "we could not check" must never be logged in
+            # the same words as "we checked and it was right".
+            log(f"  exit -> {shown} for {name}"
+                f" (HTTP 200, but {self.PROXY_FIELD} is not echoed back —"
+                f" UNCONFIRMED)")
+            return
+        if observed.strip() != proxy_url.strip():
+            fail(f"the PATCH returned 200 but {self.PROXY_FIELD} reads back as "
+                 f"{mask_proxy(observed) or '(none)'}")
+            return
+        log(f"  exit -> {shown} for {name} (verified by read-back)")
 
     # -- auth files --------------------------------------------------------
 
@@ -521,6 +699,11 @@ class StateGuard:
         self.cpa = cpa
         self.snapshot_path = snapshot_path
         self.original: dict[str, bool] = {}
+        # The exit each account had before the run. None means CPA did not report
+        # the field at all, so there is nothing to put back -- and nothing that
+        # could be put back correctly. main() refuses to rotate proxies in that
+        # case, so a None here also means no proxy was ever set by this run.
+        self.original_proxy: dict[str, str | None] = {}
         self.entries: dict[str, dict] = {}
         self.armed = False
         self.restored = False
@@ -529,6 +712,11 @@ class StateGuard:
         """Record current state and persist it before anything is mutated."""
         self.original = {str(e.get("name")): bool(e.get("disabled")) for e in auths}
         self.entries = {str(e.get("name")): e for e in auths}
+        self.original_proxy = {
+            str(e.get("name")): (str(e.get(CPA.PROXY_FIELD) or "")
+                                 if CPA.PROXY_FIELD in e else None)
+            for e in auths
+        }
         doc = {
             "captured_at": datetime.now(timezone.utc).isoformat(),
             "base_url": self.cpa.base_url,
@@ -537,6 +725,11 @@ class StateGuard:
                     "name": name,
                     "auth_index": str(self.entries[name].get("auth_index") or ""),
                     "disabled": disabled,
+                    # Written in the clear, like the rest of this file: the
+                    # snapshot is 0600 and exists precisely so a failed run can
+                    # be undone by hand. A masked value would be useless for
+                    # that. It is never logged -- see restore().
+                    CPA.PROXY_FIELD: self.original_proxy.get(name),
                 }
                 for name, disabled in sorted(self.original.items())
             ],
@@ -563,8 +756,20 @@ class StateGuard:
             return True
         self.restored = True  # set first: never loop if restore itself throws
 
-        log("restoring original account enable/disable state")
+        log("restoring original account exit and enable/disable state")
         failures = []
+        # Exits first, then the enable flags. An account that ends up enabled is
+        # immediately schedulable, so it must already be pointing at its own
+        # original exit by then -- otherwise live traffic could briefly leave
+        # through a probe proxy.
+        for name, original in sorted(self.original_proxy.items()):
+            if original is None:
+                continue  # never snapshotted, never changed
+            entry = self.entries.get(name) or {"name": name}
+            try:
+                self.cpa.set_proxy(entry, original, fatal=False)
+            except Exception as exc:
+                failures.append(f"{name}: exit not restored: {redact(str(exc))}")
         for name, disabled in sorted(self.original.items()):
             entry = self.entries.get(name) or {"name": name}
             try:
@@ -615,6 +820,14 @@ def restore_from_file(cpa: CPA, path: Path) -> int:
     failures = []
     for item in accounts:
         entry = {"name": item.get("name"), "auth_index": item.get("auth_index") or ""}
+        # Same order as StateGuard.restore: exit before enable flag, so an
+        # account is never schedulable while still pointing at a probe exit.
+        original_proxy = item.get(CPA.PROXY_FIELD)
+        if original_proxy is not None:
+            try:
+                cpa.set_proxy(entry, str(original_proxy), fatal=False)
+            except Exception as exc:
+                failures.append(f"{item.get('name')}: exit: {redact(str(exc))}")
         try:
             cpa.set_disabled(entry, bool(item.get("disabled")))
             log(f"  {item.get('name')} -> disabled={bool(item.get('disabled'))}")
@@ -640,25 +853,46 @@ def restore_from_file(cpa: CPA, path: Path) -> int:
 def probe_bucket(
     cpa: CPA,
     store_dir: Path,
-    auth_id: str,
+    entry: dict,
     model: str,
+    proxies: list[str],
     args: argparse.Namespace,
 ) -> bool:
-    """Fire requests for one bucket until it reports ready, or give up."""
+    """Fill one bucket, trying each configured exit in turn.
+
+    Returns True as soon as the plugin reports the bucket ready. A candidate that
+    times out, or that yields a degraded 312, is not an error: it means that exit
+    is not in a honeymoon right now, which is exactly what the next candidate is
+    for. Only a failure to *switch* the exit aborts -- see CPA.set_proxy.
+    """
+    auth_id = str(entry.get("name") or "")
     before = read_readiness(cpa, store_dir, [auth_id], [model]).get(auth_id, model)
     before_issued = before.issued_at if before else 0
 
-    for attempt in range(1, args.retries + 1):
+    # With exits configured, each one gets a single request: the point of a
+    # candidate list is to move on, and re-firing through an exit that just
+    # produced a 312 spends quota to learn the same thing twice. With no exits
+    # configured there is nothing to move on to, so the old retry behaviour on
+    # the account's existing exit is what remains.
+    attempts: list[str | None] = list(proxies) if proxies else [None] * max(1, args.retries)
+
+    for index, candidate in enumerate(attempts, start=1):
+        label = f"exit {index}/{len(attempts)}" if proxies else f"attempt {index}/{len(attempts)}"
+        if candidate is not None:
+            cpa.set_proxy(entry, candidate)
+            if not cpa.dry_run and args.settle > 0:
+                time.sleep(args.settle)
+
         status, note = cpa.fire(model, timeout=args.http_timeout)
         if cpa.dry_run:
             return True
         if status and 200 <= status < 300:
-            log(f"  attempt {attempt}/{args.retries} model={model} http={status}")
+            log(f"  {label} model={model} http={status}")
         else:
             # Full body, not a summary: on the first real run this is how a
-            # wrong route or payload shape gets identified.
-            log(f"  attempt {attempt}/{args.retries} model={model} http={status}"
-                f" body={note}")
+            # wrong route or payload shape gets identified. redact() strips any
+            # proxy userinfo the upstream echoed back.
+            log(f"  {label} model={model} http={status} body={redact(note)}")
 
         # Poll the plugin for its own view. HTTP status is deliberately not a
         # gate: the header rides on error responses too, and readiness is the
@@ -671,10 +905,11 @@ def probe_bucket(
                     log(f"  ready auth={auth_id} model={model}"
                         f" ttl_left={bucket.seconds_left}s")
                     return True
-                # A new token landed but the plugin does not call it ready —
-                # a degraded 312, which is never a template. Retry.
-                log(f"  new state for auth={auth_id} model={model} is not a"
-                    f" template (not ready) — will retry")
+                # A new token landed but the plugin does not call it ready — a
+                # degraded 312, which is never a template. This exit is not in a
+                # honeymoon; try the next one.
+                log(f"  degraded state for auth={auth_id} model={model}"
+                    f" — this exit yielded no template, moving on")
                 before_issued = bucket.issued_at
                 break
             time.sleep(1.0)
@@ -691,6 +926,7 @@ def probe_account(
     store_dir: Path,
     entry: dict,
     models: list[str],
+    proxies: list[str],
     args: argparse.Namespace,
 ) -> dict[str, bool]:
     """Make `entry` the only enabled Codex account, then probe every model."""
@@ -712,22 +948,36 @@ def probe_account(
         time.sleep(args.settle)
 
     results: dict[str, bool] = {}
-    current = read_readiness(cpa, store_dir, [auth_id], models)
-    for model in models:
-        existing = current.get(auth_id, model)
-        if existing and existing.ready and not args.force:
-            log(f"  skip auth={auth_id} model={model}: live template,"
-                f" {existing.seconds_left}s left")
-            results[model] = True
-            continue
-        results[model] = probe_bucket(cpa, store_dir, auth_id, model, args)
+    try:
+        current = read_readiness(cpa, store_dir, [auth_id], models)
+        for model in models:
+            existing = current.get(auth_id, model)
+            if existing and existing.ready and not args.force:
+                log(f"  skip auth={auth_id} model={model}: live template,"
+                    f" {existing.seconds_left}s left")
+                results[model] = True
+                continue
+            results[model] = probe_bucket(cpa, store_dir, entry, model, proxies, args)
 
-        # Sanity check the spec's acceptance criterion: with one account
-        # enabled, the stored bucket must belong to that account.
-        written = read_readiness(cpa, store_dir, [auth_id], [model]).get(auth_id, model)
-        if written and written.auth_id and written.auth_id != auth_id:
-            log(f"  WARNING bucket records auth_id={written.auth_id}"
-                f" but we enabled {auth_id} — do not trust this store")
+            # Sanity check the spec's acceptance criterion: with one account
+            # enabled, the stored bucket must belong to that account.
+            written = read_readiness(cpa, store_dir, [auth_id], [model]).get(auth_id, model)
+            if written and written.auth_id and written.auth_id != auth_id:
+                log(f"  WARNING bucket records auth_id={written.auth_id}"
+                    f" but we enabled {auth_id} — do not trust this store")
+    finally:
+        # This account's exit goes back before we move to the next one, so at
+        # most one account is ever pointed at a probe proxy. The finally matters:
+        # an abort partway through the models must not leave it behind. The
+        # StateGuard would catch it on the way out, but only after every other
+        # account had already been re-enabled.
+        original = guard.original_proxy.get(auth_id)
+        if original is not None and proxies:
+            try:
+                cpa.set_proxy(entry, original, fatal=False)
+            except Exception as exc:
+                log(f"  WARNING could not restore the exit for {auth_id}:"
+                    f" {redact(str(exc))}")
     return results
 
 
@@ -737,11 +987,12 @@ def run_pass(
     store_dir: Path,
     auths: list[dict],
     models: list[str],
+    proxies: list[str],
     args: argparse.Namespace,
 ) -> bool:
     """One full sweep. Returns True when every target bucket is ready."""
     for entry in auths:
-        probe_account(cpa, guard, store_dir, entry, models, args)
+        probe_account(cpa, guard, store_dir, entry, models, proxies, args)
 
     names = [str(e.get("name")) for e in auths]
     missing = read_readiness(cpa, store_dir, names, models).missing(names, models)
@@ -783,6 +1034,14 @@ def build_parser() -> argparse.ArgumentParser:
                              "is not given)")
     parser.add_argument("--account", metavar="JSONNAME",
                         help="probe only this auth file name, e.g. codex-foo.json")
+    parser.add_argument("--accounts", metavar="CSV",
+                        help="override the configured probe_accounts for this run "
+                             "only; comma-separated auth file names")
+    parser.add_argument("--proxies-file", metavar="PATH",
+                        help="override the configured probe_proxies for this run "
+                             "only; one URL per line, blank lines and # comments "
+                             "ignored. The file is read, never written, and its "
+                             "contents are never logged in full")
     parser.add_argument("--model", metavar="ID",
                         help="probe only this model id")
     parser.add_argument("--models", metavar="CSV",
@@ -827,6 +1086,31 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def read_proxies_file(path: Path) -> list[str]:
+    """One proxy URL per line; blank lines and # comments ignored.
+
+    Order is preserved because it is the try order. Nothing here is logged: the
+    caller masks before printing, and a parse error names the line number rather
+    than quoting the line, which would defeat the masking entirely.
+    """
+    try:
+        text = path.read_text(encoding="utf-8")
+    except Exception as exc:
+        die(f"cannot read {path}: {exc}")
+    out: list[str] = []
+    for lineno, raw in enumerate(text.splitlines(), start=1):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "://" not in line:
+            die(f"{path}:{lineno}: not a URL (no scheme). "
+                f"The line is not quoted here on purpose — it may be a password.")
+        out.append(line)
+    if not out:
+        die(f"{path} contains no proxy URLs")
+    return out
+
+
 def cross_check_disk(auths: list[dict], auths_dir: Path) -> None:
     """Warn when CPA's view and the on-disk codex-*.json set disagree.
 
@@ -867,12 +1151,6 @@ def main(argv: list[str]) -> int:
         return restore_from_file(cpa, Path(args.restore))
 
     store_dir = Path(args.store_dir)
-    models = DEFAULT_MODELS if not args.models else \
-        [m.strip() for m in args.models.split(",") if m.strip()]
-    if args.model:
-        if args.model not in models:
-            log(f"note: {args.model} is not in the default list {models}")
-        models = [args.model]
 
     if not cpa.healthy():
         die("CPA is not answering on /healthz; refusing to touch account state")
@@ -899,6 +1177,45 @@ def main(argv: list[str]) -> int:
                 f"  Set role: probe in plugins.configs.codex-turn-state and let\n"
                 f"  CPA reload before re-running. Refusing to touch account\n"
                 f"  state or spend quota.")
+    # ---- probe scope ----------------------------------------------------
+    #
+    # The scope comes from the plugin's own config, so the dashboard and this
+    # script cannot disagree about what "complete" means. There is deliberately
+    # no fallback to a built-in list: probing is a stop-the-world operation that
+    # spends quota per bucket, and defaulting to everything when the operator
+    # has selected nothing is the one mistake that cannot be undone afterwards.
+    config = cpa.plugin_config() or {}
+    scope_accounts = [str(a).strip() for a in (config.get("probe_accounts") or []) if str(a).strip()]
+    scope_models = [str(m).strip()
+                    for m in (config.get("models") or (status or {}).get("models") or [])
+                    if str(m).strip()]
+    scope_proxies = [str(p).strip() for p in (config.get("probe_proxies") or []) if str(p).strip()]
+
+    if args.accounts:
+        scope_accounts = [a.strip() for a in args.accounts.split(",") if a.strip()]
+    if args.account:
+        scope_accounts = [args.account]
+    if args.models:
+        scope_models = [m.strip() for m in args.models.split(",") if m.strip()]
+    if args.model:
+        scope_models = [args.model]
+    if args.proxies_file:
+        scope_proxies = read_proxies_file(Path(args.proxies_file))
+
+    if not scope_accounts:
+        die("no probe accounts selected.\n"
+            "  Set probe_accounts in plugins.configs.codex-turn-state (the\n"
+            "  dashboard's 探测范围 section writes it), or pass --accounts.\n"
+            "  Refusing to probe every account by default: each bucket costs an\n"
+            "  upstream request, and this run disables every account it is not\n"
+            "  currently probing.")
+    if not scope_models:
+        die("no probe models selected.\n"
+            "  Set models in plugins.configs.codex-turn-state, or pass --models.\n"
+            "  Refusing to fall back to the full model list for the same reason.")
+
+    models = scope_models
+    if status is not None:
         plugin_models = [str(m) for m in (status.get("models") or [])]
         if plugin_models:
             unknown = [m for m in models if m not in plugin_models]
@@ -911,14 +1228,42 @@ def main(argv: list[str]) -> int:
         die("no Codex auth files reported by CPA")
     cross_check_disk(auths, Path(args.auths_dir))
 
-    if args.account:
-        auths = [e for e in auths if str(e.get("name")) == args.account]
-        if not auths:
-            die(f"account {args.account} not found among CPA's Codex auth files")
+    known_names = {str(e.get("name")) for e in auths}
+    unknown_accounts = [name for name in scope_accounts if name not in known_names]
+    if unknown_accounts:
+        die(f"these selected accounts are not among CPA's Codex auth files: "
+            f"{unknown_accounts}\n"
+            f"  CPA knows: {sorted(known_names)}\n"
+            f"  Fix the selection rather than letting the run quietly cover less\n"
+            f"  than was asked for.")
+    auths = [e for e in auths if str(e.get("name")) in set(scope_accounts)]
+
+    # Rotation is gated on being able to read the field back. Without that there
+    # is no way to tell a working PATCH from one CPA ignored, and -- worse -- no
+    # way to record what an account's exit was before the run, so no way to put
+    # it back. Failing here costs nothing; discovering it mid-run costs the
+    # window and can leave an account pointing at a probe proxy.
+    if scope_proxies and not args.dry_run:
+        if not cpa.proxy_field_is_readable():
+            die(f"{len(scope_proxies)} probe exits are configured, but CPA does not\n"
+                f"  report {CPA.PROXY_FIELD!r} on any auth file, so this script can\n"
+                f"  neither confirm a switch took effect nor record what each\n"
+                f"  account's exit was before the run.\n"
+                f"  Rotating blind could leave an account pointed at a probe exit\n"
+                f"  with nothing to restore, so it is refused.\n"
+                f"  Either confirm the correct route and field for this CPA build\n"
+                f"  (currently PATCH {CPA.PROXY_ROUTE}, field {CPA.PROXY_FIELD!r})\n"
+                f"  and correct CPA.PROXY_ROUTE / CPA.PROXY_FIELD, or clear\n"
+                f"  probe_proxies to probe on each account's existing exit.")
 
     log(f"store_dir={store_dir}")
     log(f"accounts={[str(e.get('name')) for e in auths]}")
     log(f"models={models}")
+    # Count and masks only. The list may carry credentials, and this line is the
+    # first thing pasted into a ticket when a run goes wrong.
+    log(f"exits={len(scope_proxies)}"
+        + (f" {[mask_proxy(p) for p in scope_proxies]}" if scope_proxies else " (using each account's existing exit)"))
+    log(f"targets={len(auths) * len(models)} buckets")
     log(f"keys: management={'set' if mgmt_key else 'MISSING'} "
         f"api={'set' if api_key else 'MISSING'}")
 
@@ -952,7 +1297,7 @@ def main(argv: list[str]) -> int:
         while True:
             sweeps += 1
             log(f"--- sweep {sweeps} ---")
-            complete = run_pass(cpa, guard, store_dir, auths, models, args)
+            complete = run_pass(cpa, guard, store_dir, auths, models, scope_proxies, args)
             if complete:
                 log("every target bucket holds a live 292 — probe phase complete")
                 break

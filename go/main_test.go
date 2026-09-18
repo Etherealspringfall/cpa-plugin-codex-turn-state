@@ -111,13 +111,16 @@ func mustConfigure(t *testing.T, cfgYAML string) {
 	}
 }
 
-// resetPluginConfig restores the package-level config between tests. It
-// deliberately touches only the config field; store caching is per-directory
-// and every test gets its own t.TempDir().
+// resetPluginConfig restores the package-level config between tests. Store
+// caching is left alone: it is per-directory and every test gets its own
+// t.TempDir(). configErrors is cleared alongside the config because the two are
+// written together by configure, and a complaint left behind by one test would
+// surface in the next test's status document.
 func resetPluginConfig() {
 	state.mu.Lock()
 	defer state.mu.Unlock()
 	state.config = defaultConfig()
+	state.configErrors = nil
 }
 
 // businessConfig is a business-role config pointed at dir.

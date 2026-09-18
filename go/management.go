@@ -1,24 +1,33 @@
 // Management API for the codex-turn-state plugin.
 //
-// Two kinds of route are registered, and the difference matters:
+// This plugin is deployed keyless by the operator's explicit, repeated choice:
+// opening the dashboard and every action on it work with no management key. The
+// box binds CPA to 127.0.0.1 and is reachable only through an SSH tunnel, so
+// "keyless" means "anyone who can reach the tunnel", which in practice is the
+// operator. That decision is what shapes the two route kinds below.
 //
-//   - The HTML shell is a ResourceRoute. Those are served under
-//     /v0/resource/plugins/<id>/ and the host does NOT authenticate them
-//     ("Resource requests are not management-authenticated" -- pluginapi). So
-//     the shell carries no data whatsoever: it is markup and script, and every
-//     byte of state it displays is fetched afterwards by the browser from the
-//     authenticated routes below, with the operator's management key attached.
+//   - Everything the dashboard uses -- the HTML shell, the status document, and
+//     all four actions (dry_run, role, clear, selftest) -- is a ResourceRoute.
+//     Those are served under /v0/resource/plugins/<id>/ and the host does NOT
+//     authenticate them ("Resource requests are not management-authenticated" --
+//     pluginapi). The host also hard-restricts them to GET (ServeResourceHTTP
+//     rejects any other method) and passes the query string but no body, so the
+//     action routes read their parameters from the query and guard against an
+//     accidental firing with confirm=1 rather than with a key.
 //
-//   - Everything that reads or changes state is a ManagementRoute with no Menu.
-//     Those are served under /v0/management/ behind the host's management
-//     middleware. The Menu field is deliberately left empty on all of them: a
-//     GET route that declares one is re-registered under the resource prefix
-//     instead (routeDeclaresLegacyMenuResource in the host), which would quietly
-//     strip the authentication off the very routes that need it.
+//   - The same clear and selftest operations are ALSO exposed as authenticated
+//     ManagementRoutes under /v0/management/ (POST, reading a JSON body), for a
+//     script that holds the management key. Those are not what the dashboard
+//     calls; they are the keyed API path kept alongside the keyless one. Their
+//     Menu field is left empty: a GET route that declares one is re-registered
+//     under the resource prefix (routeDeclaresLegacyMenuResource in the host),
+//     which would matter only for a GET, but the rule is kept in view here.
 //
 // No response from any route in this file contains a template value. The store
 // holds credential-adjacent secrets; the dashboard needs readiness and expiry,
-// and readiness and expiry are all it gets.
+// and readiness and expiry are all it gets. The status document does expose each
+// bucket's auth_id, which is the credential filename and contains the customer
+// email -- an accepted consequence of an anonymously readable status.
 package main
 
 import (
@@ -27,6 +36,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
@@ -59,6 +69,38 @@ const (
 	// on, so both dispatch to handleStatus with no extra case. It exists so the
 	// dashboard can render on open, before the operator has entered any key.
 	routeStatusResource = "/status"
+	// routeConfig returns the probe scope with proxy URLs unmasked, so the
+	// dashboard can refill its editor with what is actually configured. It is the
+	// one route that emits a secret, which is why it has no resource alias: the
+	// anonymous prefix is what makes routeStatusResource readable without a key,
+	// and an alias here would do the same for the passwords.
+	routeConfig = "/codex-turn-state/config"
+
+	// The keyless action routes. These are ResourceRoutes, so the host serves
+	// them without a management key and restricts them to GET (see the package
+	// comment). They exist because the operator chose keyless operation: the four
+	// actions the dashboard offers -- flip dry_run, switch role, clear buckets,
+	// run a self-test -- carry no secret, so exposing them anonymously leaks
+	// nothing the anonymous status did not already. The proxy editor is
+	// deliberately NOT among them: it reads and writes proxy userinfo, and that
+	// stays behind routeConfig and CPA's authenticated config PATCH.
+	//
+	// They are GET routes that change state, so each requires confirm=1 -- not as
+	// authentication, but so a bare navigation, a link prefetch or a crawler
+	// cannot fire one just by loading the URL. The suffixes carry an /ops/ segment
+	// so they cannot collide with the /buckets/clear or /selftest management
+	// routes under suffix matching.
+	routeOpsDryRun   = "/ops/dry-run"
+	routeOpsRole     = "/ops/role"
+	routeOpsClear    = "/ops/clear"
+	routeOpsSelftest = "/ops/selftest"
+	// routeOpsScope saves the probe scope, keyless like the rest of /ops.
+	//
+	// It writes the plugin's own scope file rather than CPA's config.yaml,
+	// because the host offers no way for a plugin to persist its configuration
+	// and the route that would (PATCH /v0/management/plugins/<id>/config) is
+	// authenticated -- a key in front of the one screen that must not need one.
+	routeOpsScope = "/ops/scope"
 )
 
 // managementRegister answers management.register with the route table.
@@ -75,6 +117,11 @@ func managementRegister(raw []byte) ([]byte, error) {
 			{Method: http.MethodGet, Path: routeStatus},
 			{Method: http.MethodPost, Path: routeBucketsClear},
 			{Method: http.MethodPost, Path: routeSelftest},
+			// No Menu, like every other data route here. A GET route that
+			// declares one is re-registered under the unauthenticated resource
+			// prefix (routeDeclaresLegacyMenuResource in the host), which on this
+			// route specifically would publish the proxy passwords.
+			{Method: http.MethodGet, Path: routeConfig},
 		},
 		Resources: []pluginapi.ResourceRoute{
 			{
@@ -96,12 +143,26 @@ func managementRegister(raw []byte) ([]byte, error) {
 				// the status document anonymously readable, and each bucket's
 				// auth_id is the credential filename, which contains the customer
 				// email. That is the user's informed choice (they asked for a
-				// no-login page). clear and selftest are deliberately NOT mirrored
-				// here -- they are destructive or spend quota, so they stay behind
-				// the management key.
+				// no-login page).
 				Path:        routeStatusResource,
 				Description: "只读状态（无需鉴权），供看板拉取",
 			},
+			// The four keyless actions. Unauthenticated by virtue of the resource
+			// prefix, GET-only by the host's rule, guarded by confirm=1 rather than
+			// by a key. None carries a secret; the proxy editor is deliberately not
+			// here (it stays on routeConfig behind the key). No Menu: the dashboard
+			// fires these with fetch, they are not pages to navigate to.
+			{Path: routeOpsDryRun, Description: "翻转 dry_run（无需鉴权，需 confirm=1）"},
+			{Path: routeOpsRole, Description: "切换 role（无需鉴权，需 confirm=1）"},
+			{Path: routeOpsClear, Description: "清空桶（无需鉴权，需 confirm=1）"},
+			{Path: routeOpsSelftest, Description: "连通性自检（无需鉴权，需 confirm=1，烧额度）"},
+			// Saving the scope is keyless like the other four. Reading the proxy
+			// list back is NOT: routeConfig stays behind the key, because that
+			// response carries userinfo. The editor therefore shows proxies
+			// masked and treats the textarea as write-only -- changing them means
+			// retyping the list, which costs one retype and keeps the passwords
+			// off an anonymously readable route.
+			{Path: routeOpsScope, Description: "保存探测范围（无需鉴权，需 confirm=1）"},
 		},
 	})
 }
@@ -122,6 +183,22 @@ func managementHandle(raw []byte) ([]byte, error) {
 			return okEnvelope(managementError(http.StatusMethodNotAllowed, "status is a GET route"))
 		}
 		return okEnvelope(handleStatus())
+	case hasRouteSuffix(path, routeConfig):
+		if method != http.MethodGet && method != "" {
+			return okEnvelope(managementError(http.StatusMethodNotAllowed, "config is a GET route"))
+		}
+		// The one route that is NOT keyless, and the only one that emits a
+		// secret. Everything the dashboard does works without a key; reading the
+		// proxy list back is the exception, so the page shows proxies masked and
+		// treats them as write-only.
+		//
+		// The resource prefix is the unauthenticated one, so a request arriving
+		// through it means an alias was registered somewhere it should not have
+		// been. The passwords stop here rather than being served.
+		if isResourcePath(path) {
+			return okEnvelope(managementError(http.StatusNotFound, "no such codex-turn-state route: "+req.Path))
+		}
+		return okEnvelope(handleConfig())
 	case hasRouteSuffix(path, routeBucketsClear):
 		if method != http.MethodPost {
 			return okEnvelope(managementError(http.StatusMethodNotAllowed, "buckets/clear is a POST route"))
@@ -132,6 +209,16 @@ func managementHandle(raw []byte) ([]byte, error) {
 			return okEnvelope(managementError(http.StatusMethodNotAllowed, "selftest is a POST route"))
 		}
 		return okEnvelope(handleSelftest(req.Body))
+	case hasRouteSuffix(path, routeOpsDryRun),
+		hasRouteSuffix(path, routeOpsRole),
+		hasRouteSuffix(path, routeOpsClear),
+		hasRouteSuffix(path, routeOpsSelftest),
+		hasRouteSuffix(path, routeOpsScope):
+		// The keyless actions. Reached only through the resource prefix (they are
+		// registered as resources, not management routes), so they arrive with a
+		// query and no body and no key; handleOpsResource enforces GET and
+		// confirm=1 before doing anything.
+		return okEnvelope(handleOpsResource(path, method, req.Query))
 	case isDashboardPath(path):
 		return okEnvelope(handleDashboard())
 	default:
@@ -152,6 +239,15 @@ func hasRouteSuffix(path, suffix string) bool {
 // itself, but it turns every mistyped management path into a 200 and hides the
 // typo. The resource prefix is what distinguishes the browser-navigable route.
 func isDashboardPath(path string) bool {
+	return isResourcePath(path)
+}
+
+// isResourcePath reports whether a resolved path came in through the host's
+// resource prefix, which is the unauthenticated one ("Resource requests are not
+// management-authenticated" -- pluginapi). It is the only signal this handler
+// has about whether a key was required, so any route that must never answer
+// anonymously checks it.
+func isResourcePath(path string) bool {
 	return strings.Contains(strings.ToLower(path), "/resource/plugins/")
 }
 
@@ -170,6 +266,156 @@ func handleDashboard() pluginapi.ManagementResponse {
 		},
 		Body: dashboardHTML,
 	}
+}
+
+// handleOpsResource dispatches the four keyless actions. It is reached only
+// through the resource prefix, so it has no key to check; instead it enforces the
+// two things that make a keyless GET action safe enough for a localhost-only
+// dashboard: the method really is GET, and confirm=1 is present so nothing fires
+// from a bare navigation, a link prefetch or a crawler. Everything past this
+// point changes state or spends quota.
+func handleOpsResource(path, method string, q url.Values) pluginapi.ManagementResponse {
+	if method != http.MethodGet && method != "" {
+		return managementError(http.StatusMethodNotAllowed, "keyless action routes are GET-only")
+	}
+	if strings.TrimSpace(q.Get("confirm")) != "1" {
+		return managementError(http.StatusBadRequest,
+			"this action changes state or spends quota; it requires confirm=1 so it cannot fire from a bare navigation or a prefetch")
+	}
+	switch {
+	case hasRouteSuffix(path, routeOpsDryRun):
+		return handleDryRunResource(q)
+	case hasRouteSuffix(path, routeOpsRole):
+		return handleRoleResource(q)
+	case hasRouteSuffix(path, routeOpsClear):
+		return clearBuckets(clearRequestFromQuery(q))
+	case hasRouteSuffix(path, routeOpsSelftest):
+		return runSelftest(selftestRequestFromQuery(q))
+	case hasRouteSuffix(path, routeOpsScope):
+		return handleScopeSave(q)
+	default:
+		return managementError(http.StatusNotFound, "no such keyless action route")
+	}
+}
+
+// clearRequestFromQuery builds a clearRequest from the keyless clear route's
+// query: ?all=1 to wipe, or ?auth_id=..&model=.. for one bucket. clearBuckets
+// then applies the same validation and path-sanitising the POST route gets, so a
+// crafted auth_id cannot escape the store on this path either.
+func clearRequestFromQuery(q url.Values) clearRequest {
+	return clearRequest{
+		AuthID: strings.TrimSpace(q.Get("auth_id")),
+		Model:  strings.TrimSpace(q.Get("model")),
+		All:    queryTrue(q.Get("all")),
+	}
+}
+
+// selftestRequestFromQuery builds a selftestRequest from the keyless selftest
+// route's query: ?model=..&auth_id=.. with auth_id optional.
+func selftestRequestFromQuery(q url.Values) selftestRequest {
+	return selftestRequest{
+		Model:  strings.TrimSpace(q.Get("model")),
+		AuthID: strings.TrimSpace(q.Get("auth_id")),
+	}
+}
+
+// handleDryRunResource flips dry_run from the keyless route and persists it so a
+// CPA restart keeps the operator's choice (see runtimeOverride in main.go). A
+// dry_run change does not invalidate templates, so swapConfigLocked leaves the
+// cache and the tallies alone; it is used only so there is one place that swaps
+// the running config.
+func handleDryRunResource(q url.Values) pluginapi.ManagementResponse {
+	value, ok := parseBoolParam(q.Get("value"))
+	if !ok {
+		return managementError(http.StatusBadRequest, `"value" must be one of on/off/true/false/1/0`)
+	}
+	state.mu.Lock()
+	cfg := state.config
+	cfg.DryRun = value
+	swapConfigLocked(cfg)
+	dir := cfg.StoreDir
+	role := cfg.Role
+	state.mu.Unlock()
+
+	persisted := true
+	warning := ""
+	if err := writeRuntimeOverride(dir, role, value); err != nil {
+		// The in-process change already took effect; only persistence failed, so a
+		// restart would revert it. Say so rather than report a clean success.
+		persisted = false
+		warning = "restart will revert: " + err.Error()
+		log.Printf(logPrefix+"dry_run set to %t but persisting the override failed: %v", value, err)
+	} else {
+		log.Printf(logPrefix+"dry_run set to %t via dashboard (keyless)", value)
+	}
+	return jsonResponse(http.StatusOK, map[string]any{"dry_run": value, "persisted": persisted, "warning": warning})
+}
+
+// handleRoleResource switches role from the keyless route and persists it. A role
+// change clears the template cache and resets the tallies (swapConfigLocked),
+// exactly as a config-file role change does; persisting it is what lets the
+// switch survive the CPA restart a role change may need to renegotiate its hooks.
+func handleRoleResource(q url.Values) pluginapi.ManagementResponse {
+	role := strings.ToLower(strings.TrimSpace(q.Get("value")))
+	if role != roleProbe && role != roleBusiness {
+		return managementError(http.StatusBadRequest,
+			fmt.Sprintf(`"value" must be %q or %q`, roleProbe, roleBusiness))
+	}
+	state.mu.Lock()
+	cfg := state.config
+	if role == roleProbe && strings.TrimSpace(cfg.StoreDir) == "" {
+		state.mu.Unlock()
+		return managementError(http.StatusConflict, "role probe requires store_dir, which is not configured")
+	}
+	cfg.Role = role
+	// Harvesting from business traffic is prohibited; mirror configure's guard so
+	// the keyless path cannot leave business with harvest_inband on.
+	if role == roleBusiness {
+		cfg.HarvestInband = false
+	}
+	swapConfigLocked(cfg)
+	dir := cfg.StoreDir
+	dryRun := cfg.DryRun
+	state.mu.Unlock()
+
+	persisted := true
+	warning := ""
+	if err := writeRuntimeOverride(dir, role, dryRun); err != nil {
+		persisted = false
+		warning = "restart will revert: " + err.Error()
+		log.Printf(logPrefix+"role set to %s but persisting the override failed: %v", role, err)
+	} else {
+		log.Printf(logPrefix+"role set to %s via dashboard (keyless)", role)
+	}
+	return jsonResponse(http.StatusOK, map[string]any{
+		"role":      role,
+		"persisted": persisted,
+		"warning":   warning,
+		"note":      "若切换后发现钩子没被重新协商（probe 采不到 / business 不替换），重启一次 CPA。",
+	})
+}
+
+// queryTrue reads a query flag as a boolean, treating the common truthy spellings
+// as true and everything else -- including absence -- as false. Used for ?all=.
+func queryTrue(v string) bool {
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "1", "true", "on", "yes":
+		return true
+	}
+	return false
+}
+
+// parseBoolParam reads an explicit boolean value and reports whether it was
+// recognised, so a dry_run toggle can reject a typo (ok=false) rather than
+// silently reading it as off.
+func parseBoolParam(v string) (value bool, ok bool) {
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "1", "true", "on", "yes":
+		return true, true
+	case "0", "false", "off", "no":
+		return false, true
+	}
+	return false, false
 }
 
 // statusBucket is one (account, model) cell of the readiness matrix.
@@ -228,6 +474,26 @@ type statusResponse struct {
 	CountersSince  string           `json:"counters_since"`
 	GeneratedAt    string           `json:"generated_at"`
 	StoreError     string           `json:"store_error,omitempty"`
+
+	// ---- probe scope ----
+	//
+	// EVERY FIELD BELOW IS ANONYMOUSLY READABLE. This struct is serialised by
+	// handleStatus, which answers on both /v0/management/codex-turn-state/status
+	// and the unauthenticated /v0/resource/plugins/codex-turn-state/status. There
+	// is no per-route filtering: whatever is added here is public.
+	//
+	// That is why probe_proxies appears only as a count and a masked list. The
+	// raw list carries userinfo and lives behind the authenticated config route
+	// (handleConfig) instead. Adding a raw-proxy field here would publish
+	// passwords with no error and no log line, which is the failure this comment
+	// exists to prevent.
+	ProbeAccounts      []string `json:"probe_accounts"`
+	ProbeProxyCount    int      `json:"probe_proxy_count"`
+	ProbeProxiesMasked []string `json:"probe_proxies_masked"`
+	// ConfigErrors lists probe-scope entries that were rejected at configure
+	// time. They are not fatal, which is exactly why they need to be visible:
+	// the scope silently covers less than whoever edited it believes.
+	ConfigErrors []string `json:"config_errors,omitempty"`
 }
 
 // statusAccount is one credential row of the readiness matrix.
@@ -250,6 +516,7 @@ func handleStatus() pluginapi.ManagementResponse {
 	cfg := state.config
 	counts := state.counts
 	countsAt := state.countsAt
+	configErrors := append([]string(nil), state.configErrors...)
 	state.mu.Unlock()
 
 	out := statusResponse{
@@ -265,9 +532,19 @@ func handleStatus() pluginapi.ManagementResponse {
 		CountersSince:  countsAt.UTC().Format(time.RFC3339),
 		GeneratedAt:    now.UTC().Format(time.RFC3339),
 		Buckets:        []statusBucket{},
+		ProbeAccounts:  append([]string(nil), cfg.ProbeAccounts...),
+		// Count and masks only -- see the comment on these fields. maskProxyURL
+		// is the single place a proxy becomes displayable, so there is one thing
+		// to audit rather than one per call site.
+		ProbeProxyCount:    len(cfg.ProbeProxies),
+		ProbeProxiesMasked: maskProxyURLs(cfg.ProbeProxies),
+		ConfigErrors:       configErrors,
 	}
 	if out.Models == nil {
 		out.Models = []string{}
+	}
+	if out.ProbeAccounts == nil {
+		out.ProbeAccounts = []string{}
 	}
 
 	records, errScan := scanStoreRecords(cfg.StoreDir)
@@ -299,6 +576,29 @@ func handleStatus() pluginapi.ManagementResponse {
 		// Saying so beats the silent empty array this replaced.
 		out.AccountsError = errAccounts.Error()
 	}
+	// A configured probe scope replaces the rows rather than filtering them. The
+	// two differ for an account that is in the scope but that the host did not
+	// report: filtering would drop it, and the operator would see a smaller
+	// matrix than the scope they saved with nothing saying why. Keeping the row
+	// and marking it not-enabled states the problem instead.
+	//
+	// The enabled flag still comes from the host wherever the host knows the
+	// account, so a scoped row greys out for the same reason an unscoped one
+	// does.
+	if len(cfg.ProbeAccounts) > 0 {
+		known := make(map[string]bool, len(accounts))
+		for _, account := range accounts {
+			known[account.AuthID] = account.Enabled
+		}
+		scoped := make([]statusAccount, 0, len(cfg.ProbeAccounts))
+		for _, name := range cfg.ProbeAccounts {
+			enabled, seen := known[name]
+			// Unknown to the host means unreachable right now, which is what
+			// enabled=false means everywhere else on this page.
+			scoped = append(scoped, statusAccount{AuthID: name, Enabled: seen && enabled})
+		}
+		accounts = scoped
+	}
 
 	models := out.Models
 	if len(models) == 0 {
@@ -319,6 +619,12 @@ func handleStatus() pluginapi.ManagementResponse {
 		enabledByAuth[account.AuthID] = account.Enabled
 	}
 
+	// targetsReady counts the intended matrix only, so it is tallied here rather
+	// than over out.Buckets at the end -- that slice also carries the drift rows
+	// appended below, and a stale bucket left over from an earlier, wider scope
+	// would otherwise count towards the current scope's progress.
+	targetsTotal := 0
+	targetsReady := 0
 	seen := make(map[string]bool, len(accounts)*len(models))
 	for _, account := range accounts {
 		for _, model := range models {
@@ -326,6 +632,10 @@ func handleStatus() pluginapi.ManagementResponse {
 			cell.Enabled = account.Enabled
 			out.Buckets = append(out.Buckets, cell)
 			seen[bucketKey(account.AuthID, model)] = true
+			targetsTotal++
+			if cell.Ready {
+				targetsReady++
+			}
 		}
 	}
 	// Anything on disk that the matrix above does not cover -- a model no longer
@@ -351,14 +661,199 @@ func handleStatus() pluginapi.ManagementResponse {
 		return out.Buckets[i].Model < out.Buckets[j].Model
 	})
 
-	out.TargetsTotal = len(out.Buckets)
-	for _, bucket := range out.Buckets {
-		if bucket.Ready {
-			out.TargetsReady++
+	// The intended matrix, not len(out.Buckets): "8 of 25" when the operator
+	// scoped the run to 2 accounts × 2 models would be reporting progress against
+	// a target nobody chose. Drift rows stay visible in Buckets but out of the
+	// denominator.
+	out.TargetsTotal = targetsTotal
+	out.TargetsReady = targetsReady
+
+	return jsonResponse(http.StatusOK, out)
+}
+
+// configResponse is the editable configuration, proxies included verbatim.
+//
+// This is the only response in this file that carries a secret. It exists
+// because the dashboard has to refill its editor with the real values -- a form
+// seeded from masked strings would write "***" back over the passwords on the
+// first save. Keeping it on its own route, rather than adding the field to
+// statusResponse, is what confines the exposure to an authenticated caller.
+type configResponse struct {
+	Role           string   `json:"role"`
+	StoreDir       string   `json:"store_dir"`
+	Models         []string `json:"models"`
+	ProbeAccounts  []string `json:"probe_accounts"`
+	ProbeProxies   []string `json:"probe_proxies"`
+	DryRun         bool     `json:"dry_run"`
+	InjectMode     string   `json:"inject_mode"`
+	TTLSeconds     int      `json:"ttl_seconds"`
+	TemplateLength int      `json:"template_length"`
+	ReplaceLength  int      `json:"replace_length"`
+	ConfigErrors   []string `json:"config_errors,omitempty"`
+}
+
+// handleConfig serves the editable configuration behind the management key.
+//
+// It is deliberately read-only. Writes go through CPA's own
+// PATCH /v0/management/plugins/codex-turn-state/config, which the dashboard
+// already uses for dry_run and role: the host owns persisting plugin config --
+// there is no host.config.save callback -- so a write route here could only
+// change the in-memory copy, which the next reconfigure would silently revert.
+func handleConfig() pluginapi.ManagementResponse {
+	state.mu.Lock()
+	cfg := state.config
+	configErrors := append([]string(nil), state.configErrors...)
+	state.mu.Unlock()
+
+	out := configResponse{
+		Role:           cfg.Role,
+		StoreDir:       cfg.StoreDir,
+		Models:         append([]string(nil), cfg.Models...),
+		ProbeAccounts:  append([]string(nil), cfg.ProbeAccounts...),
+		ProbeProxies:   append([]string(nil), cfg.ProbeProxies...),
+		DryRun:         cfg.DryRun,
+		InjectMode:     cfg.InjectMode,
+		TTLSeconds:     cfg.TTLSeconds,
+		TemplateLength: cfg.TemplateLength,
+		ReplaceLength:  cfg.ReplaceLength,
+		ConfigErrors:   configErrors,
+	}
+	if out.Models == nil {
+		out.Models = []string{}
+	}
+	if out.ProbeAccounts == nil {
+		out.ProbeAccounts = []string{}
+	}
+	if out.ProbeProxies == nil {
+		out.ProbeProxies = []string{}
+	}
+	return jsonResponse(http.StatusOK, out)
+}
+
+type scopeSaveResponse struct {
+	Saved              bool     `json:"saved"`
+	Fields             []string `json:"fields"`
+	ProbeAccounts      []string `json:"probe_accounts"`
+	Models             []string `json:"models"`
+	ProbeProxyCount    int      `json:"probe_proxy_count"`
+	ProbeProxiesMasked []string `json:"probe_proxies_masked"`
+	TargetsTotal       int      `json:"targets_total"`
+	ConfigErrors       []string `json:"config_errors,omitempty"`
+	Note               string   `json:"note"`
+}
+
+// handleScopeSave persists the probe scope from the keyless route's query.
+//
+// Which lists to replace is named explicitly in `fields` rather than inferred
+// from which parameters are present. The two differ for an empty list, and the
+// difference matters: "the operator cleared the proxies" and "the page did not
+// send any proxies this time" arrive as the same query, and guessing wrong wipes
+// a list of credentials that cannot be recovered from anywhere else.
+//
+// Values arrive as repeated parameters: account=a&account=b&model=x&proxy=…
+// A query string is the only channel available -- the host serves resource
+// routes as GET with no body -- so proxy userinfo does travel in the URL. It
+// does not reach any log: CPA records upstream /v1/* calls, not management-plane
+// request lines, and this plugin never logs a proxy unmasked.
+func handleScopeSave(q url.Values) pluginapi.ManagementResponse {
+	requested := map[string]bool{}
+	for _, field := range strings.Split(q.Get("fields"), ",") {
+		if name := strings.ToLower(strings.TrimSpace(field)); name != "" {
+			requested[name] = true
+		}
+	}
+	if len(requested) == 0 {
+		return managementError(http.StatusBadRequest,
+			`"fields" is required: name which lists to replace, e.g. fields=accounts,models,proxies. `+
+				`Without it an empty query would be indistinguishable from "clear everything".`)
+	}
+	for name := range requested {
+		switch name {
+		case "accounts", "models", "proxies":
+		default:
+			return managementError(http.StatusBadRequest,
+				"unknown field "+name+"; expected accounts, models or proxies")
 		}
 	}
 
+	state.mu.Lock()
+	cfg := state.config
+	state.mu.Unlock()
+
+	if strings.TrimSpace(cfg.StoreDir) == "" {
+		return managementError(http.StatusConflict,
+			"store_dir is not configured, so there is nowhere to save the probe scope")
+	}
+
+	accounts, models, proxies := cfg.ProbeAccounts, cfg.Models, cfg.ProbeProxies
+	if requested["accounts"] {
+		accounts = q["account"]
+	}
+	if requested["models"] {
+		models = q["model"]
+	}
+	if requested["proxies"] {
+		proxies = q["proxy"]
+	}
+
+	accounts, models, proxies, problems := normaliseProbeScope(accounts, models, proxies)
+
+	scope := probeScope{
+		Accounts:  accounts,
+		Models:    models,
+		Proxies:   proxies,
+		UpdatedAt: time.Now().UTC().Format(time.RFC3339),
+	}
+	if errWrite := writeProbeScope(cfg.StoreDir, scope); errWrite != nil {
+		return managementError(http.StatusInternalServerError,
+			"could not save the probe scope: "+errWrite.Error())
+	}
+
+	// Applied in memory as well as on disk, so the change is live without
+	// waiting for the host's next reconfigure. Templates are deliberately left
+	// alone: scope says which buckets the next probe run covers, not whether a
+	// template already held is still genuine.
+	state.mu.Lock()
+	state.config.ProbeAccounts = accounts
+	state.config.Models = models
+	state.config.ProbeProxies = proxies
+	state.configErrors = problems
+	state.mu.Unlock()
+
+	log.Printf(logPrefix+"probe scope saved: accounts=%d models=%d proxies=%d (fields=%s)",
+		len(accounts), len(models), len(proxies), q.Get("fields"))
+	for _, problem := range problems {
+		log.Printf(logPrefix+"config error (probe scope, not fatal): %s", problem)
+	}
+
+	out := scopeSaveResponse{
+		Saved:              true,
+		Fields:             sortedKeys(requested),
+		ProbeAccounts:      accounts,
+		Models:             models,
+		ProbeProxyCount:    len(proxies),
+		ProbeProxiesMasked: maskProxyURLs(proxies),
+		TargetsTotal:       len(accounts) * len(models),
+		ConfigErrors:       problems,
+		Note: "已保存到插件自己的 scope 文件，立即生效，覆盖 config.yaml 里的同名项。" +
+			"采集仍须在宿主上运行 scripts/probe.py --until-complete。",
+	}
+	if out.ProbeAccounts == nil {
+		out.ProbeAccounts = []string{}
+	}
+	if out.Models == nil {
+		out.Models = []string{}
+	}
 	return jsonResponse(http.StatusOK, out)
+}
+
+func sortedKeys(set map[string]bool) []string {
+	out := make([]string, 0, len(set))
+	for key := range set {
+		out = append(out, key)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // statusAccounts lists the credentials the readiness matrix should have a row
@@ -547,7 +1042,15 @@ func handleBucketsClear(body []byte) pluginapi.ManagementResponse {
 			return managementError(http.StatusBadRequest, "could not decode the request body as JSON")
 		}
 	}
+	return clearBuckets(req)
+}
 
+// clearBuckets is the shared core behind both the authenticated POST route
+// (handleBucketsClear, which decodes a JSON body) and the keyless GET route
+// (clearRequestFromQuery, which builds the same struct from the query string).
+// They differ only in where the clearRequest comes from; the deletion, index
+// rewrite and cache invalidation below are identical for both.
+func clearBuckets(req clearRequest) pluginapi.ManagementResponse {
 	state.mu.Lock()
 	cfg := state.config
 	state.mu.Unlock()
@@ -616,7 +1119,7 @@ func handleBucketsClear(body []byte) pluginapi.ManagementResponse {
 		state.storeMod = time.Time{}
 		state.storeChecked = time.Time{}
 		state.mu.Unlock()
-		log.Printf(logPrefix+"cleared %d bucket(s) via management API", cleared)
+		log.Printf(logPrefix+"cleared %d bucket(s)", cleared)
 	}
 
 	if done == nil {
@@ -717,6 +1220,15 @@ func handleSelftest(body []byte) pluginapi.ManagementResponse {
 			return managementError(http.StatusBadRequest, "could not decode the request body as JSON")
 		}
 	}
+	return runSelftest(req)
+}
+
+// runSelftest is the shared core behind the authenticated POST route
+// (handleSelftest, JSON body) and the keyless GET route (selftestRequestFrom
+// Query). The self-test issues one real upstream request and spends quota, so on
+// the keyless path handleOpsResource has already required confirm=1 before this
+// runs.
+func runSelftest(req selftestRequest) pluginapi.ManagementResponse {
 	model := strings.TrimSpace(req.Model)
 	if model == "" {
 		return managementError(http.StatusBadRequest, `"model" is required`)

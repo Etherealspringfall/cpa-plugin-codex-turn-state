@@ -7,13 +7,22 @@
 # This is the gate DEPLOY.md calls between "probe phase" and "open business".
 # It is a thin wrapper: every flag probe.py accepts can be passed through, e.g.
 #
+#   ./probe-until-complete.sh --accounts codex-foo.json,codex-bar.json
 #   ./probe-until-complete.sh --account codex-foo.json
 #   ./probe-until-complete.sh --dry-run
 #
+# SCOPE
+#   "Every target bucket" means probe_accounts × models as configured in
+#   plugins.configs.codex-turn-state -- NOT a fixed 5x5 matrix. probe.py reads
+#   that scope from the plugin itself, so this gate and the dashboard cannot
+#   disagree about what complete means. An empty selection makes probe.py exit
+#   non-zero without probing anything, rather than defaulting to everything.
+#
 # SIDE EFFECTS
 #   Inherited from probe.py: it disables every Codex account except the one
-#   being probed, and restores the original state on exit (including Ctrl-C).
-#   Business traffic must already be stopped before running this.
+#   being probed, restores each account's exit and enable flag on the way out
+#   (including on Ctrl-C), and spends one upstream request per bucket per exit
+#   tried. Business traffic must already be stopped before running this.
 #
 # ENVIRONMENT
 #   CPA_MANAGEMENT_KEY  (required)  Bearer token for /v0/management/*

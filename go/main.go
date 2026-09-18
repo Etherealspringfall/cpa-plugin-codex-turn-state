@@ -84,6 +84,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -122,6 +123,15 @@ const indexFileName = "index.json"
 
 // storeIndexVersion tags the on-disk index format.
 const storeIndexVersion = 1
+
+// runtimeOverrideFileName holds the two fields the dashboard can change without a
+// management key: role and dry_run. It lives in the store dir and is layered over
+// the config-file values on every configure. It exists so a change made from the
+// keyless dashboard survives the CPA restart that a role switch requires anyway
+// (capability renegotiation); without it, a restart would silently revert role
+// and dry_run to config.yaml and undo the operator's last action. It carries no
+// secret -- a role string and a bool -- so it is not sensitive to read.
+const runtimeOverrideFileName = "runtime.json"
 
 var state = pluginState{
 	config:   defaultConfig(),
@@ -208,6 +218,13 @@ type pluginState struct {
 	// role change invalidates what the tallies describe.
 	counts   decisionCounters
 	countsAt time.Time
+	// configErrors holds complaints about the probe scope -- a malformed account
+	// name, model id or proxy URL. They are collected rather than returned from
+	// configure: probe scope is not load bearing for substitution, and refusing
+	// to register over a typo in a field the business path never reads would take
+	// the production role down for a probe-time mistake. They surface on the
+	// status page instead, where the operator who typed them will see them.
+	configErrors []string
 }
 
 // templateEntry is one harvested template, scoped to a single bucket.
@@ -282,6 +299,20 @@ type pluginConfig struct {
 	// The plugin does not gate on it; it is carried here so the running config
 	// and the probe script cannot drift apart unnoticed.
 	Models []string `yaml:"models"`
+	// ProbeAccounts narrows which credentials the probe run covers. Like Models
+	// it is probe scope only: the business path never reads it, so an account
+	// missing from this list is not excluded from substitution -- it simply has
+	// no bucket, because nothing harvested one for it.
+	ProbeAccounts []string `yaml:"probe_accounts"`
+	// ProbeProxies is the ordered list of exits the probe tries, per bucket, via
+	// each account's own proxy_url. It exists because rule 3 allows a template
+	// harvested on one IP to be used from another: the exit only has to be good
+	// for the few seconds it takes to mint the token.
+	//
+	// These values may carry userinfo, which makes them the only secret in this
+	// config. Everything that renders them goes through maskProxyURL; nothing
+	// reads them but the probe script, over the authenticated config route.
+	ProbeProxies []string `yaml:"probe_proxies"`
 }
 
 func defaultConfig() pluginConfig {
@@ -314,6 +345,130 @@ func (c pluginConfig) isProbe() bool {
 // ttl is the configured template lifetime as a duration.
 func (c pluginConfig) ttl() time.Duration {
 	return time.Duration(c.TTLSeconds) * time.Second
+}
+
+// maskProxyURL renders a proxy URL safe to log or hand to an unauthenticated
+// reader. Userinfo is replaced wholesale rather than partially: a password's
+// length is itself a hint, and a "first two characters" style mask has leaked
+// more than it hid often enough to not be worth the readability.
+//
+// An unparsable value returns a fixed placeholder rather than itself. That is
+// the important case: a URL malformed enough that net/url rejects it is exactly
+// the one likely to be a password with a stray character in it, and echoing the
+// input back "because we could not parse it" would publish the thing this
+// function exists to hide.
+func maskProxyURL(raw string) string {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return ""
+	}
+	parsed, errParse := url.Parse(trimmed)
+	if errParse != nil || parsed.Host == "" {
+		return "<unparsable proxy url>"
+	}
+	if parsed.User == nil {
+		return parsed.String()
+	}
+	// Spliced in by hand rather than via url.User("***"): URL.String()
+	// percent-encodes userinfo, so that route renders the mask as %2A%2A%2A --
+	// safe, but unreadable in exactly the place an operator is trying to tell
+	// two exits apart.
+	stripped := *parsed
+	stripped.User = nil
+	out := stripped.String()
+	marker := parsed.Scheme + "://"
+	if !strings.HasPrefix(out, marker) {
+		// An opaque or otherwise unexpected shape. Splicing into something we do
+		// not recognise risks emitting a mangled URL that still contains part of
+		// the original, so refuse rather than guess.
+		return "<unparsable proxy url>"
+	}
+	return marker + "***@" + out[len(marker):]
+}
+
+// maskProxyURLs masks a whole list, preserving order so a masked entry can be
+// matched against its position in the real list.
+func maskProxyURLs(raw []string) []string {
+	out := make([]string, 0, len(raw))
+	for _, value := range raw {
+		out = append(out, maskProxyURL(value))
+	}
+	return out
+}
+
+// proxySchemes are the exits CPA can actually dial. Anything else is a typo
+// worth reporting: an unsupported scheme fails at request time, deep inside a
+// probe run, where it looks like the upstream refusing rather than the config
+// being wrong.
+var proxySchemes = map[string]bool{"http": true, "https": true, "socks5": true, "socks5h": true}
+
+// normaliseProbeScope trims and validates the probe-scope lists, returning the
+// cleaned values and one human-readable complaint per rejected entry.
+//
+// Rejected entries are dropped from the returned list, not silently kept: a
+// proxy URL we cannot parse would be PATCHed onto a live account verbatim, and
+// an account name that is not a credential filename would steer a probe run at
+// nothing. But the complaint is carried out so the operator learns which entry
+// went and why -- a scope that quietly shrinks is how a probe run "completes"
+// while covering less than the operator believes.
+func normaliseProbeScope(accounts, models, proxies []string) ([]string, []string, []string, []string) {
+	var problems []string
+
+	cleanAccounts := make([]string, 0, len(accounts))
+	for _, raw := range accounts {
+		name := strings.TrimSpace(raw)
+		if name == "" {
+			continue
+		}
+		// Shape only. Whether the file exists is deliberately not checked here:
+		// configure runs before CPA has necessarily loaded every credential, and
+		// a "no such account" at this point would be wrong as often as right.
+		if !strings.HasPrefix(strings.ToLower(name), "codex-") || !strings.HasSuffix(strings.ToLower(name), ".json") {
+			problems = append(problems, fmt.Sprintf("probe_accounts: %q is not a Codex credential filename (expected codex-*.json)", name))
+			continue
+		}
+		if strings.ContainsAny(name, `/\`) || strings.Contains(name, "..") {
+			problems = append(problems, fmt.Sprintf("probe_accounts: %q contains a path component", name))
+			continue
+		}
+		cleanAccounts = append(cleanAccounts, name)
+	}
+
+	cleanModels := make([]string, 0, len(models))
+	for _, raw := range models {
+		name := strings.TrimSpace(raw)
+		if name == "" {
+			continue
+		}
+		if strings.ContainsAny(name, " \t\r\n") {
+			problems = append(problems, fmt.Sprintf("models: %q contains whitespace", name))
+			continue
+		}
+		cleanModels = append(cleanModels, name)
+	}
+
+	cleanProxies := make([]string, 0, len(proxies))
+	for index, raw := range proxies {
+		candidate := strings.TrimSpace(raw)
+		if candidate == "" {
+			continue
+		}
+		parsed, errParse := url.Parse(candidate)
+		switch {
+		case errParse != nil || parsed.Host == "":
+			// Reported by its position in the configured list, never by value:
+			// an entry too malformed to parse is the one most likely to be a
+			// mistyped password, and the index is enough to find it.
+			problems = append(problems, fmt.Sprintf("probe_proxies[%d]: not a valid URL", index))
+			continue
+		case !proxySchemes[strings.ToLower(parsed.Scheme)]:
+			problems = append(problems, fmt.Sprintf("probe_proxies: unsupported scheme %q in %s (want http, https, socks5 or socks5h)", parsed.Scheme, maskProxyURL(candidate)))
+			continue
+		}
+		cleanProxies = append(cleanProxies, candidate)
+	}
+
+	return cleanAccounts, cleanModels, cleanProxies, problems
 }
 
 type envelope struct {
@@ -466,6 +621,23 @@ func configure(raw []byte) error {
 		}
 	}
 
+	// Layer the keyless dashboard override on top of the config-file values.
+	// role and dry_run are the two fields the dashboard changes without a
+	// management key; persisting and re-applying them here is what lets a flip
+	// survive the CPA restart a role change requires. The override only carries a
+	// field the operator actually set, so an untouched field keeps its
+	// config.yaml value. Everything below (role validation, the probe store_dir
+	// check) then runs on the merged result, so an override cannot smuggle in an
+	// invalid role.
+	if ov, okOverride := readRuntimeOverride(strings.TrimSpace(cfg.StoreDir)); okOverride {
+		if ov.Role != nil {
+			cfg.Role = *ov.Role
+		}
+		if ov.DryRun != nil {
+			cfg.DryRun = *ov.DryRun
+		}
+	}
+
 	// An empty role means business: the half that neither writes nor harvests.
 	// The deploy order installs the .so before config.yaml gains a role, and a
 	// plugin that refuses to register in that window would look like a broken
@@ -524,14 +696,95 @@ func configure(raw []byte) error {
 		forcedInband = true
 	}
 
+	// Probe scope is validated but never fatal. These three lists steer a probe
+	// run; none of them is consulted when deciding a substitution, so a typo here
+	// must not stop the business role from registering. The complaints ride out
+	// on the status page instead.
+	var scopeProblems []string
+	cfg.ProbeAccounts, cfg.Models, cfg.ProbeProxies, scopeProblems =
+		normaliseProbeScope(cfg.ProbeAccounts, cfg.Models, cfg.ProbeProxies)
+
+	// A saved scope overrides config.yaml outright. The dashboard is the editing
+	// surface now, so the alternative -- config.yaml quietly winning -- would
+	// mean the operator saves a selection, sees it applied, and then watches it
+	// revert at the next reconfigure with nothing to explain why. CPA rewrites
+	// config.yaml on its own, so that reconfigure is not hypothetical.
+	//
+	// config.yaml still supplies the starting values: it is what the scope is
+	// before anything has ever been saved.
+	scopeSource := "config.yaml"
+	if saved, errScope := loadProbeScope(cfg.StoreDir); errScope != nil {
+		scopeProblems = append(scopeProblems,
+			"probe scope file unreadable, falling back to config.yaml: "+errScope.Error())
+	} else if saved != nil {
+		var savedProblems []string
+		cfg.ProbeAccounts, cfg.Models, cfg.ProbeProxies, savedProblems =
+			normaliseProbeScope(saved.Accounts, saved.Models, saved.Proxies)
+		scopeProblems = append(scopeProblems, savedProblems...)
+		scopeSource = scopeFileName + " (saved " + saved.UpdatedAt + ")"
+	}
+
 	state.mu.Lock()
 	// The host reconfigures far more often than the config actually changes:
 	// five times during startup alone, and again every time CPA rewrites
-	// config.yaml on its own. Clearing unconditionally would drop every
-	// template at unpredictable moments and leave the cache permanently
-	// empty, so only a change that invalidates templates clears them.
-	cleared := templatesInvalidatedBy(state.config, cfg)
-	roleChanged := !strings.EqualFold(state.config.Role, cfg.Role)
+	// config.yaml on its own. swapConfigLocked clears templates only on a change
+	// that invalidates them, so a no-op reconfigure keeps the cache intact.
+	cleared, _ := swapConfigLocked(cfg)
+	state.configErrors = scopeProblems
+	state.mu.Unlock()
+
+	if forcedInband {
+		log.Printf(logPrefix + "config error: harvest_inband is not allowed for role=business, forced to false")
+	}
+	templates := "templates kept"
+	if cleared {
+		templates = "templates cleared"
+	}
+	// Counts, not contents. probe_proxies may carry userinfo, so the only safe
+	// thing to say about it in a log line is how many there are.
+	log.Printf(logPrefix+"configured role=%s store_dir=%q template_length=%d replace_length=%d ttl_seconds=%d dry_run=%t inject_mode=%s harvest_inband=%t models=%d probe_accounts=%d probe_proxies=%d scope_from=%s (%s)",
+		cfg.Role, cfg.StoreDir, cfg.TemplateLength, cfg.ReplaceLength, cfg.TTLSeconds, cfg.DryRun, cfg.InjectMode, cfg.HarvestInband,
+		len(cfg.Models), len(cfg.ProbeAccounts), len(cfg.ProbeProxies), scopeSource, templates)
+	for _, problem := range scopeProblems {
+		// One line each, and loud: a dropped scope entry means the next probe run
+		// covers less than whoever edited the config believes it does.
+		log.Printf(logPrefix+"config error (probe scope, not fatal): %s", problem)
+	}
+	return nil
+}
+
+// templatesInvalidatedBy reports whether moving from oldCfg to newCfg makes
+// already-held templates unusable. A template must never outlive the rules it
+// was harvested under, so the two lengths and the TTL force a clear. A role or
+// store_dir change forces one too: the memory belongs to the old role's view of
+// the old store, and carrying it across would blur exactly the boundary the two
+// roles exist to keep. dry_run and log_decisions change what the plugin does
+// with a template, not whether the template is still a valid one.
+//
+// probe_accounts, probe_proxies and models are all in the second group and are
+// deliberately absent below. They describe which buckets the next probe run will
+// try to fill and how it will reach the upstream; none of them says anything
+// about whether a template already on hand is still the genuine article. Editing
+// the scope on the dashboard is the commonest reason this function runs at all,
+// and clearing there would throw away live templates every time the operator
+// ticked a box.
+func templatesInvalidatedBy(oldCfg, newCfg pluginConfig) bool {
+	return oldCfg.TemplateLength != newCfg.TemplateLength ||
+		oldCfg.ReplaceLength != newCfg.ReplaceLength ||
+		oldCfg.TTLSeconds != newCfg.TTLSeconds ||
+		oldCfg.Role != newCfg.Role ||
+		oldCfg.StoreDir != newCfg.StoreDir
+}
+
+// swapConfigLocked installs cfg as the running config and updates the derived
+// state that depends on it. The caller must hold state.mu. It is the shared tail
+// of configure and the dashboard's keyless role/dry_run toggles, so the rule for
+// when a change clears templates or resets tallies lives in exactly one place and
+// the two entry points cannot drift. It returns whether templates were cleared
+// and whether the role changed, for the caller's logging.
+func swapConfigLocked(cfg pluginConfig) (cleared, roleChanged bool) {
+	cleared = templatesInvalidatedBy(state.config, cfg)
+	roleChanged = !strings.EqualFold(state.config.Role, cfg.Role)
 	state.config = cfg
 	if cleared {
 		state.buckets = make(map[string]templateEntry)
@@ -546,33 +799,7 @@ func configure(raw []byte) error {
 		state.counts = decisionCounters{}
 		state.countsAt = time.Now()
 	}
-	state.mu.Unlock()
-
-	if forcedInband {
-		log.Printf(logPrefix + "config error: harvest_inband is not allowed for role=business, forced to false")
-	}
-	templates := "templates kept"
-	if cleared {
-		templates = "templates cleared"
-	}
-	log.Printf(logPrefix+"configured role=%s store_dir=%q template_length=%d replace_length=%d ttl_seconds=%d dry_run=%t inject_mode=%s harvest_inband=%t models=%d (%s)",
-		cfg.Role, cfg.StoreDir, cfg.TemplateLength, cfg.ReplaceLength, cfg.TTLSeconds, cfg.DryRun, cfg.InjectMode, cfg.HarvestInband, len(cfg.Models), templates)
-	return nil
-}
-
-// templatesInvalidatedBy reports whether moving from oldCfg to newCfg makes
-// already-held templates unusable. A template must never outlive the rules it
-// was harvested under, so the two lengths and the TTL force a clear. A role or
-// store_dir change forces one too: the memory belongs to the old role's view of
-// the old store, and carrying it across would blur exactly the boundary the two
-// roles exist to keep. dry_run and log_decisions change what the plugin does
-// with a template, not whether the template is still a valid one.
-func templatesInvalidatedBy(oldCfg, newCfg pluginConfig) bool {
-	return oldCfg.TemplateLength != newCfg.TemplateLength ||
-		oldCfg.ReplaceLength != newCfg.ReplaceLength ||
-		oldCfg.TTLSeconds != newCfg.TTLSeconds ||
-		oldCfg.Role != newCfg.Role ||
-		oldCfg.StoreDir != newCfg.StoreDir
+	return cleared, roleChanged
 }
 
 func pluginRegistration() registration {
@@ -598,8 +825,8 @@ func pluginRegistration() registration {
 		Metadata: pluginapi.Metadata{
 			Name:             "codex-turn-state",
 			Version:          "0.1.0",
-			Author:           "arden-aaai",
-			GitHubRepository: "https://github.com/arden-aaai/cpa-plugin-codex-turn-state",
+			Author:           "ncdeng",
+			GitHubRepository: "https://github.com/ncdeng/cpa-plugin-codex-turn-state",
 			ConfigFields: []pluginapi.ConfigField{
 				{
 					Name:        "role",
@@ -652,6 +879,16 @@ func pluginRegistration() registration {
 					Name:        "models",
 					Type:        pluginapi.ConfigFieldTypeArray,
 					Description: "Official model ids the probe is expected to fill. Recorded so the running config and the probe script cannot drift apart.",
+				},
+				{
+					Name:        "probe_accounts",
+					Type:        pluginapi.ConfigFieldTypeArray,
+					Description: "Credential filenames the probe run covers. PROBE SCOPE ONLY: the business path never reads this, so an account left out is not excluded from substitution -- it just has no bucket for anything to substitute from.",
+				},
+				{
+					Name:        "probe_proxies",
+					Type:        pluginapi.ConfigFieldTypeArray,
+					Description: "Ordered exits the probe tries per bucket, applied to the probed account's own proxy_url. PROBE SCOPE ONLY; never read by the business path. May contain credentials, so it is masked everywhere it is displayed and never logged.",
 				},
 			},
 		},
@@ -1182,6 +1419,59 @@ func atomicWrite(path string, data []byte) error {
 	return os.Rename(name, path)
 }
 
+// runtimeOverride is the persisted form of the two dashboard-settable fields.
+// Both are pointers so "absent" is distinct from "set to the zero value": a file
+// that only ever recorded a dry_run flip must not also assert role="" (business)
+// and silently switch the role. Only a field that was actually written is applied.
+type runtimeOverride struct {
+	Role   *string `json:"role,omitempty"`
+	DryRun *bool   `json:"dry_run,omitempty"`
+}
+
+// readRuntimeOverride loads the dashboard override from dir. A missing file is the
+// normal case (fresh deploy, nobody has touched the dashboard) and returns
+// ok=false with no error noise. A malformed file is treated the same way rather
+// than failing configure: a corrupt override must never take down registration,
+// and falling back to config.yaml is the safe direction.
+func readRuntimeOverride(dir string) (runtimeOverride, bool) {
+	dir = strings.TrimSpace(dir)
+	if dir == "" {
+		return runtimeOverride{}, false
+	}
+	data, errRead := os.ReadFile(filepath.Join(dir, runtimeOverrideFileName))
+	if errRead != nil {
+		return runtimeOverride{}, false
+	}
+	var ov runtimeOverride
+	if errUnmarshal := json.Unmarshal(data, &ov); errUnmarshal != nil {
+		log.Printf(logPrefix+"ignoring malformed %s: %v", runtimeOverrideFileName, errUnmarshal)
+		return runtimeOverride{}, false
+	}
+	if ov.Role == nil && ov.DryRun == nil {
+		return runtimeOverride{}, false
+	}
+	return ov, true
+}
+
+// writeRuntimeOverride records the dashboard's current role and dry_run so a
+// restart keeps them. It always writes both fields as a full snapshot of what the
+// dashboard controls, so a later role flip cannot lose an earlier dry_run flip.
+func writeRuntimeOverride(dir string, role string, dryRun bool) error {
+	dir = strings.TrimSpace(dir)
+	if dir == "" {
+		return fmt.Errorf("store_dir is empty, cannot persist the dashboard override")
+	}
+	ov := runtimeOverride{Role: &role, DryRun: &dryRun}
+	data, errMarshal := json.MarshalIndent(ov, "", "  ")
+	if errMarshal != nil {
+		return errMarshal
+	}
+	if errMkdir := os.MkdirAll(dir, 0o700); errMkdir != nil {
+		return errMkdir
+	}
+	return atomicWrite(filepath.Join(dir, runtimeOverrideFileName), append(data, '\n'))
+}
+
 // scanStoreRecords reads every bucket file under dir. Records whose contents
 // disagree with their own path are dropped: the path is the bucket key, and a
 // file claiming a different account or model than the directory it sits in is
@@ -1334,6 +1624,68 @@ func writeStoreIndex(dir string, now time.Time, ttl time.Duration, templateLengt
 		return errMkdir
 	}
 	return atomicWrite(filepath.Join(dir, indexFileName), append(data, '\n'))
+}
+
+// scopeFileName holds the probe scope the dashboard edits. It lives beside the
+// store because that is the one directory this plugin owns and can write.
+//
+// It exists because the host offers no way for a plugin to persist its own
+// config: there is a host.auth.save callback and nothing equivalent for
+// configuration. Saving through CPA's own
+// PATCH /v0/management/plugins/<id>/config is the alternative, and that route is
+// authenticated -- which would put a management key in front of the one screen
+// the operator asked to be keyless. Owning the file ourselves is what removes
+// the key from the page entirely.
+const scopeFileName = "probe-scope.json"
+
+// probeScope is the editable half of the configuration: which buckets the next
+// probe run covers and which exits it tries. None of it is read by the business
+// path.
+type probeScope struct {
+	Accounts  []string `json:"probe_accounts"`
+	Models    []string `json:"models"`
+	Proxies   []string `json:"probe_proxies"`
+	UpdatedAt string   `json:"updated_at"`
+}
+
+// loadProbeScope reads the saved scope, or returns nil when none exists. A
+// missing file is the normal state before the operator has saved anything, not
+// an error.
+func loadProbeScope(dir string) (*probeScope, error) {
+	dir = strings.TrimSpace(dir)
+	if dir == "" {
+		return nil, nil
+	}
+	data, errRead := os.ReadFile(filepath.Join(dir, scopeFileName))
+	if errRead != nil {
+		if os.IsNotExist(errRead) {
+			return nil, nil
+		}
+		return nil, errRead
+	}
+	var scope probeScope
+	if errUnmarshal := json.Unmarshal(data, &scope); errUnmarshal != nil {
+		return nil, errUnmarshal
+	}
+	return &scope, nil
+}
+
+// writeProbeScope persists the scope atomically. The file carries proxy
+// userinfo, so it is written with the same 0600 the bucket files get -- see
+// atomicWrite, which creates via os.CreateTemp and renames into place.
+func writeProbeScope(dir string, scope probeScope) error {
+	dir = strings.TrimSpace(dir)
+	if dir == "" {
+		return fmt.Errorf("store_dir is empty, so there is nowhere to save the probe scope")
+	}
+	if errMkdir := os.MkdirAll(dir, 0o700); errMkdir != nil {
+		return errMkdir
+	}
+	data, errMarshal := json.MarshalIndent(scope, "", "  ")
+	if errMarshal != nil {
+		return errMarshal
+	}
+	return atomicWrite(filepath.Join(dir, scopeFileName), append(data, '\n'))
 }
 
 // refreshStoreLocked keeps the business role's view of the store current. It

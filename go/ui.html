@@ -8,24 +8,33 @@
 
   ── 鉴权模型（读之前先看这段）──────────────────────────────────────────
 
-  分两层，界线是「看」还是「动」：
+  用户明确要求：页面上的操作不弹密钥。界线现在是「碰不碰机密」，不再是「看还是动」：
 
     不鉴权 GET   ── dashboard（页面本身）/ status（数据）
-                    挂在 /v0/resource/plugins/<id>/ 下，那个前缀不鉴权且只接受
-                    GET（ServeResourceHTTP 第一行就挡掉非 GET）。
-    要管理密钥   ── selftest（烧额度）/ clear（清库，破坏性）/ dry_run / role
-                    前两个是插件自己的 POST /v0/management/codex-turn-state/*，
-                    后两个是 CPA 自己的 PATCH .../plugins/<id>/config。
+                    + 四个操作：dry_run / role / 清桶 / 连通性自检
+                    全挂在 /v0/resource/plugins/<id>/ 下，那个前缀不鉴权且只接受
+                    GET（ServeResourceHTTP 第一行就挡掉非 GET）。四个操作走
+                    .../ops/*，改状态或烧额度，所以固定带 confirm=1 —— 那不是
+                    鉴权，只挡浏览器预取 / 爬虫 / 误打开 URL 触发。
+    保存探测范围 ── 也在 .../ops/scope，同样不鉴权。插件把范围写进【自己的】
+                    scope 文件，不经过 CPA 那条鉴权的 config PATCH —— 宿主没给
+                    插件保存配置的接口，那条 PATCH 是唯一替代，而它要密钥。
+    代理 ──────── 是本插件配置里唯一的机密，明文只在鉴权的 management /config
+                    上回传，本页面【从不调用那条路由】。所以代理框是只写的：
+                    显示掩码，要改就整段重填。把它做成匿名可读 = 把账号密码摊
+                    给任何摸到隧道的人。
 
-  【这是用户在知情下选的】：打开页面、看数据不设登录门 —— 但凡是会改状态或烧
-  额度的动作都要密钥。前提是 CPA 只绑 127.0.0.1、要走 SSH 隧道才能到。密钥是
-  一次性索取的：第一次点四个操作里的任意一个时弹一次，之后本标签页内不再问，
-  只存 sessionStorage，不落磁盘、不进 URL。
+  代理掩码是单向的 —— 匿名 status 只给条数和 socks5h://***@host:1080 这种掩码；
+  页面任何情况下都不会拿掩码去反推原值，也不会把带 *** 的行当真值存回配置。
 
-  ⚠ 由此产生一个必须记住的事实：status 不鉴权可读，而它返回的 auth_id 就是
-    账号文件名，【含客户邮箱】。哪天有人考虑把 8317 暴露到公网、或者在它前面
-    挂反代，先回来看这一行 —— 那等于把客户邮箱列表做成了匿名可读接口。破坏性
-    动作有密钥挡着，但「看」这一层是敞开的，别忘了它也泄露信息。
+  【这是用户在知情下选的】：CPA 只绑 127.0.0.1、要走 SSH 隧道才够得到，所以
+  「不鉴权」实际等于「能进隧道的人（就是用户自己）」。四个操作因此不设任何门。
+
+  ⚠ 两个必须记住的后果：
+    1. status 不鉴权可读，它返回的 auth_id 就是账号文件名【含客户邮箱】。
+    2. 四个操作也不鉴权：能打开这个页面的人，无需密码就能清库、切真实流量、
+       烧额度。哪天想把 8317 暴露到公网或挂反代，先回来看这两行 —— 那时这些就
+       不再只是「隧道里的自己」够得到了。
 
   不要往这个文件里写任何密钥、账号名或 token。
 -->
@@ -97,7 +106,7 @@ section { margin-bottom: 18px; }
   border-radius: 8px; padding: 12px 14px;
 }
 
-/* ---------- 模态里的密钥输入（惰性索取，不是登录门） ---------- */
+/* ---------- 模态里的文本输入（确认对话框用，不是登录门） ---------- */
 #modalInput {
   width: 100%; padding: 9px 11px; font-family: inherit; font-size: 14px;
   margin-top: 4px;
@@ -171,6 +180,45 @@ td.cell button:disabled:hover { outline: 0; }
           display: flex; gap: 16px; flex-wrap: wrap; }
 .swatch { display: inline-block; width: 10px; height: 10px; border-radius: 2px;
           margin-right: 5px; vertical-align: -1px; border: 1px solid var(--border); }
+/* 范围外的行 / 列：store 里有桶，但它不在 probe_accounts × models 里。压低而不
+   隐藏 —— 「多出来的桶」正是配置漂移的信号，藏了就再也没人发现。 */
+td.acct.outscope, th.model.outscope, em.outscope { font-style: italic; color: var(--faint); }
+
+/* ---------- 探测范围编辑器 ---------- */
+.lead { font-size: 12.5px; color: var(--muted); margin: 0 0 11px; }
+.scopegrid { display: flex; gap: 14px; flex-wrap: wrap; align-items: flex-start; }
+.scopecol { flex: 1 1 230px; min-width: 200px; }
+.scopecol.wide { flex: 1.4 1 290px; }
+.scopehead { display: flex; gap: 8px; align-items: baseline; margin-bottom: 6px; flex-wrap: wrap; }
+.scopehead .hint { margin-top: 0; }
+.checks {
+  max-height: 170px; overflow-y: auto;
+  border: 1px solid var(--border); border-radius: 6px;
+  background: var(--raised); padding: 5px 8px;
+}
+/* 停用态只压低对比度，不隐藏 ——「看得见但改不了」和「压根没这一项」是两回事，
+   后者会让人以为插件不支持，然后跑去翻代码。 */
+.checks.disabled { opacity: .55; }
+.check { display: flex; gap: 7px; align-items: baseline; padding: 2px 0; font-size: 12.5px; }
+.check input { flex: 0 0 auto; margin: 0; }
+.check span {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.checks .empty { color: var(--faint); font-size: 12.5px; padding: 3px 0; }
+.addrow { margin-top: 7px; }
+#scopeModelAdd, #scopeProxies {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12.5px; padding: 6px 9px; border-radius: 6px;
+  border: 1px solid var(--border); background: var(--raised); color: var(--fg);
+}
+#scopeModelAdd { flex: 1 1 140px; min-width: 110px; }
+#scopeProxies { width: 100%; min-height: 96px; resize: vertical; line-height: 1.45; }
+#scopeModelAdd:focus, #scopeProxies:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+#scopeProxies[readonly] { background: var(--card); color: var(--muted); }
+#scopeErrors { margin-top: 12px; }
+#scopeErrors .notice { margin-bottom: 8px; }
+#scopeErrors .mono { font-size: 12px; word-break: break-all; }
 
 /* ---------- 计数 ---------- */
 .counters { display: flex; gap: 10px; flex-wrap: wrap; }
@@ -226,6 +274,16 @@ select {
   border: 0; background: transparent; color: inherit; cursor: pointer;
   font: inherit; opacity: .65; padding: 0 2px;
 }
+/* 带动作的通知（目前只有「复制命令」）。做成有边框的小按钮，和右上角那个关闭
+   ✕ 明确区分开 —— 它们一个是操作、一个是丢弃。 */
+.notice .act {
+  border: 1px solid currentColor; border-radius: 5px; padding: 2px 8px;
+  font-size: 12px; opacity: .85; flex: 0 0 auto; align-self: flex-start;
+}
+.notice .cmd {
+  margin-top: 6px; font-size: 12px; opacity: .95; word-break: break-all;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
 
 /* ---------- 模态确认 ---------- */
 #modal {
@@ -253,12 +311,74 @@ select {
       <div class="spacer"></div>
       <div class="freshness" id="freshness"></div>
       <button class="btn" id="btnPause" type="button">暂停刷新</button>
-      <button class="btn" id="btnForget" type="button">清除密钥</button>
     </div>
     <div class="badges" id="badges"></div>
   </header>
 
   <div id="notices"></div>
+
+  <section>
+    <h2>探测范围</h2>
+    <div class="card">
+      <div class="lead">
+        这三项只决定下一轮探测去采哪些桶 —— <b>不影响业务端替不替换</b>：业务只看
+        store 里有没有对应的桶。把某个账号从名单里去掉，不等于业务不给它替换，
+        只等于没人再给它采；桶过期之后它就自然停了。
+      </div>
+      <div class="scopegrid">
+        <div class="scopecol">
+          <div class="scopehead">
+            <span class="sublabel">账号</span>
+            <span class="hint" id="scopeAcctNote"></span>
+          </div>
+          <div class="checks" id="scopeAccounts"></div>
+        </div>
+        <div class="scopecol">
+          <div class="scopehead">
+            <span class="sublabel">模型</span>
+            <span class="hint" id="scopeModelNote"></span>
+          </div>
+          <div class="checks" id="scopeModels"></div>
+          <div class="row addrow">
+            <input id="scopeModelAdd" type="text" spellcheck="false" autocomplete="off"
+                   placeholder="补一个模型 id" aria-label="补充一个模型 id">
+            <button class="btn ghost" id="btnAddModel" type="button">加进清单</button>
+          </div>
+          <div class="hint">
+            原样提交：不改大小写、不动横线。<code>gpt-5.6-sol</code> 里的横线是 id
+            的一部分，写成 <code>gpt5.6sol</code> 是另一个（不存在的）模型。
+          </div>
+        </div>
+        <div class="scopecol wide">
+          <div class="scopehead">
+            <span class="sublabel">代理（一行一个）</span>
+            <span class="hint" id="scopeProxyNote"></span>
+          </div>
+          <textarea id="scopeProxies" rows="5" spellcheck="false" autocomplete="off"
+                    placeholder="一行一个 URL，空行忽略；顺序就是探测的尝试顺序"
+                    aria-label="探测代理清单，一行一个 URL"></textarea>
+          <div class="hint" id="scopeProxyHint"></div>
+        </div>
+      </div>
+
+      <div id="scopeErrors"></div>
+
+      <div class="subtle">
+        <div class="row">
+          <button class="btn primary" id="btnScopeSave" type="button">保存探测范围</button>
+          <button class="btn" id="btnScopeReset" type="button">放弃改动</button>
+          <span class="spacer"></span>
+          <span class="hint" id="scopeDirty"></span>
+        </div>
+        <div class="hint">
+          <b>这里没有「一键采集」按钮，也不可能有。</b>
+          宿主会让插件自己发出的请求跳过本插件的响应钩子（和连通性自检同一个原因），
+          所以从这个页面发出的任何请求都产生不了桶。保存范围只是改配置，
+          采集要到宿主上跑 <code>scripts/probe.py --until-complete</code>。
+        </div>
+      </div>
+    </div>
+  </section>
 
   <section>
     <h2>桶就绪度</h2>
@@ -268,6 +388,7 @@ select {
       <span><i class="swatch st-ok"></i>就绪（显示剩余时长）</span>
       <span><i class="swatch st-warn"></i>剩余不足 10 分钟</span>
       <span><i class="swatch st-miss"></i>缺失或已过期</span>
+      <span><em class="outscope">斜体灰</em> 的行 / 列在探测范围之外：store 里有它的桶，下一轮不会去采</span>
       <span>点格子可清空该桶</span>
     </div>
   </section>
@@ -320,24 +441,14 @@ select {
 <script>
 "use strict";
 
-// 密钥只放 sessionStorage。这把钥匙能改 CPA 的全局配置，localStorage 那种
-// 跨标签页、跨重启的寿命不值得为省一次输入去换；URL 更不行（会进历史记录、
-// Referer 和反代日志）。
-var KEY_STORE = "cts.mgmtKey";
 var POLL_MS = 10000;
 
-// 不鉴权、GET-only。只有查看数据（status）走这里，页面打开直接拉。
+// 不鉴权、GET-only。这个页面【只】用这一个前缀：status、四个操作、保存范围。
+// 鉴权的 management 路由（.../config 回明文代理，POST .../buckets/clear、
+// .../selftest）都还在，作为带密钥的脚本 API，但页面一条都不调。
 var RES = "/v0/resource/plugins/codex-turn-state";
-// 要管理密钥。破坏性 / 烧额度的动作都在这儿：
-//   MGMT_API/selftest、MGMT_API/buckets/clear —— 插件自己的鉴权接口
-//   CONFIG_API（PATCH dry_run/role）        —— CPA 自己的接口
-// clear 会清库、selftest 会烧额度，匿名 GET 挡不住故意或爬虫/预取，所以这两个
-// 和 dry_run/role 一样保持鉴权，统一走一次性密钥。
-var MGMT_API = "/v0/management/codex-turn-state";
-var CONFIG_API = "/v0/management/plugins/codex-turn-state/config";
 
 var state = {
-  key: null,
   data: null,         // 最后一次成功的 status
   lastGood: null,     // 最后一次成功刷新的时刻
   lastError: null,    // 最近一次刷新失败的原因
@@ -397,22 +508,61 @@ function fmtAgo(d) {
 
 /* ---------------------------- 通知条 ---------------------------- */
 
-function notify(kind, message) {
+// opts.copy = {text, label} 时多挂一个复制按钮，并且这条通知不自动消失 ——
+// 一条要人照着敲的命令，6 秒后自己跑掉是最气人的。
+function notify(kind, message, opts) {
+  opts = opts || {};
   var box = $("notices");
   var line = el("div", { cls: "notice " + kind });
-  line.appendChild(el("div", { cls: "msg", text: message }));
+  var msg = el("div", { cls: "msg", text: message });
+  line.appendChild(msg);
+  if (opts.copy) {
+    msg.appendChild(el("div", { cls: "cmd", text: opts.copy.text }));
+    var label = opts.copy.label || "复制";
+    var act = el("button", { cls: "act", text: label, attrs: { type: "button" } });
+    act.addEventListener("click", function () {
+      copyToClipboard(opts.copy.text).then(function (ok) {
+        act.textContent = ok ? "已复制" : "复制失败，请手动选中";
+        setTimeout(function () { act.textContent = label; }, 2500);
+      });
+    });
+    line.appendChild(act);
+  }
   var close = el("button", { text: "✕", attrs: { type: "button", "aria-label": "关闭" } });
   close.addEventListener("click", function () { line.remove(); });
   line.appendChild(close);
   box.appendChild(line);
   // 成功类提示会话性地自己消失；错误留着，等人看。
-  if (kind === "ok") { setTimeout(function () { line.remove(); }, 6000); }
+  if (kind === "ok" && !opts.copy) { setTimeout(function () { line.remove(); }, 6000); }
   return line;
 }
 
-// 「清除密钥」只在手上确实握着密钥时才有意义，否则是个空按钮。
-function renderKeyState() {
-  $("btnForget").hidden = !state.key;
+// navigator.clipboard 在非安全上下文里根本不存在（http:// + 非 localhost 就是），
+// 而这个看板经常是通过隧道或内网 IP 打开的，所以必须有退路：失败就返回 false，
+// 让调用方老实说「复制失败」，而不是假装成功。
+function copyToClipboard(text) {
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    return navigator.clipboard.writeText(text).then(
+      function () { return true; },
+      function () { return legacyCopy(text); }
+    );
+  }
+  return Promise.resolve(legacyCopy(text));
+}
+
+function legacyCopy(text) {
+  var ta = document.createElement("textarea");
+  ta.value = text;
+  ta.setAttribute("readonly", "");
+  ta.style.position = "fixed";
+  ta.style.top = "-1000px";
+  ta.style.opacity = "0";
+  document.body.appendChild(ta);
+  ta.select();
+  var ok = false;
+  try { ok = document.execCommand("copy"); } catch (e) { ok = false; }
+  document.body.removeChild(ta);
+  return ok;
 }
 
 /* ---------------------------- 模态确认 ---------------------------- */
@@ -440,7 +590,7 @@ function confirmDialog(opts) {
 
     function done(v) {
       modal.hidden = true;
-      input.value = "";           // 别把密钥留在 DOM 里
+      input.value = "";           // 不把输入内容留在 DOM 里
       input.hidden = true;
       ok.removeEventListener("click", onOk);
       cancel.removeEventListener("click", onCancel);
@@ -469,43 +619,19 @@ function confirmDialog(opts) {
   });
 }
 
-/* ---------------------------- 鉴权与请求 ---------------------------- */
+/* ---------------------------- 请求 ---------------------------- */
 
-function setKey(k) {
-  state.key = k;
-  try { sessionStorage.setItem(KEY_STORE, k); } catch (e) { /* 隐私模式下忽略 */ }
-}
-
-// 只丢弃密钥，【不动页面】。只读部分本来就不需要密钥，把整页退回登录态会把
-// 一个配置接口的鉴权失败放大成「看板挂了」。
-function forgetKey(reason) {
-  state.key = null;
-  try { sessionStorage.removeItem(KEY_STORE); } catch (e) { /* 忽略 */ }
-  renderKeyState();
-  if (reason) { notify("err", reason); }
-}
-
-// 惰性索取：四个操作（dry_run / role / clear / selftest）第一次点任意一个时
-// 走到这里，同一标签页内只问一次。返回 Promise<string|null>，null 表示取消。
-function ensureKey(purpose) {
-  if (state.key) { return Promise.resolve(state.key); }
-  return confirmDialog({
-    title: "需要 CPA 管理密钥",
-    confirmText: "确定",
-    input: true,
-    placeholder: "管理密钥",
-    lines: [
-      { text: purpose },
-      { text: "查看数据不需要密钥，但任何会改状态或烧额度的动作（dry_run、role、清空桶、连通性自检）都要，插件绕不过去。" },
-      { text: "密钥只存在本标签页，关掉即失效，不写磁盘、不进 URL。同一标签页内不会再问第二次。" }
-    ]
-  }).then(function (v) {
-    if (!v) { return null; }
-    setKey(v);
-    renderKeyState();
-    return v;
-  });
-}
+// 这个页面不持有、不索取、也不发送任何管理密钥。每一条它调用的路由都在
+// /v0/resource/plugins/codex-turn-state/ 下面，宿主对那个前缀不做鉴权：
+//
+//   status          只读数据
+//   ops/dry-run     ops/role     ops/clear     ops/selftest
+//   ops/scope       保存探测范围
+//
+// 代理是唯一的机密，它的明文只在鉴权的 management /config 上回传，而这个页面
+// 【从不调用那条路由】—— 代理框显示掩码、只写，要改就整段重填。这就是为什么
+// 这里没有 ensureKey / setKey / mgmtSend 之类的东西：不是忘了写，是不能有。
+// 任何在这里重新引入密钥输入的改动，都请先回去看 management.go 顶部那段。
 
 // ApiError 携带服务端原话。403 的原因有好几种（远程管理关闭、IP 被封 30 分钟），
 // 自己改写成「失败」会把排障线索丢掉，所以一律原样透出。
@@ -530,41 +656,39 @@ function qs(params) {
   Object.keys(params || {}).forEach(function (k) {
     var v = params[k];
     if (v === undefined || v === null || v === "") { return; }
+    // An array becomes repeated parameters (a=1&a=2), which is how the scope
+    // save receives a list. Joining with a comma instead would break on any
+    // value that can contain one -- and a proxy URL can.
+    if (Object.prototype.toString.call(v) === "[object Array]") {
+      v.forEach(function (item) {
+        if (item === undefined || item === null || item === "") { return; }
+        parts.push(encodeURIComponent(k) + "=" + encodeURIComponent(String(item)));
+      });
+      return;
+    }
     parts.push(encodeURIComponent(k) + "=" + encodeURIComponent(String(v)));
   });
   return parts.length ? ("?" + parts.join("&")) : "";
 }
 
-// 不鉴权的 resource 接口：GET-only，不带任何鉴权头。只有 status 走这里。
+// 不鉴权的 resource 接口：GET-only，不带任何鉴权头。status 和四个操作都走这里。
 function resGet(path, params) {
   return fetch(RES + path + qs(params), { method: "GET", cache: "no-store" })
     .then(readResponse);
 }
 
-// 鉴权的 management 接口：带管理密钥 + JSON body。调用前必须先 ensureKey()。
-// selftest / clear / config 都走这条。用 POST/PATCH 而非 GET query，鉴权动作
-// 不需要防浏览器预取，也不该把参数留进历史记录。
-function mgmtSend(url, method, body) {
-  return fetch(url, {
-    method: method,
-    headers: { "X-Management-Key": state.key, "Content-Type": "application/json" },
-    cache: "no-store",
-    body: JSON.stringify(body)
-  }).then(readResponse);
+// 不鉴权的【动作】接口：GET + confirm=1，同样不带任何鉴权头。四个操作
+// （dry_run / role / clear / selftest）走这里 —— 用户明确要求页面上这几个操作不
+// 弹密钥。它们改状态或烧额度，所以固定带 confirm=1：那不是鉴权（这台机器只绑
+// 127.0.0.1、要走 SSH 隧道才够得到），只是挡住浏览器预取 / 爬虫 / 误打开 URL 触发。
+// 探测范围（尤其代理明文）不在此列，仍走鉴权接口。
+function resAction(path, params) {
+  var p = {};
+  Object.keys(params || {}).forEach(function (k) { p[k] = params[k]; });
+  p.confirm = "1";
+  return fetch(RES + path + qs(p), { method: "GET", cache: "no-store" }).then(readResponse);
 }
 
-// 401/403 一律退回输入态。401 是密钥本身不对；403 另有原因，把服务端原话带上。
-function handleAuthFailure(err) {
-  if (err.status === 401) {
-    forgetKey("密钥无效或已失效：" + err.message);
-    return true;
-  }
-  if (err.status === 403) {
-    forgetKey("被拒绝（HTTP 403）：" + err.message);
-    return true;
-  }
-  return false;
-}
 
 /* ---------------------------- 渲染 ---------------------------- */
 
@@ -588,9 +712,9 @@ function renderBadges(d) {
   badge("ttl", (d.ttl_seconds || 0) + "s");
   badge("长度", (d.template_length || 0) + " → 换 " + (d.replace_length || 0));
   badge("store_dir", d.store_dir || "—");
-  // 陈述当前页面的访问性质：查看数据匿名，任何改动 / 烧额度的动作都要密钥。
-  // 谁打开这个页面都该知道「能看到」不等于「有权操作」。
-  badge("访问", "只读不鉴权 · 操作需密钥", "open");
+  // 陈述访问性质：这个页面上的每一个动作都不鉴权 —— 看数据、四个操作、保存
+  // 探测范围。谁打开页面都该知道这条边界在哪：能摸到这个端口就能改这些。
+  badge("访问", "全程免密钥（本机 127.0.0.1）", "open");
 }
 
 function renderFreshness() {
@@ -618,21 +742,48 @@ function uniqueAuthIds(buckets) {
   return out;
 }
 
+// 去重但保留原顺序。模型列用它：models 在 config.yaml 里是人排过的顺序，
+// 排序会让矩阵的列跟配置文件对不上号。
+function uniqKeep(list) {
+  var seen = Object.create(null);
+  var out = [];
+  (list || []).forEach(function (x) {
+    if (x && !seen[x]) { seen[x] = true; out.push(x); }
+  });
+  return out;
+}
+
 function renderMatrix(d) {
-  var models = (d.models || []).slice();
   var buckets = d.buckets || [];
 
-  // 账号行取自 buckets 里出现过的 auth_id。缺的格子要占位，所以行列先定全，
-  // 再往里填，而不是只画 buckets 里有的那些。
-  var accounts = uniqueAuthIds(buckets);
+  // 矩阵就是探测范围：行 = probe_accounts，列 = models。配了范围就按范围画，
+  // 哪怕某个账号一个桶都没有 —— 「点了名却一个都没采到」正是要看的东西。
+  // 范围没配（或 .so 旧到不报 probe_accounts）时退回老行为：按状态报的账号画。
+  var cfgAccts = uniqSorted(strList(d.probe_accounts));
+  var cfgModels = uniqKeep(strList(d.models));
+  var seenAccts = uniqueAuthIds(buckets);
+  var seenModels = uniqSorted(bucketModels(buckets));
+
+  var rows = cfgAccts.length ? cfgAccts : seenAccts;
+  var cols = cfgModels.length ? cfgModels : seenModels;
+  // 范围外的行 / 列：store 里有桶，但不在清单里。照样画出来 —— 这类漂移
+  // （模型改了名、账号被摘掉）只有在这里能被看见。
+  var extraRows = cfgAccts.length
+    ? seenAccts.filter(function (a) { return rows.indexOf(a) < 0; }) : [];
+  var extraCols = cfgModels.length
+    ? seenModels.filter(function (m) { return cols.indexOf(m) < 0; }) : [];
+  var allRows = rows.concat(extraRows);
+  var allCols = cols.concat(extraCols);
 
   var byKey = Object.create(null);
   buckets.forEach(function (b) {
     if (b && b.auth_id && b.model) { byKey[b.auth_id + " " + b.model] = b; }
   });
 
-  var ready = 0;
-  var total = accounts.length * models.length;
+  var ready = 0;                  // 范围内就绪
+  var total = rows.length * cols.length;
+  var outsideReady = 0;           // 范围外但 store 里有的
+  var outsideTotal = 0;
 
   var table = $("matrix");
   clear(table);
@@ -640,25 +791,49 @@ function renderMatrix(d) {
   var thead = el("thead");
   var hr = el("tr");
   hr.appendChild(el("th", { text: "账号" }));
-  models.forEach(function (m) { hr.appendChild(el("th", { cls: "model", text: m })); });
+  allCols.forEach(function (m) {
+    var outside = cols.indexOf(m) < 0;
+    hr.appendChild(el("th", {
+      cls: "model" + (outside ? " outscope" : ""),
+      text: m,
+      attrs: outside ? { title: m + "\n不在 models 清单里 —— store 里有它的桶，但下一轮不会去采" } : { title: m }
+    }));
+  });
   thead.appendChild(hr);
   table.appendChild(thead);
 
   var tbody = el("tbody");
-  accounts.forEach(function (acct) {
+  allRows.forEach(function (acct) {
+    var rowOutside = rows.indexOf(acct) < 0;
     var tr = el("tr");
-    tr.appendChild(el("td", { cls: "acct", text: acct, attrs: { title: acct } }));
-    models.forEach(function (m) {
+    tr.appendChild(el("td", {
+      cls: "acct" + (rowOutside ? " outscope" : ""),
+      text: acct,
+      attrs: {
+        title: rowOutside
+          ? (acct + "\n不在 probe_accounts 里 —— store 里有它的桶，但下一轮不会去采")
+          : acct
+      }
+    }));
+    allCols.forEach(function (m) {
+      var outside = rowOutside || cols.indexOf(m) < 0;
       var b = byKey[acct + " " + m];
       var isReady = !!(b && b.ready);
       var left = b ? b.seconds_left : null;
-      if (isReady) { ready++; }
+      // 范围外的桶单独计数，不混进「就绪 x/y」—— 那个分数回答的是「这一轮要采的
+      // 采齐了没有」，把范围外的算进去会让它永远也到不了满分。
+      if (outside) {
+        if (b) { outsideTotal++; }
+        if (isReady) { outsideReady++; }
+      } else if (isReady) {
+        ready++;
+      }
       var cls = !isReady ? "st-miss" : (left !== null && left < 600 ? "st-warn" : "st-ok");
       var td = el("td", { cls: "cell" });
       var label = isReady ? fmtLeft(left) : "—";
-      var title = isReady
+      var title = (outside ? "【范围外】" : "") + (isReady
         ? (acct + " / " + m + "\n签发 " + fmtTime(b.issued_at) + "\n过期 " + fmtTime(b.expires_at) + "\n点击清空此桶")
-        : (acct + " / " + m + "\n缺失或已过期");
+        : (acct + " / " + m + "\n缺失或已过期"));
       var btn = el("button", {
         cls: cls, text: label,
         attrs: { type: "button", title: title },
@@ -683,14 +858,38 @@ function renderMatrix(d) {
   });
   table.appendChild(tbody);
 
+  // 目标桶数严格按 len(probe_accounts) × len(models) 算 —— 探测要采的就是这个
+  // 叉积。任何一边没配就给不出这个数，那时宁可写「—」并说清缺什么，也不要拿
+  // 别的数（比如 store 里已有的账号数）顶上去冒充目标。
+  var targetWhy = "";
+  if (!hasField(d, "probe_accounts")) {
+    targetWhy = "当前 .so 的 status 不报 probe_accounts";
+  } else if (!cfgAccts.length) {
+    targetWhy = "probe_accounts 是空的";
+  } else if (!cfgModels.length) {
+    targetWhy = "models 是空的";
+  }
+  var targetCount = targetWhy ? null : (cfgAccts.length * cfgModels.length);
+
   var s = $("summary");
   clear(s);
-  if (total === 0) {
-    s.appendChild(el("span", { text: "store 里还没有任何桶 —— 探测尚未跑过，或 store_dir 为空。" }));
+  if (allRows.length === 0 && allCols.length === 0) {
+    s.appendChild(el("span", { text: "既没有配探测范围，store 里也还没有任何桶 —— 探测尚未跑过，或 store_dir 为空。" }));
   } else {
     s.appendChild(el("span", { text: "就绪 " }));
     s.appendChild(el("b", { text: ready + "/" + total }));
-    s.appendChild(el("span", { text: "  （" + accounts.length + " 个账号 × " + models.length + " 个模型）" }));
+    s.appendChild(el("span", { text: "　目标桶数 " }));
+    s.appendChild(el("b", { text: targetCount === null ? "—" : String(targetCount) }));
+    s.appendChild(el("span", {
+      text: targetCount === null
+        ? ("（算不出来：" + targetWhy + "；矩阵按状态报的账号和模型画）")
+        : ("（" + cfgAccts.length + " 个账号 × " + cfgModels.length + " 个模型）")
+    }));
+    if (outsideTotal) {
+      s.appendChild(el("span", { text: "　另有 " }));
+      s.appendChild(el("b", { text: String(outsideTotal) }));
+      s.appendChild(el("span", { text: " 个范围外的桶（其中 " + outsideReady + " 个仍就绪），不计入上面的分数" }));
+    }
   }
 }
 
@@ -744,11 +943,485 @@ function renderSelftestModels(d) {
   if (prev) { sel.value = prev; }
 }
 
+/* ---------------------------- 探测范围 ---------------------------- */
+
+// 这三项是【探测范围】，不是业务开关：只决定下一轮探测去采哪些桶。业务端替不
+// 替换只看 store 里有没有桶，跟这里无关。
+//
+// 值的来源分两条，因为代理里可能带 userinfo（本插件配置里唯一的机密）：
+//   账号 / 模型 —— 匿名 status 就有，进页面即可勾选、直接保存。
+//   代理       —— 匿名 status 只给条数和掩码（socks5h://***@host:1080）。
+// 掩码是单向的：从 *** 推不回原值。所以代理是【只写】的 —— 框里永远显示掩码，
+// 整段重填才算改动；没动过时它逐字等于那串掩码，diff 为空，不会被提交。
+var PROBE_CMD = "python3 scripts/probe.py --until-complete";
+
+var scope = {
+  acctCandidates: [],
+  acctSelected: Object.create(null),
+  hasAccounts: false,       // status 里有没有 probe_accounts（旧 .so 没有）
+  modelCandidates: [],
+  modelSelected: Object.create(null),
+  extraModels: [],          // 手填进来、状态里还没有的模型 id
+  hasProxyFields: false,
+  // 只写：框里永远是掩码。整段重填才算改动，没动过时它逐字等于那串掩码。
+  // 读明文要密钥，而这个页面不碰密钥。
+  proxyText: "",
+  dirty: false,             // 人动过表单。动过之后轮询就不再覆盖它
+  acctSig: "",
+  modelSig: ""
+};
+
+function hasField(obj, k) {
+  return !!obj && Object.prototype.hasOwnProperty.call(obj, k);
+}
+
+// 服务端给的字符串列表原样取用：不 trim、不改大小写。这里的值是模型 id 和账号
+// 文件名，任何「顺手规范化」都会在保存时被当成一次真实改动写回配置。
+function strList(v) {
+  var out = [];
+  if (Array.isArray(v)) {
+    v.forEach(function (x) { if (typeof x === "string" && x !== "") { out.push(x); } });
+  }
+  return out;
+}
+
+function uniqSorted(list) {
+  var seen = Object.create(null);
+  var out = [];
+  (list || []).forEach(function (x) {
+    if (x && !seen[x]) { seen[x] = true; out.push(x); }
+  });
+  out.sort();
+  return out;
+}
+
+// 账号和模型是集合语义（勾选框排不出顺序），代理是序列语义（顺序就是尝试顺序）。
+function sameSet(a, b) {
+  if (a.length !== b.length) { return false; }
+  var x = a.slice().sort(), y = b.slice().sort();
+  for (var i = 0; i < x.length; i++) { if (x[i] !== y[i]) { return false; } }
+  return true;
+}
+
+function sameList(a, b) {
+  if (!a || !b || a.length !== b.length) { return false; }
+  for (var i = 0; i < a.length; i++) { if (a[i] !== b[i]) { return false; } }
+  return true;
+}
+
+// 一行一个，去掉空行和行首尾空白。不校验 URL、不补协议头 —— 合法性由插件判定并
+// 通过 config_errors 回报，前端擅自「修正」只会让人看不到真实的错。
+function parseLines(text) {
+  var out = [];
+  String(text === null || text === undefined ? "" : text).split(/\r?\n/).forEach(function (line) {
+    var s = line.trim();
+    if (s) { out.push(s); }
+  });
+  return out;
+}
+
+function looksMasked(s) { return String(s).indexOf("***") >= 0; }
+
+// 账号一侧能不能编辑，只取决于当前 .so 的 status 报不报 probe_accounts。
+// 旧 .so 不报时不要把复选框显示成「全都没勾」—— 那看着像人自己没选。
+function scopeAccountsEditable() { return scope.hasAccounts; }
+
+function selectedAccounts() {
+  return scope.acctCandidates.filter(function (a) { return !!scope.acctSelected[a]; });
+}
+
+function selectedModels() {
+  return scope.modelCandidates.filter(function (m) { return !!scope.modelSelected[m]; });
+}
+
+function bucketModels(buckets) {
+  var out = [];
+  (buckets || []).forEach(function (b) { if (b && b.model) { out.push(b.model); } });
+  return out;
+}
+
+// 每次刷新都跑。候选清单跟着状态走，但【人动过之后就不再覆盖已勾选的值】——
+// 10 秒一次的轮询把正在填的表单刷掉，是最容易让人存错东西的做法。
+function syncScope(d) {
+  scope.hasAccounts = hasField(d, "probe_accounts");
+  var cfgAccts = strList(d.probe_accounts);
+  // 点了名但一个桶都没有的账号也要出现在清单里，否则「我明明选了它」没处看。
+  scope.acctCandidates = uniqSorted(uniqueAuthIds(d.buckets).concat(cfgAccts));
+
+  var cfgModels = strList(d.models);
+  scope.modelCandidates = uniqSorted(cfgModels.concat(bucketModels(d.buckets), scope.extraModels));
+
+  scope.hasProxyFields = hasField(d, "probe_proxies_masked") || hasField(d, "probe_proxy_count");
+
+  if (scope.dirty) { return; }
+
+  var sel = Object.create(null);
+  cfgAccts.forEach(function (a) { sel[a] = true; });
+  scope.acctSelected = sel;
+
+  var msel = Object.create(null);
+  cfgModels.forEach(function (m) { msel[m] = true; });
+  scope.modelSelected = msel;
+
+  // 永远显示掩码：读明文那条路由要密钥，而这个页面不要密钥。框是可编辑的，
+  // 但语义是【只写】—— 整段重填才算改动，没动过时它逐字等于这串掩码，diff 为空。
+  scope.proxyText = strList(d.probe_proxies_masked).join("\n");
+}
+
+function checksSig(candidates, selected, disabled) {
+  return JSON.stringify([
+    candidates,
+    candidates.map(function (c) { return !!selected[c]; }),
+    !!disabled
+  ]);
+}
+
+// 只在清单或勾选真的变了时重建 DOM：每 10 秒把一排勾选框拆了重建，会把正在
+// 操作的人的焦点和滚动位置一起弄丢。
+function renderChecks(boxId, sigKey, candidates, selected, disabled, emptyText, onToggle) {
+  var sig = checksSig(candidates, selected, disabled);
+  if (scope[sigKey] === sig) { return; }
+  scope[sigKey] = sig;
+
+  var box = $(boxId);
+  box.className = "checks" + (disabled ? " disabled" : "");
+  clear(box);
+  if (!candidates.length) {
+    box.appendChild(el("div", { cls: "empty", text: emptyText }));
+    return;
+  }
+  candidates.forEach(function (name) {
+    var cb = el("input", { attrs: { type: "checkbox" } });
+    cb.checked = !!selected[name];
+    cb.disabled = !!disabled;
+    cb.addEventListener("change", function () { onToggle(name, cb.checked); });
+    // 账号名就是账号文件名，【可能含客户邮箱】。原样显示，不做二次查询、不显示
+    // 除文件名以外的任何账号信息，更不显示任何 token。
+    box.appendChild(el("label", { cls: "check" }, [
+      cb, el("span", { text: name, attrs: { title: name } })
+    ]));
+  });
+}
+
+function renderScopeChecks() {
+  var acctOff = !scopeAccountsEditable();
+  renderChecks("scopeAccounts", "acctSig", scope.acctCandidates, scope.acctSelected, acctOff,
+    "一个账号都没有 —— CPA 没报账号列表，store 也是空的。",
+    function (name, on) { scope.acctSelected[name] = on; onScopeEdited(); });
+  renderChecks("scopeModels", "modelSig", scope.modelCandidates, scope.modelSelected, false,
+    "清单是空的。用下面的输入框补一个模型 id。",
+    function (name, on) { scope.modelSelected[name] = on; onScopeEdited(); });
+}
+
+// 勾选之后不重建清单（会打断正在点的人），只把签名对齐，免得下一次轮询把它
+// 重建掉，然后更新那几处计数。
+function onScopeEdited() {
+  scope.dirty = true;
+  scope.acctSig = checksSig(scope.acctCandidates, scope.acctSelected, !scopeAccountsEditable());
+  scope.modelSig = checksSig(scope.modelCandidates, scope.modelSelected, false);
+  renderScopeMeta(state.data || {});
+}
+
+function renderScopeProxies() {
+  var ta = $("scopeProxies");
+  // 始终可写。只写语义见 syncScope：显示掩码，整段重填才算改动。
+  ta.readOnly = false;
+  // 正在输入时不要动它的值，否则光标会跳。输入事件已经把值同步进 scope 了。
+  if (document.activeElement !== ta && ta.value !== scope.proxyText) {
+    ta.value = scope.proxyText;
+  }
+}
+
+function renderScopeMeta(d) {
+  d = d || {};
+  var selA = selectedAccounts();
+  var selM = selectedModels();
+
+  var aNote = $("scopeAcctNote");
+  clear(aNote);
+  aNote.appendChild(el("span", {
+    text: scopeAccountsEditable()
+      ? ("已选 " + selA.length + " / 候选 " + scope.acctCandidates.length)
+      : "当前 .so 的 status 不报 probe_accounts，勾选已停用 —— 不把猜出来的范围存回去"
+  }));
+
+  var mNote = $("scopeModelNote");
+  clear(mNote);
+  mNote.appendChild(el("span", { text: "已选 " + selM.length + " / 候选 " + scope.modelCandidates.length }));
+
+  var pNote = $("scopeProxyNote");
+  clear(pNote);
+  var count = (typeof d.probe_proxy_count === "number") ? d.probe_proxy_count : null;
+  var pText;
+  if (scope.hasProxyFields) {
+    pText = "只写：显示掩码" + (count === null ? "" : ("，插件里共 " + count + " 条"));
+  } else {
+    pText = "当前 .so 的 status 不返回代理信息";
+  }
+  pNote.appendChild(el("span", { text: pText }));
+
+  var pHint = $("scopeProxyHint");
+  clear(pHint);
+  var lines = parseLines(scope.proxyText);
+  var notURL = lines.filter(function (l) { return !/^[a-z][a-z0-9+.\-]*:\/\//i.test(l); });
+  var maskedLines = lines.filter(looksMasked);
+  var baselineMasked = strList((state.data || {}).probe_proxies_masked);
+  var touched = !sameList(baselineMasked, lines);
+  pHint.className = "hint" + ((touched && maskedLines.length) || notURL.length ? " warn" : "");
+  var bits = [lines.length + " 行"];
+  if (!touched) {
+    bits.push("原样未动，这次保存【不会】提交代理");
+    bits.push("要改就整段重填成完整 URL —— 掩码推不回原值，所以这里只写不读");
+  } else {
+    bits.push("已整段重填，保存时会替换整个清单；顺序就是探测的尝试顺序");
+    if (maskedLines.length) {
+      bits.push("有 " + maskedLines.length + " 行还带着 ***，那是掩码不是真值，保存会被拦下");
+    }
+  }
+  if (notURL.length) {
+    bits.push(notURL.length + " 行不像 URL（少 scheme://）—— 照样提交，合法性由插件判，错了会出现在下面的配置错误里");
+  }
+  pHint.appendChild(el("span", { text: bits.join("；") + "。" }));
+
+  var dirty = $("scopeDirty");
+  clear(dirty);
+  dirty.className = "hint" + (scope.dirty ? " warn" : "");
+  // 账号那一侧读不到的时候，不要写「0 账号」—— 那看着像是人自己一个都没选。
+  dirty.appendChild(el("span", {
+    text: (scopeAccountsEditable()
+            ? ("表单：" + selA.length + " 账号 × " + selM.length + " 模型 = " +
+               (selA.length * selM.length) + " 个目标桶")
+            : ("表单：模型 " + selM.length + " 个；账号这一侧读不到，算不出目标桶数")) +
+          (scope.dirty ? " · 有未保存的改动" : " · 与当前配置一致")
+  }));
+
+  $("btnScopeReset").disabled = !scope.dirty;
+}
+
+// config_errors 的元素形状由插件决定，这里对字符串、对象和 map 都兜住 ——
+// 宁可显示一行 JSON，也不要因为形状没对上就把错误吞掉。
+function configErrorLines(d) {
+  var v = d ? d.config_errors : null;
+  var out = [];
+
+  function one(x) {
+    if (x === null || x === undefined) { return ""; }
+    if (typeof x === "string") { return x; }
+    if (typeof x === "object") {
+      var head = [];
+      ["field", "key", "name", "item", "value"].forEach(function (k) {
+        if (typeof x[k] === "string" && x[k]) { head.push(x[k]); }
+      });
+      var msg = "";
+      ["message", "error", "reason", "detail"].forEach(function (k) {
+        if (!msg && typeof x[k] === "string" && x[k]) { msg = x[k]; }
+      });
+      if (msg) { head.push(msg); }
+      if (head.length) { return head.join("："); }
+      try { return JSON.stringify(x); } catch (e) { return String(x); }
+    }
+    return String(x);
+  }
+
+  if (typeof v === "string") {
+    if (v) { out.push(v); }
+  } else if (Array.isArray(v)) {
+    v.forEach(function (x) { var s = one(x); if (s) { out.push(s); } });
+  } else if (v && typeof v === "object") {
+    Object.keys(v).forEach(function (k) {
+      var s = one(v[k]);
+      out.push(s ? (k + "：" + s) : k);
+    });
+  }
+  return out;
+}
+
+// 这块没有关闭按钮：它是一个【状态】而不是一条事件通知。关掉它，配置还是错的，
+// 而下一次轮询它又会回来 —— 不如一直挂着，直到配置改对。
+function renderScopeErrors(d) {
+  var box = $("scopeErrors");
+  var lines = configErrorLines(d);
+  var sig = lines.join("\u0000");
+  if (box.getAttribute("data-sig") === sig) { return; }
+  box.setAttribute("data-sig", sig);
+  clear(box);
+  if (!lines.length) { return; }
+
+  var msg = el("div", { cls: "msg" });
+  msg.appendChild(el("div", { text: "插件读配置时丢掉了这些条目 —— 它们不在探测范围里，但看起来像是在：" }));
+  lines.forEach(function (l) { msg.appendChild(el("div", { cls: "mono", text: "· " + l })); });
+  msg.appendChild(el("div", { text: "不致命：插件照常跑。但在改对之前，上面的目标桶数不是你以为的那个。" }));
+  box.appendChild(el("div", { cls: "notice warn" }, [msg]));
+}
+
+function renderScope(d) {
+  if (!d) { return; }
+  syncScope(d);
+  renderScopeChecks();
+  renderScopeProxies();
+  renderScopeMeta(d);
+  renderScopeErrors(d);
+}
+
+function addModelFromInput() {
+  var input = $("scopeModelAdd");
+  var raw = input.value.trim();   // 只去首尾空白（多半是粘贴带进来的），其余原样
+  if (!raw) { return; }
+  if (/\s/.test(raw)) {
+    notify("err", "模型 id 里不该有空白字符：" + raw + "。一次加一个。");
+    return;
+  }
+  var known = scope.modelCandidates.indexOf(raw) >= 0;
+  if (!known && scope.extraModels.indexOf(raw) < 0) { scope.extraModels.push(raw); }
+  var already = known && !!scope.modelSelected[raw];
+  scope.modelSelected[raw] = true;
+  scope.dirty = true;
+  input.value = "";
+  scope.modelSig = "";            // 清单变了，强制重建
+  if (state.data) { renderScope(state.data); }
+  notify("ok", already
+    ? (raw + " 本来就在清单里，已确保勾上。")
+    : ("已把 " + raw + " 加进清单（还没保存）。id 原样提交，大小写和横线一个字符都没动。"));
+}
+
+function scopeDiff(d) {
+  var patch = {};
+  var lines = [];
+
+  // 浅合并：只发改过的键。把没改的键一起发回去，等于拿页面上这份可能已经过时的
+  // 快照去覆盖配置 —— 别人刚在 config.yaml 里改的东西会被无声顶掉。
+  if (scopeAccountsEditable()) {
+    var baseA = strList(d.probe_accounts);
+    var nextA = selectedAccounts();
+    if (!sameSet(baseA, nextA)) {
+      patch.probe_accounts = nextA;
+      lines.push({ text: "账号：" + baseA.length + " → " + nextA.length + " 个" });
+    }
+  }
+
+  var baseM = strList(d.models);
+  var nextM = selectedModels();
+  if (!sameSet(baseM, nextM)) {
+    patch.models = nextM;
+    lines.push({ text: "模型：" + baseM.length + " → " + nextM.length + " 个" });
+  }
+
+  // 代理是【只写】的：框里显示的是掩码，读明文那条路由要密钥，而这个页面不要
+  // 密钥。所以判据不是「和明文比有没有变」，而是「操作员有没有整段重填过」——
+  // 没动过时框里就是那串掩码，逐字相等，diff 为空，什么都不提交。
+  //
+  // 代价是改代理要整段重打一遍。收益是密码从头到尾不经过任何匿名可读的路由。
+  var baseP = strList(d.probe_proxies_masked);
+  var nextP = parseLines(scope.proxyText);
+  if (!sameList(baseP, nextP)) {
+    patch.probe_proxies = nextP;
+    lines.push({ text: "代理：" + baseP.length + " → " + nextP.length + " 条（整段替换；顺序即尝试顺序，这里不显示内容）" });
+  }
+
+  return { patch: patch, lines: lines };
+}
+
+// 保存完成之后【不】自动做任何采集动作，只把该跑的命令给出来。
+// 复制出去的是一条不带任何凭据的命令：probe.py 的两把钥匙从环境变量读，代理在
+// 插件配置里 —— 两样都不该出现在剪贴板里。
+function noticeSaved() {
+  notify("ok", "保存完成。请在宿主上运行 scripts/probe.py --until-complete", {
+    copy: { text: PROBE_CMD, label: "复制命令" }
+  });
+}
+
+function doSaveScope() {
+  var d = state.data;
+  if (!d) { notify("err", "还没拿到状态，等一次刷新再保存。"); return; }
+
+  // 掩码是单向的。把 socks5h://***@host:1080 存回去会毁掉那条代理，而且毁得很
+  // 隐蔽：配置看着还在，探测却连不出去。
+  //
+  // 只在【代理真的被重填过】时拦。没动过的时候框里就是那串掩码，proxies 压根
+  // 不进 patch，拿它去拦账号和模型的改动是没道理的。
+  var baseMasked = strList(d.probe_proxies_masked);
+  var typed = parseLines(scope.proxyText);
+  if (!sameList(baseMasked, typed)) {
+    var masked = typed.filter(looksMasked);
+    if (masked.length) {
+      notify("err", "代理里有 " + masked.length + " 行还带着 ***。掩码是单向的，推不回原值，" +
+        "存回去会把那条代理毁掉，而且毁得很隐蔽：配置看着还在，探测却连不出去。" +
+        "所以这次什么都没发 —— 要改代理就把整段重填成完整 URL，要保持不变就把框还原成原来那串掩码（点「放弃改动」即可）。");
+      return;
+    }
+  }
+
+  var diff = scopeDiff(d);
+  var keys = Object.keys(diff.patch);
+  if (!keys.length) {
+    notify("info", "和当前配置一模一样，没有发出任何请求。");
+    return;
+  }
+
+  var finalA = diff.patch.probe_accounts || strList(d.probe_accounts);
+  var finalM = diff.patch.models || strList(d.models);
+  var lines = diff.lines.slice();
+  lines.push({ text: "保存后的目标桶数：" + finalA.length + " × " + finalM.length +
+                     " = " + (finalA.length * finalM.length) + " 个。" });
+  // 清空一侧不是「探测范围变成零」，而是「这一侧不再限定范围」—— 两者差得很远，
+  // 值得在按下去之前说清楚。
+  if (!finalA.length) {
+    lines.push({ text: "注意：probe_accounts 会变成空的。那不等于「不采任何账号」，而是这一项不再限定范围，矩阵退回按 CPA 报的账号列。", em: true });
+  }
+  if (!finalM.length) {
+    lines.push({ text: "注意：models 会变成空的。目标桶数从此算不出来，--until-complete 也没有清单可比对。", em: true });
+  }
+  lines.push({ text: "只发改动的键（" + keys.join("、") + "）。CPA 的 config 是浅合并，没列出的键不动。" });
+  lines.push({ text: "这只是改配置：不会开始采集，也不影响业务端的替换。采集要在宿主上跑 " + PROBE_CMD + "。" });
+
+  confirmDialog({
+    title: "保存探测范围？",
+    confirmText: "保存",
+    lines: lines
+  }).then(function (go) {
+    if (!go) { return; }
+    return withBusy(function () {
+      // 无密钥保存。走 RES 下的 /ops/scope：插件把范围写进【自己的】scope 文件，
+      // 不经过 CPA 那条鉴权的 config PATCH —— 宿主没给插件保存配置的接口，那条
+      // PATCH 是唯一的替代，而它要密钥，等于在这个页面上立一道门。
+      //
+      // fields 显式列出要替换哪几项。少了它，「把代理清空」和「这次没提交代理」
+      // 在 query 里长得一模一样，猜错就是把一串没有别处可恢复的凭据抹掉。
+      var fields = [];
+      var params = {};
+      if (diff.patch.probe_accounts) { fields.push("accounts"); params.account = diff.patch.probe_accounts; }
+      if (diff.patch.models) { fields.push("models"); params.model = diff.patch.models; }
+      if (diff.patch.probe_proxies) { fields.push("proxies"); params.proxy = diff.patch.probe_proxies; }
+      params.fields = fields.join(",");
+
+      return resAction("/ops/scope", params).then(function (r) {
+        if (r === null) { return; }
+        scope.dirty = false;
+        scope.extraModels = [];
+        scope.acctSig = "";
+        scope.modelSig = "";
+        noticeSaved();
+        return refresh();
+      });
+    }).catch(actionError);
+  });
+}
+
+function doResetScope() {
+  scope.dirty = false;
+  scope.extraModels = [];
+  scope.acctSig = "";
+  scope.modelSig = "";
+  if (state.data) { renderScope(state.data); }
+  notify("ok", "已放弃未保存的改动，表单退回当前配置。");
+}
+
 function render() {
   renderFreshness();
   if (!state.data) { return; }
   var d = state.data;
   renderBadges(d);
+  renderScope(d);
   renderMatrix(d);
   renderCounters(d);
   renderSelftestAuths(d);
@@ -766,7 +1439,6 @@ function refresh() {
     state.lastError = null;
     render();
   }).catch(function (err) {
-    if (err instanceof ApiError && handleAuthFailure(err)) { return; }
     // 关键：失败时不清 state.data。网络抖一下就把看板刷成空白，会让人以为
     // 桶全没了 —— 那正是最容易引发误操作的时刻。
     state.lastError = (err && err.message) ? err.message : String(err);
@@ -799,21 +1471,7 @@ function withBusy(fn) {
 }
 
 function actionError(err) {
-  if (err instanceof ApiError && handleAuthFailure(err)) { return; }
   notify("err", (err && err.message) ? err.message : String(err));
-}
-
-// 先确保有密钥再发。用户取消输入就当作放弃这次操作，返回 null 静默收场。
-// 四个动作（dry_run/role/clear/selftest）都经过这里，所以一次性密钥对它们统一。
-function authedSend(url, method, body, purpose) {
-  return ensureKey(purpose).then(function (key) {
-    if (!key) { return null; }
-    return mgmtSend(url, method, body);
-  });
-}
-
-function patchConfig(patch, purpose) {
-  return authedSend(CONFIG_API, "PATCH", patch, purpose);
 }
 
 function doToggleDryRun() {
@@ -841,10 +1499,7 @@ function doToggleDryRun() {
   p.then(function (go) {
     if (!go) { return; }
     return withBusy(function () {
-      return patchConfig({ dry_run: turningOn },
-        "要把 dry_run 改成 " + (turningOn ? "ON" : "OFF") + "。"
-      ).then(function (r) {
-        if (r === null) { return; }      // 用户没给密钥，放弃
+      return resAction("/ops/dry-run", { value: turningOn ? "on" : "off" }).then(function () {
         notify("ok", "dry_run 已切换为 " + (turningOn ? "ON（只记录）" : "OFF（改写真实流量）"));
         return refresh();
       });
@@ -869,8 +1524,7 @@ function doToggleRole() {
   }).then(function (go) {
     if (!go) { return; }
     return withBusy(function () {
-      return patchConfig({ role: next }, "要把 role 切到 " + next + "。").then(function (r) {
-        if (r === null) { return; }      // 用户没给密钥，放弃
+      return resAction("/ops/role", { value: next }).then(function () {
         notify("info", "role 已切到 " + next +
           "。若接下来发现钩子没被调用（probe 采不到 / business 不替换），重启一次 cli-proxy-api。");
         return refresh();
@@ -891,10 +1545,7 @@ function doClearBucket(auth, model) {
   }).then(function (go) {
     if (!go) { return; }
     return withBusy(function () {
-      return authedSend(MGMT_API + "/buckets/clear", "POST",
-        { auth_id: auth, model: model }, "要清空桶 " + auth + " / " + model + "。"
-      ).then(function (r) {
-          if (r === null) { return; }      // 用户没给密钥，放弃
+      return resAction("/ops/clear", { auth_id: auth, model: model }).then(function (r) {
           notify("ok", "已清空 " + (r && r.cleared !== undefined ? r.cleared : 1) + " 个桶：" + auth + " / " + model);
           return refresh();
         });
@@ -915,10 +1566,7 @@ function doClearAll() {
   }).then(function (go) {
     if (!go) { return; }
     return withBusy(function () {
-      return authedSend(MGMT_API + "/buckets/clear", "POST",
-        { all: true }, "要清空全部桶。"
-      ).then(function (r) {
-          if (r === null) { return; }      // 用户没给密钥，放弃
+      return resAction("/ops/clear", { all: "1" }).then(function (r) {
           notify("ok", "已清空 " + (r && r.cleared !== undefined ? r.cleared : "全部") + " 个桶。");
           return refresh();
         });
@@ -985,21 +1633,15 @@ function doSelfTest(opts) {
     lines: lines
   }).then(function (go) {
     if (!go) { return; }
-    var body = { model: model };
-    if (auth) { body.auth_id = auth; }
-    var purpose = auth
-      ? ("要对 " + auth + " / " + model + " 跑一次连通性自检（会烧额度）。")
-      : ("要对 " + model + " 跑一次连通性自检（会烧额度）。");
     return withBusy(function () {
-      return authedSend(MGMT_API + "/selftest", "POST", body, purpose)
+      // auth 为空时 qs 会把 auth_id 略掉，等于「由调度器选号」。
+      return resAction("/ops/selftest", { model: model, auth_id: auth || "" })
         .then(function (r) {
-          if (r === null) { return; }      // 用户没给密钥，放弃
           notify(selfTestKind(r), selfTestMessage(r, model));
           return refresh();
         });
     }).catch(function (err) {
-      if (err instanceof ApiError && handleAuthFailure(err)) { return; }
-      // 服务端的错误原文是排障线索，一律原样透出。400 = 模型名不在清单里。
+        // 服务端的错误原文是排障线索，一律原样透出。400 = 模型名不在清单里。
       var prefix = (err instanceof ApiError && err.status === 400)
         ? "自检未执行（模型名不被接受）："
         : "自检未执行：";
@@ -1009,13 +1651,6 @@ function doSelfTest(opts) {
 }
 
 /* ---------------------------- 启动 ---------------------------- */
-
-$("btnForget").addEventListener("click", function () {
-  state.key = null;
-  try { sessionStorage.removeItem(KEY_STORE); } catch (e) { /* 忽略 */ }
-  renderKeyState();
-  notify("ok", "已清除本标签页的管理密钥。下次改 dry_run / role 时会重新询问。");
-});
 
 $("btnPause").addEventListener("click", function () {
   state.paused = !state.paused;
@@ -1030,11 +1665,22 @@ $("btnClearAll").addEventListener("click", doClearAll);
 // 必须包一层：直接传 doSelfTest 会把 MouseEvent 当成 opts。
 $("btnSelftest").addEventListener("click", function () { doSelfTest(); });
 
+$("btnScopeSave").addEventListener("click", doSaveScope);
+$("btnScopeReset").addEventListener("click", doResetScope);
+$("btnAddModel").addEventListener("click", addModelFromInput);
+$("scopeModelAdd").addEventListener("keydown", function (e) {
+  if (e.key === "Enter") { e.preventDefault(); addModelFromInput(); }
+});
+$("scopeProxies").addEventListener("input", function () {
+  scope.proxyText = $("scopeProxies").value;
+  scope.dirty = true;
+  renderScopeMeta(state.data || {});
+});
+
 (function boot() {
-  // 没有登录门：直接拉数据渲染。sessionStorage 里若还留着密钥就捡回来，纯粹是
-  // 为了同一标签页内改 dry_run / role 时不再问第二次。
-  try { state.key = sessionStorage.getItem(KEY_STORE) || null; } catch (e) { state.key = null; }
-  renderKeyState();
+  // 没有登录门，也没有任何需要密钥的动作：看数据、四个操作、保存探测范围全部
+  // 走不鉴权的 resource 路由。代理是只写的 —— 框里显示掩码，要改就整段重填 ——
+  // 所以读明文那条鉴权路由这个页面从不调用。
   refresh().then(startPolling);
 })();
 </script>
