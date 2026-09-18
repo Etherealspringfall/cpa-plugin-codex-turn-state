@@ -1,10 +1,12 @@
 package main
 
 import (
+	"bytes"
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
 	"strings"
 	"testing"
@@ -109,6 +111,28 @@ func mustConfigure(t *testing.T, cfgYAML string) {
 	if err := configureYAML(t, cfgYAML); err != nil {
 		t.Fatalf("configure rejected a valid config: %v", err)
 	}
+}
+
+// captureLog redirects the standard logger for the duration of fn and returns
+// everything it wrote.
+//
+// It exists for the probe keys, which must never reach a log line. A log is the
+// one output that cannot be checked after the fact: by the time a test could
+// look, the line has already gone to stderr and into whatever collects it. The
+// flags are zeroed so an assertion reads the message rather than a timestamp.
+func captureLog(t *testing.T, fn func()) string {
+	t.Helper()
+	var buffer bytes.Buffer
+	previousWriter := log.Writer()
+	previousFlags := log.Flags()
+	log.SetOutput(&buffer)
+	log.SetFlags(0)
+	t.Cleanup(func() {
+		log.SetOutput(previousWriter)
+		log.SetFlags(previousFlags)
+	})
+	fn()
+	return buffer.String()
 }
 
 // resetPluginConfig restores the package-level config between tests. Store
@@ -820,4 +844,42 @@ func TestConfigureInjectModeValidation(t *testing.T) {
 			}
 		})
 	}
+}
+
+// probe_base_url defaults to CPA's own loopback listener, because the plugin runs
+// inside the process it probes. An explicitly empty value is pinned to the same
+// default rather than left blank: an empty base URL fails deep inside a probe run
+// as a transport error, which reads as "the upstream is down" when the truth is
+// "the setting is blank".
+func TestProbeBaseURLDefaultsToLoopback(t *testing.T) {
+	if got := defaultConfig().ProbeBaseURL; got != defaultProbeBaseURL {
+		t.Fatalf("defaultConfig().ProbeBaseURL = %q, want %q", got, defaultProbeBaseURL)
+	}
+
+	for name, cfgYAML := range map[string]string{
+		"absent":           "role: business\n",
+		"explicitly empty": "role: business\nprobe_base_url: \"\"\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			mustConfigure(t, cfgYAML)
+			state.mu.Lock()
+			got := state.config.ProbeBaseURL
+			state.mu.Unlock()
+			if got != defaultProbeBaseURL {
+				t.Fatalf("probe_base_url = %q, want the default %q", got, defaultProbeBaseURL)
+			}
+		})
+	}
+
+	// The control: a configured value is of course kept, or the two cases above
+	// would pass against a function that ignored the setting entirely.
+	t.Run("configured value wins", func(t *testing.T) {
+		mustConfigure(t, "role: business\nprobe_base_url: http://127.0.0.1:9317\n")
+		state.mu.Lock()
+		got := state.config.ProbeBaseURL
+		state.mu.Unlock()
+		if got != "http://127.0.0.1:9317" {
+			t.Fatalf("probe_base_url = %q, want the configured value", got)
+		}
+	})
 }

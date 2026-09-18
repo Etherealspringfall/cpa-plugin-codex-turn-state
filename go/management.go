@@ -7,7 +7,8 @@
 // operator. That decision is what shapes the two route kinds below.
 //
 //   - Everything the dashboard uses -- the HTML shell, the status document, and
-//     all four actions (dry_run, role, clear, selftest) -- is a ResourceRoute.
+//     every action it offers (dry_run, role, clear, selftest, scope save, probe
+//     start and probe cancel) -- is a ResourceRoute.
 //     Those are served under /v0/resource/plugins/<id>/ and the host does NOT
 //     authenticate them ("Resource requests are not management-authenticated" --
 //     pluginapi). The host also hard-restricts them to GET (ServeResourceHTTP
@@ -69,11 +70,14 @@ const (
 	// on, so both dispatch to handleStatus with no extra case. It exists so the
 	// dashboard can render on open, before the operator has entered any key.
 	routeStatusResource = "/status"
-	// routeConfig returns the probe scope with proxy URLs unmasked, so the
-	// dashboard can refill its editor with what is actually configured. It is the
-	// one route that emits a secret, which is why it has no resource alias: the
-	// anonymous prefix is what makes routeStatusResource readable without a key,
-	// and an alias here would do the same for the passwords.
+	// routeConfig returns the configuration verbatim. The dashboard no longer
+	// needs it -- the status document carries the proxy list in the clear now --
+	// but it stays exactly where it is, behind the management key and with no
+	// resource alias, because "the config, verbatim" is the shape any future
+	// secret lands in by default. probe_api_key and probe_management_key are
+	// already two such secrets, and neither is in configResponse for precisely
+	// that reason. An alias here would publish whatever this route grows next,
+	// with no error and no log line.
 	routeConfig = "/codex-turn-state/config"
 
 	// The keyless action routes. These are ResourceRoutes, so the host serves
@@ -101,6 +105,22 @@ const (
 	// and the route that would (PATCH /v0/management/plugins/<id>/config) is
 	// authenticated -- a key in front of the one screen that must not need one.
 	routeOpsScope = "/ops/scope"
+	// The probe runner's two controls, keyless like the rest of /ops and for the
+	// same reason: the whole point of running a probe from the dashboard is that
+	// nobody has to type a key to do it. The bearers the run itself needs come
+	// from probe_api_key and probe_management_key in the config, which is why
+	// neither route takes one and why neither response can ever echo one.
+	//
+	// Being in the resource list is deliberate, not incidental. A GET management
+	// route that declares a Menu is silently re-registered under the
+	// unauthenticated resource prefix (routeDeclaresLegacyMenuResource in the
+	// host), which is how a route ends up keyless by accident; these are keyless
+	// by choice, declared where keyless routes belong.
+	//
+	// Start spends real quota and cancel stops a run in flight, so both go through
+	// handleOpsResource and both require confirm=1.
+	routeOpsProbeStart  = "/ops/probe/start"
+	routeOpsProbeCancel = "/ops/probe/cancel"
 )
 
 // managementRegister answers management.register with the route table.
@@ -147,22 +167,28 @@ func managementRegister(raw []byte) ([]byte, error) {
 				Path:        routeStatusResource,
 				Description: "只读状态（无需鉴权），供看板拉取",
 			},
-			// The four keyless actions. Unauthenticated by virtue of the resource
+			// The keyless actions. Unauthenticated by virtue of the resource
 			// prefix, GET-only by the host's rule, guarded by confirm=1 rather than
-			// by a key. None carries a secret; the proxy editor is deliberately not
-			// here (it stays on routeConfig behind the key). No Menu: the dashboard
-			// fires these with fetch, they are not pages to navigate to.
+			// by a key. None of them echoes probe_api_key or probe_management_key,
+			// which are the only values on this plugin that are never displayed at
+			// all. No Menu: the dashboard fires these with fetch, they are not
+			// pages to navigate to.
 			{Path: routeOpsDryRun, Description: "翻转 dry_run（无需鉴权，需 confirm=1）"},
 			{Path: routeOpsRole, Description: "切换 role（无需鉴权，需 confirm=1）"},
 			{Path: routeOpsClear, Description: "清空桶（无需鉴权，需 confirm=1）"},
 			{Path: routeOpsSelftest, Description: "连通性自检（无需鉴权，需 confirm=1，烧额度）"},
-			// Saving the scope is keyless like the other four. Reading the proxy
-			// list back is NOT: routeConfig stays behind the key, because that
-			// response carries userinfo. The editor therefore shows proxies
-			// masked and treats the textarea as write-only -- changing them means
-			// retyping the list, which costs one retype and keeps the passwords
-			// off an anonymously readable route.
+			// Saving the scope is keyless like the other four, and so is reading
+			// the proxy list back: the status document now carries it in the
+			// clear (see statusResponse), at the operator's explicit instruction,
+			// because the write-only masked editor meant retyping every password
+			// on every scope edit. routeConfig stays behind the key regardless --
+			// see the comment there.
 			{Path: routeOpsScope, Description: "保存探测范围（无需鉴权，需 confirm=1）"},
+			// The probe runner's controls. Keyless and confirm=1 guarded like the
+			// rest of /ops; the run authenticates with the configured probe keys,
+			// so the operator never supplies one.
+			{Path: routeOpsProbeStart, Description: "启动探测运行（无需鉴权，需 confirm=1，烧额度）"},
+			{Path: routeOpsProbeCancel, Description: "取消探测运行（无需鉴权，需 confirm=1）"},
 		},
 	})
 }
@@ -187,10 +213,12 @@ func managementHandle(raw []byte) ([]byte, error) {
 		if method != http.MethodGet && method != "" {
 			return okEnvelope(managementError(http.StatusMethodNotAllowed, "config is a GET route"))
 		}
-		// The one route that is NOT keyless, and the only one that emits a
-		// secret. Everything the dashboard does works without a key; reading the
-		// proxy list back is the exception, so the page shows proxies masked and
-		// treats them as write-only.
+		// The one route that is NOT keyless. Everything the dashboard does works
+		// without a key, this route included -- the page stopped calling it when
+		// the status document started carrying the proxy list in the clear -- but
+		// it keeps its key because it returns the configuration verbatim, which is
+		// where the two probe bearers would surface if they were ever added to
+		// configResponse.
 		//
 		// The resource prefix is the unauthenticated one, so a request arriving
 		// through it means an alias was registered somewhere it should not have
@@ -213,7 +241,9 @@ func managementHandle(raw []byte) ([]byte, error) {
 		hasRouteSuffix(path, routeOpsRole),
 		hasRouteSuffix(path, routeOpsClear),
 		hasRouteSuffix(path, routeOpsSelftest),
-		hasRouteSuffix(path, routeOpsScope):
+		hasRouteSuffix(path, routeOpsScope),
+		hasRouteSuffix(path, routeOpsProbeStart),
+		hasRouteSuffix(path, routeOpsProbeCancel):
 		// The keyless actions. Reached only through the resource prefix (they are
 		// registered as resources, not management routes), so they arrive with a
 		// query and no body and no key; handleOpsResource enforces GET and
@@ -268,7 +298,7 @@ func handleDashboard() pluginapi.ManagementResponse {
 	}
 }
 
-// handleOpsResource dispatches the four keyless actions. It is reached only
+// handleOpsResource dispatches the keyless actions. It is reached only
 // through the resource prefix, so it has no key to check; instead it enforces the
 // two things that make a keyless GET action safe enough for a localhost-only
 // dashboard: the method really is GET, and confirm=1 is present so nothing fires
@@ -293,9 +323,64 @@ func handleOpsResource(path, method string, q url.Values) pluginapi.ManagementRe
 		return runSelftest(selftestRequestFromQuery(q))
 	case hasRouteSuffix(path, routeOpsScope):
 		return handleScopeSave(q)
+	case hasRouteSuffix(path, routeOpsProbeStart):
+		return handleProbeStartResource()
+	case hasRouteSuffix(path, routeOpsProbeCancel):
+		return handleProbeCancelResource()
 	default:
 		return managementError(http.StatusNotFound, "no such keyless action route")
 	}
+}
+
+// handleProbeStartResource starts a probe run and answers with the run's state.
+//
+// A start that fails because a run is already in flight is a 409, not a 400: the
+// request was well formed and the caller has nothing to fix, which is exactly
+// what a browser refresh or a double click produces, and 400 would send the
+// dashboard to the "your request is wrong" branch for something that is merely
+// "already happening".
+//
+// Which of the two it was is decided from the runner's own state rather than by
+// matching words in the error message. Message text is not a contract; a reword
+// on the runner's side would silently start returning 400 for a running probe,
+// and nothing would fail until an operator wondered why the page was complaining.
+// The narrow cost is that a run finishing between the failed start and this
+// snapshot reports 400 -- with the runner's own message attached either way.
+func handleProbeStartResource() pluginapi.ManagementResponse {
+	if errStart := probeRunStart(); errStart != nil {
+		status := http.StatusBadRequest
+		if probeRunSnapshot().Running {
+			status = http.StatusConflict
+		}
+		return managementError(status, errStart.Error())
+	}
+	// Freshly taken rather than assumed: the run is already going, so this is the
+	// first progress the page can show, and inventing a zeroed "about to start"
+	// state would be a claim about something we did not look at.
+	return jsonResponse(http.StatusOK, probeRunSnapshot())
+}
+
+// probeCancelResponse reports whether a cancel actually stopped anything, with
+// the resulting run state alongside. The two are separate answers: "there was
+// nothing to cancel" and "a run was cancelled" both end with a stopped runner,
+// and a page that only saw the end state could not tell the operator which of the
+// two their click did. The field is named probe_run to match the status document,
+// so one decoder reads both.
+type probeCancelResponse struct {
+	Cancelled bool          `json:"cancelled"`
+	ProbeRun  probeRunState `json:"probe_run"`
+}
+
+// handleProbeCancelResource asks the runner to stop. Cancelling when nothing is
+// running is not an error -- it is the state the caller wanted -- so it answers
+// 200 with cancelled=false rather than a 404 the dashboard would have to special
+// case.
+func handleProbeCancelResource() pluginapi.ManagementResponse {
+	cancelled := probeRunCancel()
+	return jsonResponse(http.StatusOK, probeCancelResponse{
+		Cancelled: cancelled,
+		ProbeRun:  probeRunSnapshot(),
+	})
 }
 
 // clearRequestFromQuery builds a clearRequest from the keyless clear route's
@@ -482,18 +567,42 @@ type statusResponse struct {
 	// and the unauthenticated /v0/resource/plugins/codex-turn-state/status. There
 	// is no per-route filtering: whatever is added here is public.
 	//
-	// That is why probe_proxies appears only as a count and a masked list. The
-	// raw list carries userinfo and lives behind the authenticated config route
-	// (handleConfig) instead. Adding a raw-proxy field here would publish
-	// passwords with no error and no log line, which is the failure this comment
-	// exists to prevent.
-	ProbeAccounts      []string `json:"probe_accounts"`
-	ProbeProxyCount    int      `json:"probe_proxy_count"`
-	ProbeProxiesMasked []string `json:"probe_proxies_masked"`
+	// probe_proxies used to appear here only as a count and a masked list. It no
+	// longer does, and the honest record of why:
+	//
+	//   - The operator asked for it, explicitly, after the masked field made the
+	//     editor unusable. A textarea seeded with "socks5h://***@exit:1080" can
+	//     only be saved by retyping every entry, so every scope edit cost the
+	//     whole proxy list -- which is what they were told to do, and refused.
+	//   - It is their system and their call. This comment records the change, not
+	//     an argument about it.
+	//   - The blast radius is "already on the box": CPA binds to 127.0.0.1 and is
+	//     reached through an SSH tunnel, so the reader of this document is someone
+	//     who could read config.yaml anyway.
+	//
+	// What that does NOT mean: this list is now readable by anything that can
+	// reach the plugin, keyless, including any other process on the host. Masking
+	// therefore stays everywhere else -- every log line and every configErrors
+	// complaint still goes through maskProxyURL, because a log is copied into
+	// tickets and chat windows and a status fetch is not.
+	//
+	// The rest of the rule is unchanged and is the part to keep: anything added
+	// here is public. probe_api_key and probe_management_key are consequently NOT
+	// here in any form, not even a masked one.
+	ProbeAccounts   []string `json:"probe_accounts"`
+	ProbeProxyCount int      `json:"probe_proxy_count"`
+	// ProbeProxies is plaintext, at the operator's explicit instruction. See
+	// above.
+	ProbeProxies []string `json:"probe_proxies"`
 	// ConfigErrors lists probe-scope entries that were rejected at configure
 	// time. They are not fatal, which is exactly why they need to be visible:
 	// the scope silently covers less than whoever edited it believes.
 	ConfigErrors []string `json:"config_errors,omitempty"`
+	// ProbeRun is the in-plugin probe runner's live progress, so the dashboard can
+	// poll one document instead of two. Anonymously readable like everything else
+	// here, which is the constraint on what the runner may put in Lines: progress
+	// and outcomes, never a key and never a template value.
+	ProbeRun probeRunState `json:"probe_run"`
 }
 
 // statusAccount is one credential row of the readiness matrix.
@@ -533,18 +642,28 @@ func handleStatus() pluginapi.ManagementResponse {
 		GeneratedAt:    now.UTC().Format(time.RFC3339),
 		Buckets:        []statusBucket{},
 		ProbeAccounts:  append([]string(nil), cfg.ProbeAccounts...),
-		// Count and masks only -- see the comment on these fields. maskProxyURL
-		// is the single place a proxy becomes displayable, so there is one thing
-		// to audit rather than one per call site.
-		ProbeProxyCount:    len(cfg.ProbeProxies),
-		ProbeProxiesMasked: maskProxyURLs(cfg.ProbeProxies),
-		ConfigErrors:       configErrors,
+		// Plaintext, at the operator's explicit instruction -- see the comment on
+		// the field. The count stays alongside it because the page reads it
+		// without having to count a list it may be rendering lazily.
+		ProbeProxyCount: len(cfg.ProbeProxies),
+		ProbeProxies:    append([]string(nil), cfg.ProbeProxies...),
+		ConfigErrors:    configErrors,
+		// Taken outside state.mu on purpose: the runner keeps its own lock, and
+		// reaching for it while holding this one is how two locks become a
+		// deadlock. Nothing above needs the two views to be consistent with each
+		// other.
+		ProbeRun: probeRunSnapshot(),
 	}
 	if out.Models == nil {
 		out.Models = []string{}
 	}
 	if out.ProbeAccounts == nil {
 		out.ProbeAccounts = []string{}
+	}
+	// [] rather than null: the page assigns this straight into its editor, and a
+	// null would render as the string "null" in the textarea.
+	if out.ProbeProxies == nil {
+		out.ProbeProxies = []string{}
 	}
 
 	records, errScan := scanStoreRecords(cfg.StoreDir)
@@ -673,11 +792,15 @@ func handleStatus() pluginapi.ManagementResponse {
 
 // configResponse is the editable configuration, proxies included verbatim.
 //
-// This is the only response in this file that carries a secret. It exists
-// because the dashboard has to refill its editor with the real values -- a form
-// seeded from masked strings would write "***" back over the passwords on the
-// first save. Keeping it on its own route, rather than adding the field to
-// statusResponse, is what confines the exposure to an authenticated caller.
+// It exists because the dashboard used to refill its editor from here -- a form
+// seeded from masked strings writes "***" back over the passwords on the first
+// save. The status document now carries the proxy list itself, so the page no
+// longer calls this at all; it is kept as the keyed view of the configuration.
+//
+// What it must never grow: probe_api_key or probe_management_key. Those are not
+// editable from anywhere and are not displayed anywhere, so there is nothing for
+// a form to refill, and a field here would be a secret one accidental resource
+// alias away from being anonymous.
 type configResponse struct {
 	Role           string   `json:"role"`
 	StoreDir       string   `json:"store_dir"`

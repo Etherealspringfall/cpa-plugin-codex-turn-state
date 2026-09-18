@@ -257,6 +257,22 @@ select {
 .hint code { font-size: 11.5px; padding: 1px 4px; border-radius: 3px;
              background: var(--raised); border: 1px solid var(--border); }
 
+/* ---------- 探测进度 ---------- */
+/* 固定高度而不是随内容长高：一轮探测会滚出几十行，让整页跟着抻长会把下面的
+   桶矩阵一直推出视口。空的时候整块收起来，不留一条空边框。 */
+#probeLines:empty { display: none; }
+#probeLines {
+  margin-top: 10px; max-height: 190px; overflow-y: auto;
+  border: 1px solid var(--border); border-radius: 6px; background: var(--raised);
+  padding: 8px 10px;
+}
+#probeLines p {
+  margin: 0 0 4px; font-size: 12px; line-height: 1.5; color: var(--muted);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  white-space: pre-wrap; word-break: break-word;
+}
+#probeLines p:last-child { margin-bottom: 0; color: var(--fg); }
+
 /* ---------- 通知 ---------- */
 .notice {
   border-radius: 7px; padding: 9px 12px; margin-bottom: 10px; font-size: 13px;
@@ -371,10 +387,8 @@ select {
           <span class="hint" id="scopeDirty"></span>
         </div>
         <div class="hint">
-          <b>这里没有「一键采集」按钮，也不可能有。</b>
-          宿主会让插件自己发出的请求跳过本插件的响应钩子（和连通性自检同一个原因），
-          所以从这个页面发出的任何请求都产生不了桶。保存范围只是改配置，
-          采集要到宿主上跑 <code>scripts/probe.py --until-complete</code>。
+          保存范围只是改配置，不会开始采集。要采就用下面<b>「操作」</b>里的
+          <b>开始探测</b> —— 不需要开终端，也不需要任何密钥。
         </div>
       </div>
     </div>
@@ -400,6 +414,26 @@ select {
   </section>
 
   <section>
+    <h2>探测</h2>
+    <div class="card">
+      <div class="row">
+        <button class="btn primary" id="btnProbeStart" type="button">开始探测</button>
+        <button class="btn danger" id="btnProbeCancel" type="button">停止</button>
+        <span class="spacer"></span>
+        <span class="hint" id="probeProgress"></span>
+      </div>
+      <div id="probeLines"></div>
+      <div class="hint">
+        按探测范围逐个桶采集：每次只启用被探的那一个账号（CPA 的调度器自己挑号，
+        这是把采到的令牌归属到已知账号的唯一办法），按代理清单顺序换出口，
+        每个桶发一条最小请求。<b class="warntext">会消耗额度。</b>
+        跑之前应当先停掉业务流量。结束时账号启用状态和 <code>proxy_url</code> 会自动还原
+        —— 先还原出口再还原启用位，顺序反了会把日常流量送进探测代理。
+      </div>
+    </div>
+  </section>
+
+  <section>
     <h2>操作</h2>
     <div class="card">
       <div class="row">
@@ -417,7 +451,7 @@ select {
         <div class="hint">
           只验证「请求能否打到上游、上游回了什么状态码」。<b>不会产生桶</b> ——
           宿主会让插件自己发出的请求跳过本插件的响应钩子，所以自检永远采不到模板，
-          采集只能用 <code>scripts/probe.py</code>。<b class="warntext">会消耗额度。</b>
+          采集用上面「探测」里的「开始探测」。<b class="warntext">会消耗额度。</b>
           定向到具体账号时<b>不需要</b>停用其它账号；也可以在桶矩阵里 hover 任一格子，
           用右上角的角标直接自检那对（账号, 模型）。
         </div>
@@ -454,6 +488,7 @@ var state = {
   lastError: null,    // 最近一次刷新失败的原因
   paused: false,
   timer: null,
+  pollMs: 0,          // 当前轮询间隔。探测进行中会自动收紧，见 retunePolling
   busy: false
 };
 
@@ -624,14 +659,18 @@ function confirmDialog(opts) {
 // 这个页面不持有、不索取、也不发送任何管理密钥。每一条它调用的路由都在
 // /v0/resource/plugins/codex-turn-state/ 下面，宿主对那个前缀不做鉴权：
 //
-//   status          只读数据
-//   ops/dry-run     ops/role     ops/clear     ops/selftest
-//   ops/scope       保存探测范围
+//   status                只读数据
+//   ops/dry-run           ops/role          ops/clear       ops/selftest
+//   ops/scope             保存探测范围
+//   ops/probe/start       ops/probe/cancel  插件内探测
 //
-// 代理是唯一的机密，它的明文只在鉴权的 management /config 上回传，而这个页面
-// 【从不调用那条路由】—— 代理框显示掩码、只写，要改就整段重填。这就是为什么
-// 这里没有 ensureKey / setKey / mgmtSend 之类的东西：不是忘了写，是不能有。
-// 任何在这里重新引入密钥输入的改动，都请先回去看 management.go 顶部那段。
+// 这就是为什么这里没有 ensureKey / setKey / mgmtSend 之类的东西：不是忘了写，
+// 是不能有。任何在这里重新引入密钥输入的改动，都请先回去看 management.go 顶部。
+//
+// 代理明文现在【也走 status】，是操作员明确要求的：之前显示掩码，代价是改一条
+// 代理就得把整个池子重打一遍，那个编辑框基本没法用。所以这份清单现在对任何够得
+// 到本插件的东西都是可读的 —— CPA 只绑 127.0.0.1，能读到的前提是已经在这台机器
+// 上。探测自己要用的两把钥匙放在插件配置里，页面既不显示也不经手。
 
 // ApiError 携带服务端原话。403 的原因有好几种（远程管理关闭、IP 被封 30 分钟），
 // 自己改写成「失败」会把排障线索丢掉，所以一律原样透出。
@@ -953,7 +992,6 @@ function renderSelftestModels(d) {
 //   代理       —— 匿名 status 只给条数和掩码（socks5h://***@host:1080）。
 // 掩码是单向的：从 *** 推不回原值。所以代理是【只写】的 —— 框里永远显示掩码，
 // 整段重填才算改动；没动过时它逐字等于那串掩码，diff 为空，不会被提交。
-var PROBE_CMD = "python3 scripts/probe.py --until-complete";
 
 var scope = {
   acctCandidates: [],
@@ -963,8 +1001,7 @@ var scope = {
   modelSelected: Object.create(null),
   extraModels: [],          // 手填进来、状态里还没有的模型 id
   hasProxyFields: false,
-  // 只写：框里永远是掩码。整段重填才算改动，没动过时它逐字等于那串掩码。
-  // 读明文要密钥，而这个页面不碰密钥。
+  // 明文。status 直接回传原值，所以这里就是真值，没动过时 diff 为空。
   proxyText: "",
   dirty: false,             // 人动过表单。动过之后轮询就不再覆盖它
   acctSig: "",
@@ -1051,7 +1088,7 @@ function syncScope(d) {
   var cfgModels = strList(d.models);
   scope.modelCandidates = uniqSorted(cfgModels.concat(bucketModels(d.buckets), scope.extraModels));
 
-  scope.hasProxyFields = hasField(d, "probe_proxies_masked") || hasField(d, "probe_proxy_count");
+  scope.hasProxyFields = hasField(d, "probe_proxies") || hasField(d, "probe_proxy_count");
 
   if (scope.dirty) { return; }
 
@@ -1063,9 +1100,10 @@ function syncScope(d) {
   cfgModels.forEach(function (m) { msel[m] = true; });
   scope.modelSelected = msel;
 
-  // 永远显示掩码：读明文那条路由要密钥，而这个页面不要密钥。框是可编辑的，
-  // 但语义是【只写】—— 整段重填才算改动，没动过时它逐字等于这串掩码，diff 为空。
-  scope.proxyText = strList(d.probe_proxies_masked).join("\n");
+  // 明文回填。这里曾经显示掩码，代价是每次想改一条代理都得把整个池子重打一遍
+  // —— 操作员明确要求改掉。status 现在直接回传原值，所以框里就是真值：没动过
+  // 时 diff 为空，改一行也就只是改一行。
+  scope.proxyText = strList(d.probe_proxies).join("\n");
 }
 
 function checksSig(candidates, selected, disabled) {
@@ -1154,7 +1192,7 @@ function renderScopeMeta(d) {
   var count = (typeof d.probe_proxy_count === "number") ? d.probe_proxy_count : null;
   var pText;
   if (scope.hasProxyFields) {
-    pText = "只写：显示掩码" + (count === null ? "" : ("，插件里共 " + count + " 条"));
+    pText = "明文显示可直接编辑" + (count === null ? "" : ("，插件里共 " + count + " 条"));
   } else {
     pText = "当前 .so 的 status 不返回代理信息";
   }
@@ -1165,18 +1203,19 @@ function renderScopeMeta(d) {
   var lines = parseLines(scope.proxyText);
   var notURL = lines.filter(function (l) { return !/^[a-z][a-z0-9+.\-]*:\/\//i.test(l); });
   var maskedLines = lines.filter(looksMasked);
-  var baselineMasked = strList((state.data || {}).probe_proxies_masked);
-  var touched = !sameList(baselineMasked, lines);
-  pHint.className = "hint" + ((touched && maskedLines.length) || notURL.length ? " warn" : "");
+  var baseline = strList((state.data || {}).probe_proxies);
+  var touched = !sameList(baseline, lines);
+  pHint.className = "hint" + (maskedLines.length || notURL.length ? " warn" : "");
   var bits = [lines.length + " 行"];
   if (!touched) {
-    bits.push("原样未动，这次保存【不会】提交代理");
-    bits.push("要改就整段重填成完整 URL —— 掩码推不回原值，所以这里只写不读");
+    bits.push("与插件里的一致，这次保存【不会】提交代理");
   } else {
-    bits.push("已整段重填，保存时会替换整个清单；顺序就是探测的尝试顺序");
-    if (maskedLines.length) {
-      bits.push("有 " + maskedLines.length + " 行还带着 ***，那是掩码不是真值，保存会被拦下");
-    }
+    bits.push("保存时会替换整个清单；顺序就是探测的尝试顺序");
+  }
+  if (maskedLines.length) {
+    // 明文回填之后，带 *** 的行只可能是从旧版本页面复制过来的掩码。存回去会
+    // 毁掉那条代理，而且毁得很隐蔽：配置看着还在，探测却连不出去。
+    bits.push("有 " + maskedLines.length + " 行带着 ***，那是旧版的掩码不是真值，保存会被拦下");
   }
   if (notURL.length) {
     bits.push(notURL.length + " 行不像 URL（少 scheme://）—— 照样提交，合法性由插件判，错了会出现在下面的配置错误里");
@@ -1306,12 +1345,9 @@ function scopeDiff(d) {
     lines.push({ text: "模型：" + baseM.length + " → " + nextM.length + " 个" });
   }
 
-  // 代理是【只写】的：框里显示的是掩码，读明文那条路由要密钥，而这个页面不要
-  // 密钥。所以判据不是「和明文比有没有变」，而是「操作员有没有整段重填过」——
-  // 没动过时框里就是那串掩码，逐字相等，diff 为空，什么都不提交。
-  //
-  // 代价是改代理要整段重打一遍。收益是密码从头到尾不经过任何匿名可读的路由。
-  var baseP = strList(d.probe_proxies_masked);
+  // 代理现在是明文回填的，所以判据就是最朴素的那个：和插件里的值逐行比。
+  // 没动过 diff 就是空的，什么都不提交；动过就整段替换。
+  var baseP = strList(d.probe_proxies);
   var nextP = parseLines(scope.proxyText);
   if (!sameList(baseP, nextP)) {
     patch.probe_proxies = nextP;
@@ -1321,34 +1357,24 @@ function scopeDiff(d) {
   return { patch: patch, lines: lines };
 }
 
-// 保存完成之后【不】自动做任何采集动作，只把该跑的命令给出来。
-// 复制出去的是一条不带任何凭据的命令：probe.py 的两把钥匙从环境变量读，代理在
-// 插件配置里 —— 两样都不该出现在剪贴板里。
+// 保存完成之后【不】自动开始采集。范围改了就去点「开始探测」——
+// 保存和采集是两件事，把它们绑在一起会让人改一个模型名就烧掉一轮额度。
 function noticeSaved() {
-  notify("ok", "保存完成。请在宿主上运行 scripts/probe.py --until-complete", {
-    copy: { text: PROBE_CMD, label: "复制命令" }
-  });
+  notify("ok", "保存完成。要采集就点下面「探测」里的「开始探测」。");
 }
 
 function doSaveScope() {
   var d = state.data;
   if (!d) { notify("err", "还没拿到状态，等一次刷新再保存。"); return; }
 
-  // 掩码是单向的。把 socks5h://***@host:1080 存回去会毁掉那条代理，而且毁得很
-  // 隐蔽：配置看着还在，探测却连不出去。
-  //
-  // 只在【代理真的被重填过】时拦。没动过的时候框里就是那串掩码，proxies 压根
-  // 不进 patch，拿它去拦账号和模型的改动是没道理的。
-  var baseMasked = strList(d.probe_proxies_masked);
-  var typed = parseLines(scope.proxyText);
-  if (!sameList(baseMasked, typed)) {
-    var masked = typed.filter(looksMasked);
-    if (masked.length) {
-      notify("err", "代理里有 " + masked.length + " 行还带着 ***。掩码是单向的，推不回原值，" +
-        "存回去会把那条代理毁掉，而且毁得很隐蔽：配置看着还在，探测却连不出去。" +
-        "所以这次什么都没发 —— 要改代理就把整段重填成完整 URL，要保持不变就把框还原成原来那串掩码（点「放弃改动」即可）。");
-      return;
-    }
+  // 框里现在是明文，所以带 *** 的行只可能是从旧版页面复制来的掩码。掩码是单向
+  // 的，存回去会毁掉那条代理，而且毁得很隐蔽：配置看着还在，探测却连不出去。
+  var masked = parseLines(scope.proxyText).filter(looksMasked);
+  if (masked.length) {
+    notify("err", "代理里有 " + masked.length + " 行带着 ***。那是旧版页面的掩码，不是真值，" +
+      "推不回原值；存回去会把那条代理毁掉，而且毁得很隐蔽：配置看着还在，探测却连不出去。" +
+      "所以这次什么都没发 —— 把那几行换成完整 URL，或者点「放弃改动」退回插件里的当前值。");
+    return;
   }
 
   var diff = scopeDiff(d);
@@ -1372,7 +1398,7 @@ function doSaveScope() {
     lines.push({ text: "注意：models 会变成空的。目标桶数从此算不出来，--until-complete 也没有清单可比对。", em: true });
   }
   lines.push({ text: "只发改动的键（" + keys.join("、") + "）。CPA 的 config 是浅合并，没列出的键不动。" });
-  lines.push({ text: "这只是改配置：不会开始采集，也不影响业务端的替换。采集要在宿主上跑 " + PROBE_CMD + "。" });
+  lines.push({ text: "这只是改配置：不会开始采集，也不影响业务端的替换。采集要点「开始探测」。" });
 
   confirmDialog({
     title: "保存探测范围？",
@@ -1416,6 +1442,76 @@ function doResetScope() {
   notify("ok", "已放弃未保存的改动，表单退回当前配置。");
 }
 
+/* ---------------------------- 探测进度 ---------------------------- */
+
+// 旧的 .so 不返回 probe_run。那种情况下按钮要停用并说清楚原因，而不是让人点了
+// 之后拿到一个 404 —— 「这个版本没有这个功能」和「这次请求失败了」是两回事。
+function probeRunOf(d) {
+  var r = d ? d.probe_run : null;
+  return (r && typeof r === "object") ? r : null;
+}
+
+function elapsedText(startedAt) {
+  var t = Date.parse(startedAt || "");
+  if (!t) { return ""; }
+  var secs = Math.max(0, Math.round((Date.now() - t) / 1000));
+  if (secs < 60) { return secs + " 秒"; }
+  return Math.floor(secs / 60) + " 分 " + (secs % 60) + " 秒";
+}
+
+function renderProbeRun(d) {
+  var run = probeRunOf(d);
+  var start = $("btnProbeStart");
+  var cancel = $("btnProbeCancel");
+  var note = $("probeProgress");
+  clear(note);
+
+  if (!run) {
+    start.disabled = true;
+    cancel.disabled = true;
+    note.className = "hint warn";
+    note.appendChild(el("span", { text: "当前 .so 的 status 不返回 probe_run —— 这个版本还没有插件内探测，换成新的 .so 并重启 CPA 才有。" }));
+    clear($("probeLines"));
+    return;
+  }
+
+  var running = !!run.running;
+  // 探测跑起来之后范围就定死了，此时再存范围只会让人以为改动生效了。
+  start.disabled = running || state.busy;
+  cancel.disabled = !running;
+  start.textContent = running ? "探测进行中…" : "开始探测";
+
+  var total = Number(run.total) || 0;
+  var done = Number(run.done) || 0;
+  var bits = [];
+  if (running) {
+    bits.push(done + " / " + total + " 个桶");
+    if (run.current) { bits.push("正在：" + run.current); }
+    var el0 = elapsedText(run.started_at);
+    if (el0) { bits.push("已跑 " + el0); }
+  } else if (run.finished_at) {
+    bits.push("上一轮：" + done + " / " + total + " 个桶");
+  } else {
+    bits.push("尚未跑过");
+  }
+  note.className = "hint" + (run.error ? " warn" : "");
+  if (run.error) { bits.push("错误：" + run.error); }
+  note.appendChild(el("span", { text: bits.join(" · ") }));
+
+  var box = $("probeLines");
+  var lines = strList(run.lines);
+  // 只在内容真的变了时重建：两秒一次把节点全拆了重建，会把人正在看的滚动位置
+  // 顶掉。签名比整段 DOM 便宜得多。
+  var sig = lines.join("\n");
+  if (box.getAttribute("data-sig") === sig) { return; }
+  box.setAttribute("data-sig", sig);
+  var atBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 24;
+  clear(box);
+  lines.forEach(function (line) { box.appendChild(el("p", { text: line })); });
+  // 人往回翻的时候不要把他拽回底部；贴着底看的时候才跟着滚。
+  if (atBottom) { box.scrollTop = box.scrollHeight; }
+}
+
 function render() {
   renderFreshness();
   if (!state.data) { return; }
@@ -1424,6 +1520,7 @@ function render() {
   renderScope(d);
   renderMatrix(d);
   renderCounters(d);
+  renderProbeRun(d);
   renderSelftestAuths(d);
   renderSelftestModels(d);
   $("btnDryRun").textContent = d.dry_run ? "关闭 dry_run（开始改写流量）" : "开启 dry_run（停止改写）";
@@ -1432,12 +1529,28 @@ function render() {
 
 /* ---------------------------- 轮询 ---------------------------- */
 
+// 探测跑起来的时候 10 秒一刷太钝：进度条几乎不动，人会以为卡死了。跑完之后要
+// 退回原来的节奏，否则页面开一天就是几万次无谓请求。这里【复用同一个定时器】，
+// 再开一个只会让两条时间线互相打架。
+function desiredPollMs() {
+  var run = probeRunOf(state.data);
+  return (run && run.running) ? 2000 : POLL_MS;
+}
+
+function retunePolling() {
+  var want = desiredPollMs();
+  if (want === state.pollMs) { return; }
+  state.pollMs = want;
+  if (state.timer) { startPolling(); }
+}
+
 function refresh() {
   return resGet("/status").then(function (d) {
     state.data = d;
     state.lastGood = new Date();
     state.lastError = null;
     render();
+    retunePolling();
   }).catch(function (err) {
     // 关键：失败时不清 state.data。网络抖一下就把看板刷成空白，会让人以为
     // 桶全没了 —— 那正是最容易引发误操作的时刻。
@@ -1451,7 +1564,7 @@ function startPolling() {
   if (state.paused) { return; }
   state.timer = setInterval(function () {
     if (!state.busy) { refresh(); }
-  }, POLL_MS);
+  }, state.pollMs || POLL_MS);
 }
 
 function stopPolling() {
@@ -1574,6 +1687,63 @@ function doClearAll() {
   });
 }
 
+function doProbeStart() {
+  var d = state.data;
+  if (!d) { notify("err", "还没拿到状态，等一次刷新再开始。"); return; }
+
+  var accounts = strList(d.probe_accounts);
+  var models = strList(d.models);
+  var proxies = Number(d.probe_proxy_count) || 0;
+  var pending = (Number(d.targets_total) || 0) - (Number(d.targets_ready) || 0);
+
+  var lines = [];
+  lines.push({ text: "范围：" + accounts.length + " 账号 × " + models.length + " 模型；" +
+                     "已就绪的桶会跳过，这一轮大约要采 " + Math.max(0, pending) + " 个。" });
+  lines.push({ text: "出口：" + (proxies ? (proxies + " 条代理，按清单顺序逐条试") : "没有配代理，直接用账号当前的出口") });
+  lines.push({ text: "跑的时候每次只启用被探的那一个账号 —— CPA 的调度器自己挑号，" +
+                     "这是把采到的令牌归属到已知账号的唯一办法。请先停掉业务流量。", em: true });
+  lines.push({ text: "会消耗额度：每个还没就绪的桶至少一条上游请求。", em: true });
+  lines.push({ text: "结束（含中途停止）时会自动还原：先还原 proxy_url，再还原账号启用位。" });
+  if (d.role !== "probe") {
+    lines.push({ text: "注意：当前 role 是 " + (d.role || "—") + "，不是 probe。插件会拒绝这次请求。", em: true });
+  }
+
+  confirmDialog({
+    title: "开始探测？",
+    danger: true,
+    confirmText: "开始探测",
+    lines: lines
+  }).then(function (go) {
+    if (!go) { return; }
+    return withBusy(function () {
+      return resAction("/ops/probe/start", {}).then(function () {
+        notify("ok", "探测已开始。进度就在这一节里，页面会自动加快刷新。");
+        return refresh();
+      });
+    }).catch(actionError);
+  });
+}
+
+function doProbeCancel() {
+  confirmDialog({
+    title: "停止探测？",
+    danger: true,
+    confirmText: "停止",
+    lines: [
+      { text: "已经采到的桶会留下，没采的这一轮就不采了。" },
+      { text: "账号启用位和 proxy_url 仍然会被还原 —— 停止不会把账号留在探测态。" }
+    ]
+  }).then(function (go) {
+    if (!go) { return; }
+    return withBusy(function () {
+      return resAction("/ops/probe/cancel", {}).then(function () {
+        notify("info", "已要求停止。正在还原账号状态，稍等一次刷新。");
+        return refresh();
+      });
+    }).catch(actionError);
+  });
+}
+
 // 自检的结果有两个独立维度，UI 上必须分开呈现：
 //   reached      —— 请求有没有打到上游并拿到响应（链路/协议层面）
 //   status_code  —— 上游回的真实状态码（账号/配额层面）
@@ -1600,7 +1770,7 @@ function selfTestMessage(r, model) {
   } else {
     lines.push("账号：未知 —— 未指定账号时无法得知实际用了哪个号（CPA 的响应不携带账号标识）");
   }
-  lines.push("落盘：否 —— 自检不产生桶，采集请用 scripts/probe.py");
+  lines.push("落盘：否 —— 自检不产生桶，采集请用「开始探测」");
   if (r && r.note) { lines.push(String(r.note)); }
   if (r && r.error) { lines.push("错误：" + String(r.error)); }
   return lines.join("\n");
@@ -1617,7 +1787,7 @@ function doSelfTest(opts) {
   var lines = [
     { text: "会向上游真实发一次请求，消耗额度。" },
     { text: "只验证链路是否打通，不会产生桶：宿主会让插件自己发出的请求跳过本插件的响应钩子，所以自检永远采不到模板。", em: true },
-    { text: "要真正采集模板，用 scripts/probe.py。" }
+    { text: "要真正采集模板，用「开始探测」。" }
   ];
   if (auth) {
     lines.push({ text: "定向到 " + auth + "。定向自检不需要停用其它账号。" });
@@ -1659,6 +1829,8 @@ $("btnPause").addEventListener("click", function () {
   renderFreshness();
 });
 
+$("btnProbeStart").addEventListener("click", doProbeStart);
+$("btnProbeCancel").addEventListener("click", doProbeCancel);
 $("btnDryRun").addEventListener("click", doToggleDryRun);
 $("btnRole").addEventListener("click", doToggleRole);
 $("btnClearAll").addEventListener("click", doClearAll);

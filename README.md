@@ -251,18 +251,23 @@ gpt-6-astra
 本身就是线索），**解析不了的返回固定占位符而不是原值** —— 解析失败的那条往往正
 是密码里混了怪字符的那条。
 
-#### ⚠️ 现状：这台 CPA 上代理轮换还开不起来
+#### per-account 代理：读写都走哪里
 
-2026-09-18 实测：`GET /v0/management/auth-files` 的条目里**没有任何 per-account
-代理字段**（字段名按字母序输出，`proxy_url` 该在 `provider` 和 `quota` 之间，
-那里是空的）。
+```
+写   PATCH /v0/management/auth-files/fields      {"name":…, "proxy_url":…, "auth_index":…}
+读   GET   /v0/management/auth-files/download?name=…
+```
 
-后果是 `probe.py` 既无法确认写入生效，**也无法快照账号原来的出口**，也就无法恢
-复。所以配了 `probe_proxies` 时它会**拒绝开跑**，而不是盲切。
+**读回不能用列表接口。** `GET /v0/management/auth-files` 的条目里没有 `proxy_url`
+（CPA 7.3.4 的列表 DTO 不带它）—— 早先据此断言「这台 CPA 不支持 per-account 代
+理」是错的：字段在**账号文件本身**里，下载那条路由读得到。2026-09-18 已在 CPA
+v7.3.4 上实测打通，`probe.py` 的日志会打出 `(verified by read-back)`。
 
-要启用这个功能，得先确认这台 CPA 到底支不支持 per-account 代理、字段名是什么，
-再改 `CPA.PROXY_ROUTE` / `CPA.PROXY_FIELD`。在那之前把 `probe_proxies` 留空，
-走各账号现有出口，其余功能不受影响。
+写完**必须读回确认**。一条返回 200 却没生效的 PATCH，表现成「每个出口都采不到
+292」，而真因是出口压根没换过 —— 那会把一整个停服窗口浪费在查上游上。所以读回
+对不上时直接中止整轮，而不是当成「这个代理不行」记一笔继续。
+
+全局 `proxy-url` **永远不碰**：它承载 Kimi、xAI 和全部日常流量。
 
 ### `inject_mode`
 

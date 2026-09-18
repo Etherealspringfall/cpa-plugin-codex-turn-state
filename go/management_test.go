@@ -21,7 +21,13 @@ const (
 	mgmtStatusPath   = "/v0/management/codex-turn-state/status"
 	mgmtClearPath    = "/v0/management/codex-turn-state/buckets/clear"
 	mgmtSelftestPath = "/v0/management/codex-turn-state/selftest"
+	mgmtConfigPath   = "/v0/management/codex-turn-state/config"
 	mgmtResourcePath = "/v0/resource/plugins/codex-turn-state/"
+
+	// The probe runner's controls, on the unauthenticated resource prefix where
+	// the rest of the keyless actions live.
+	opsProbeStartPath  = mgmtResourcePath + "ops/probe/start"
+	opsProbeCancelPath = mgmtResourcePath + "ops/probe/cancel"
 )
 
 // --- wire shapes ---------------------------------------------------------
@@ -86,6 +92,12 @@ type mgmtStatus struct {
 	AccountsError  string       `json:"accounts_error"`
 	StoreError     string       `json:"store_error"`
 	Counters       mgmtCounters `json:"counters"`
+	ProbeAccounts  []string     `json:"probe_accounts"`
+	// ProbeProxies is plaintext, and that is the contract now rather than an
+	// oversight -- see TestStatusShowsProbeProxiesInTheClear for why it changed
+	// and what still stays masked. ProbeProxyCount survived the change.
+	ProbeProxyCount int      `json:"probe_proxy_count"`
+	ProbeProxies    []string `json:"probe_proxies"`
 }
 
 type mgmtClearResult struct {
@@ -2100,5 +2112,200 @@ func TestStatusMarksExpiredBucketsNotReady(t *testing.T) {
 	expired, ok := mgmtBucketByKey(status, "codex-alpha.json", "gpt-5.6-sol")
 	if ok && expired.Ready {
 		t.Error("an expired bucket is reported ready; the page would show it as usable and --until-complete would stop early")
+	}
+}
+
+// --- 9. the probe scope's secrets, and the one that stopped being one -----
+//
+// Three values live in the probe scope that nothing else does: the proxy list,
+// which is now published in the clear on purpose, and the two bearers the probe
+// runner uses, which are published nowhere at all. Both halves are pinned below,
+// because they are easy to confuse and the second is what makes the first
+// survivable.
+
+const (
+	// Distinctive on purpose: the assertions below check these strings appear
+	// nowhere, so they must not collide with anything a formatter might emit.
+	testProbeAPIKey        = "sk-probe-api-never-show-me"
+	testProbeManagementKey = "mk-probe-management-never-show-me"
+)
+
+// probeConfigWithSecrets is probeRoleConfig plus every secret-bearing probe
+// field: a proxy carrying a password (testProxyWithPW, probe_scope_test.go) and
+// the two bearers. One fixture drives both halves of the contract -- the proxy
+// list rendered verbatim, the two keys rendered nowhere.
+func probeConfigWithSecrets(dir string) string {
+	return probeRoleConfig(dir) + fmt.Sprintf(`probe_accounts:
+  - codex-a.json
+probe_proxies:
+  - %s
+probe_api_key: %s
+probe_management_key: %s
+`, testProxyWithPW, testProbeAPIKey, testProbeManagementKey)
+}
+
+// The proxy list is served in the clear, which is a deliberate reversal of what
+// this document used to do. The masked field made the editor write-only: a
+// textarea seeded with "socks5h://***@exit:1080" can only be saved by retyping
+// every entry, so every scope edit cost the whole proxy list. The operator
+// instructed that it show the real values.
+//
+// What this pins is the reversal itself, so a later "surely this should be
+// masked" tidy-up breaks loudly rather than quietly restoring the unusable
+// editor. Masking everywhere else is covered by probe_scope_test.go and by
+// TestProbeKeysAreNeverDisplayedOrLogged below.
+func TestStatusShowsProbeProxiesInTheClear(t *testing.T) {
+	dir := t.TempDir()
+	mustConfigure(t, probeConfigWithSecrets(dir))
+
+	status := mustManagementStatus(t)
+	if status.ProbeProxyCount != 1 {
+		t.Fatalf("probe_proxy_count = %d, want 1; the count stays alongside the list", status.ProbeProxyCount)
+	}
+	if len(status.ProbeProxies) != 1 || status.ProbeProxies[0] != testProxyWithPW {
+		t.Fatalf("probe_proxies = %v, want the configured entry verbatim", status.ProbeProxies)
+	}
+
+	// The anonymous resource path serves the same document, and it is the route
+	// that actually publishes this. Asserting only the keyed path would miss the
+	// half that matters.
+	resp := driveManagement(t, http.MethodGet, mgmtResourcePath+"status", nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("anonymous status returned %d, want 200 (body: %s)", resp.StatusCode, truncateMgmtLog(resp.Body))
+	}
+	var anonymous mgmtStatus
+	if err := json.Unmarshal(resp.Body, &anonymous); err != nil {
+		t.Fatalf("decode anonymous status: %v", err)
+	}
+	if len(anonymous.ProbeProxies) != 1 || anonymous.ProbeProxies[0] != testProxyWithPW {
+		t.Fatalf("anonymous probe_proxies = %v, want the same verbatim entry", anonymous.ProbeProxies)
+	}
+
+	// The field that was replaced must be gone rather than kept alongside: a
+	// page reading the old name would show masks while the real values sat in
+	// the same document, which is the worst of both.
+	if strings.Contains(string(resp.Body), "probe_proxies_masked") {
+		t.Error("status still carries probe_proxies_masked; the masked field was replaced, not supplemented")
+	}
+}
+
+// The two probe keys exist so the dashboard can start a run without anyone
+// typing a key. That only holds up if the keys themselves never come back out:
+// the status document is anonymously readable, and a configure log line gets
+// copied into tickets. Neither may carry one in any form -- there is no masked
+// rendering of these, because no caller has any business seeing one.
+func TestProbeKeysAreNeverDisplayedOrLogged(t *testing.T) {
+	dir := t.TempDir()
+
+	// configure is the only place the keys are read, so its log line is the one
+	// that could leak them.
+	logged := captureLog(t, func() { mustConfigure(t, probeConfigWithSecrets(dir)) })
+	if strings.TrimSpace(logged) == "" {
+		t.Fatal("configure logged nothing; the leak assertions below would prove nothing")
+	}
+	for _, secret := range []string{testProbeAPIKey, testProbeManagementKey} {
+		if strings.Contains(logged, secret) {
+			t.Error("the configure log line carried a probe key verbatim")
+		}
+	}
+	// Presence, and only presence. "Is it configured at all" is the one question
+	// an operator answers from a log; anything more is a hint.
+	for _, want := range []string{"probe_api_key=set", "probe_management_key=set"} {
+		if !strings.Contains(logged, want) {
+			t.Errorf("the configure log line does not report %q, so a missing key would be invisible: %s", want, logged)
+		}
+	}
+
+	// Every place the configuration is rendered: both status routes, and the
+	// keyed config route, which returns the configuration verbatim and is the
+	// one most likely to grow a field by accident.
+	for name, path := range map[string]string{
+		"management status": mgmtStatusPath,
+		"anonymous status":  mgmtResourcePath + "status",
+		"config":            mgmtConfigPath,
+	} {
+		resp := driveManagement(t, http.MethodGet, path, nil)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("%s returned %d, want 200 (body: %s)", name, resp.StatusCode, truncateMgmtLog(resp.Body))
+		}
+		if len(resp.Body) == 0 {
+			t.Fatalf("%s body is empty; the assertions below would prove nothing", name)
+		}
+		body := string(resp.Body)
+		for _, secret := range []string{testProbeAPIKey, testProbeManagementKey} {
+			if strings.Contains(body, secret) {
+				t.Errorf("%s leaked a probe key", name)
+			}
+		}
+		// The field name matters as much as the value. A key rendered as "" or
+		// as "***" reads as "nothing configured" while the plugin is in fact
+		// holding one, and it invites the next person to fill the field in for
+		// real.
+		for _, field := range []string{"probe_api_key", "probe_management_key"} {
+			if strings.Contains(body, field) {
+				t.Errorf("%s carries a %q field; these are never displayed, not even empty or masked", name, field)
+			}
+		}
+	}
+}
+
+// The probe runner's two controls are keyless by choice -- the whole point of
+// the button is that nobody types a key to press it -- so they must be
+// resources. Being GETs that spend quota and stop a run in flight, they must
+// also refuse to fire without confirm=1, or a bare navigation or a link prefetch
+// could do either.
+func TestProbeRunRoutesAreKeylessResourcesGuardedByConfirm(t *testing.T) {
+	dir := t.TempDir()
+	mustConfigure(t, probeConfigWithSecrets(dir))
+
+	reg := driveManagementRegister(t)
+	if len(reg.Resources) == 0 {
+		t.Fatal("no resources declared; this test would pass vacuously")
+	}
+	resources := make(map[string]mgmtRoute, len(reg.Resources))
+	for _, res := range reg.Resources {
+		resources[res.Path] = res
+	}
+	managementRoutes := make(map[string]bool, len(reg.Routes))
+	for _, route := range reg.Routes {
+		managementRoutes[route.Path] = true
+	}
+
+	for _, path := range []string{"/ops/probe/start", "/ops/probe/cancel"} {
+		res, ok := resources[path]
+		if !ok {
+			t.Errorf("%s is not registered as a resource, so it would demand a management key the dashboard does not have", path)
+			continue
+		}
+		// A Menu on a GET route is what demotes one to the resource prefix by
+		// accident. These belong there on purpose, and a Menu would also
+		// misrepresent them as pages to navigate to.
+		if strings.TrimSpace(res.Menu) != "" {
+			t.Errorf("%s declares Menu %q; it is fetched by the page, not navigated to", path, res.Menu)
+		}
+		if managementRoutes[path] {
+			t.Errorf("%s is also a management route; a keyless action must live only on the unauthenticated prefix", path)
+		}
+	}
+
+	// Asserted again here, beside the routes being added: adding a route is
+	// exactly when the config route gets copied into the resource list by
+	// mistake, and that response returns the configuration verbatim.
+	for _, res := range reg.Resources {
+		if strings.HasSuffix(res.Path, "/config") {
+			t.Errorf("config route %q is registered as a resource; it must stay behind the management key", res.Path)
+		}
+	}
+
+	for _, path := range []string{opsProbeStartPath, opsProbeCancelPath} {
+		resp := driveResource(t, path, url.Values{})
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Errorf("GET %s without confirm=1 returned %d, want 400 (body: %s)", path, resp.StatusCode, truncateMgmtLog(resp.Body))
+		}
+	}
+	// And nothing started. A refused request that still kicked off a run would
+	// be the exact failure confirm=1 exists to prevent.
+	if snapshot := probeRunSnapshot(); snapshot.Running {
+		t.Error("a probe run is in flight after two requests that were refused for lack of confirm=1")
 	}
 }

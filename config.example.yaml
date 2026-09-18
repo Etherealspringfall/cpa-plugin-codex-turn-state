@@ -124,15 +124,31 @@ plugins:
       #
       # ⚠️ 两条硬规矩：
       #   1. 【绝不】改全局 proxy-url —— 那条线上跑着 Kimi、xAI 和所有日常流量。
-      #   2. 这里的值带密码，是本段配置里唯一的机密。它【不会】出现在匿名
-      #      status、日志或 index.json 里，只以 socks5h://***@host:port 的
-      #      形式露出；完整值只在鉴权的 GET /v0/management/codex-turn-state/config
-      #      里回传，供看板回填。不要把真实密码提交进 git 或贴进聊天。
+      #   2. 这里的值带密码。日志、index.json、决策行里它只以
+      #      socks5h://***@host:port 的形式露出 —— 那些会被复制进工单。
+      #      但 status 从 2026-09-18 起**回传明文**（见下），所以别把真实密码
+      #      提交进 git 或贴进聊天。
       #
-      # ⚠️ 现状（2026-09-18）：CPA 的 auth-files 接口【不回显】任何 per-account
-      #    代理字段，所以 probe.py 无法确认写入是否生效、也无法快照原值用于恢复。
-      #    在这种情况下配了 probe_proxies 会被【拒绝开跑】。要用这个功能，
-      #    先确认这台 CPA 到底支不支持 per-account 代理、字段名是什么。
+      # 关于明文：看板的代理编辑框原先显示掩码，代价是想改一条就得把整个池子
+      # 重打一遍，基本没法用。所以 status 现在直接回传原值。status 是不鉴权的，
+      # 也就是说这份清单对任何够得到本插件的东西都可读 —— CPA 只绑 127.0.0.1，
+      # 前提是已经在这台机器上。这是权衡后的选择，不是疏漏。
       probe_proxies: []
       #  - socks5h://user:pass@exit-1.example:1080
       #  - http://user:pass@exit-2.example:8080
+
+      # ---- 看板里那个「开始探测」按钮要用的三项 ----
+      #
+      # 插件自己跑探测需要两把钥匙。它们写在这里【只写一次】，就是为了让看板
+      # 上点一下就能跑 —— 页面既不显示也不索取任何密钥。
+      #
+      # 为什么插件不能用 host.model.execute 去发请求：宿主会给插件自己发出的
+      # 请求打上 SkipInterceptorPluginID，那条请求永远不会回到本插件的响应钩子，
+      # 所以【采不到任何东西】（连通性自检采不到，就是同一个原因）。插件因此必须
+      # 像 probe.py 一样，向 CPA 自己的 /v1/responses 发一条真请求，走正常拦截链。
+      #
+      # 这两个值比代理更机密：它们【不出现在任何地方】—— 不进 status、不进
+      # /config、不进日志，连掩码形式都没有。日志里只说 set / unset。
+      probe_api_key: ""            # 打 POST /v1/responses 用
+      probe_management_key: ""     # 改账号启用位和 proxy_url 用
+      probe_base_url: http://127.0.0.1:8317

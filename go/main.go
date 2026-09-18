@@ -309,11 +309,38 @@ type pluginConfig struct {
 	// harvested on one IP to be used from another: the exit only has to be good
 	// for the few seconds it takes to mint the token.
 	//
-	// These values may carry userinfo, which makes them the only secret in this
-	// config. Everything that renders them goes through maskProxyURL; nothing
-	// reads them but the probe script, over the authenticated config route.
+	// These values may carry userinfo. Everything that logs or complains about
+	// them goes through maskProxyURL; the status document now reports them in the
+	// clear at the operator's explicit instruction (see statusResponse).
 	ProbeProxies []string `yaml:"probe_proxies"`
+	// The three fields below exist for one reason: so the dashboard can run a
+	// probe without the operator ever typing a key. That was the requirement, not
+	// a convenience -- a run needs a bearer for the upstream call and a bearer for
+	// the management calls, and prompting for both on every run is exactly the
+	// friction the keyless dashboard exists to remove. Typing them into an
+	// anonymously readable page would be worse than leaving them in config.yaml,
+	// so they live here and are read only by the probe runner.
+	//
+	// ProbeAPIKey is the Bearer for POST /v1/responses.
+	// ProbeManagementKey is the Bearer for /v0/management/*.
+	//
+	// Both are secrets, and are held to a stricter rule than the proxy list ever
+	// was: they never reach a log line (the configure line says set/unset and
+	// nothing else), never reach statusResponse, and never reach configResponse.
+	// There is no masked rendering of them anywhere, because there is no caller
+	// that has any business seeing one.
+	ProbeAPIKey        string `yaml:"probe_api_key"`
+	ProbeManagementKey string `yaml:"probe_management_key"`
+	// ProbeBaseURL is where the probe runner sends both. It defaults to CPA's own
+	// loopback listener because the plugin runs inside CPA: a probe talks to the
+	// process hosting it, not out across the network.
+	ProbeBaseURL string `yaml:"probe_base_url"`
 }
+
+// defaultProbeBaseURL is CPA's own loopback listener. It is the default rather
+// than a required setting because the overwhelmingly common case -- the only one
+// deployed -- is the plugin probing the process it is loaded into.
+const defaultProbeBaseURL = "http://127.0.0.1:8317"
 
 func defaultConfig() pluginConfig {
 	return pluginConfig{
@@ -326,6 +353,7 @@ func defaultConfig() pluginConfig {
 		InjectMode:     "replace-only",
 		DryRun:         false,
 		LogDecisions:   true,
+		ProbeBaseURL:   defaultProbeBaseURL,
 	}
 }
 
@@ -384,6 +412,19 @@ func maskProxyURL(raw string) string {
 		return "<unparsable proxy url>"
 	}
 	return marker + "***@" + out[len(marker):]
+}
+
+// secretPresence renders a secret for a log line, and "set" or "unset" is the
+// entire vocabulary. It exists for probe_api_key and probe_management_key, which
+// are never displayed anywhere -- not even masked. A length or a first-few-
+// characters rendering is the obvious alternative and is rejected for the same
+// reason maskProxyURL rejects it: both are hints, and the only question an
+// operator ever has to answer from a log is whether the key is configured at all.
+func secretPresence(value string) string {
+	if strings.TrimSpace(value) == "" {
+		return "unset"
+	}
+	return "set"
 }
 
 // maskProxyURLs masks a whole list, preserving order so a masked entry can be
@@ -652,6 +693,20 @@ func configure(raw []byte) error {
 	}
 	cfg.Role = role
 	cfg.StoreDir = strings.TrimSpace(cfg.StoreDir)
+	// Trimmed for the same reason store_dir is: a YAML value that picked up a
+	// trailing newline or a stray space would be sent as part of the bearer and
+	// come back as a 401, which reads as "the key is wrong" rather than "the key
+	// has whitespace on it".
+	cfg.ProbeAPIKey = strings.TrimSpace(cfg.ProbeAPIKey)
+	cfg.ProbeManagementKey = strings.TrimSpace(cfg.ProbeManagementKey)
+	// An explicitly empty probe_base_url is pinned to the default rather than left
+	// empty: an absent key already yields the default (defaultConfig supplies it
+	// before the unmarshal), so letting `probe_base_url: ""` mean something
+	// different would be a distinction nobody intends, and it would surface as a
+	// transport error deep inside a probe run.
+	if cfg.ProbeBaseURL = strings.TrimSpace(cfg.ProbeBaseURL); cfg.ProbeBaseURL == "" {
+		cfg.ProbeBaseURL = defaultProbeBaseURL
+	}
 
 	if cfg.TemplateLength < 1 {
 		return fmt.Errorf("template_length must be greater than zero")
@@ -741,10 +796,17 @@ func configure(raw []byte) error {
 		templates = "templates cleared"
 	}
 	// Counts, not contents. probe_proxies may carry userinfo, so the only safe
-	// thing to say about it in a log line is how many there are.
-	log.Printf(logPrefix+"configured role=%s store_dir=%q template_length=%d replace_length=%d ttl_seconds=%d dry_run=%t inject_mode=%s harvest_inband=%t models=%d probe_accounts=%d probe_proxies=%d scope_from=%s (%s)",
+	// thing to say about it in a log line is how many there are -- that rule is
+	// unchanged by the status document now showing them, because a log is copied
+	// into tickets and chat windows and the status document is not.
+	//
+	// The two probe keys get less than that: set or unset, via secretPresence.
+	// probe_base_url is not a secret and is printed, because "the probe cannot
+	// reach CPA" is diagnosed from exactly that value.
+	log.Printf(logPrefix+"configured role=%s store_dir=%q template_length=%d replace_length=%d ttl_seconds=%d dry_run=%t inject_mode=%s harvest_inband=%t models=%d probe_accounts=%d probe_proxies=%d probe_base_url=%q probe_api_key=%s probe_management_key=%s scope_from=%s (%s)",
 		cfg.Role, cfg.StoreDir, cfg.TemplateLength, cfg.ReplaceLength, cfg.TTLSeconds, cfg.DryRun, cfg.InjectMode, cfg.HarvestInband,
-		len(cfg.Models), len(cfg.ProbeAccounts), len(cfg.ProbeProxies), scopeSource, templates)
+		len(cfg.Models), len(cfg.ProbeAccounts), len(cfg.ProbeProxies), cfg.ProbeBaseURL,
+		secretPresence(cfg.ProbeAPIKey), secretPresence(cfg.ProbeManagementKey), scopeSource, templates)
 	for _, problem := range scopeProblems {
 		// One line each, and loud: a dropped scope entry means the next probe run
 		// covers less than whoever edited the config believes it does.
@@ -768,6 +830,12 @@ func configure(raw []byte) error {
 // the scope on the dashboard is the commonest reason this function runs at all,
 // and clearing there would throw away live templates every time the operator
 // ticked a box.
+//
+// probe_api_key, probe_management_key and probe_base_url are absent for the same
+// reason and more plainly still: they say how the next probe run authenticates
+// and where it sends its requests. Rotating a key says nothing about whether a
+// template already harvested is still the genuine article, so a rotation must not
+// cost the buckets on hand.
 func templatesInvalidatedBy(oldCfg, newCfg pluginConfig) bool {
 	return oldCfg.TemplateLength != newCfg.TemplateLength ||
 		oldCfg.ReplaceLength != newCfg.ReplaceLength ||
@@ -888,7 +956,22 @@ func pluginRegistration() registration {
 				{
 					Name:        "probe_proxies",
 					Type:        pluginapi.ConfigFieldTypeArray,
-					Description: "Ordered exits the probe tries per bucket, applied to the probed account's own proxy_url. PROBE SCOPE ONLY; never read by the business path. May contain credentials, so it is masked everywhere it is displayed and never logged.",
+					Description: "Ordered exits the probe tries per bucket, applied to the probed account's own proxy_url. PROBE SCOPE ONLY; never read by the business path. May contain credentials, so it is masked in every log line; the status document shows it in the clear at the operator's explicit request.",
+				},
+				{
+					Name:        "probe_api_key",
+					Type:        pluginapi.ConfigFieldTypeString,
+					Description: "Bearer the probe runner sends to POST /v1/responses. PROBE SCOPE ONLY; never read by the business path. It exists so a probe can be started from the dashboard without anyone typing a key, and it is NEVER displayed: not on the status page, not in the config response, not in a log line (which reports only set/unset).",
+				},
+				{
+					Name:        "probe_management_key",
+					Type:        pluginapi.ConfigFieldTypeString,
+					Description: "Bearer the probe runner sends to /v0/management/*. PROBE SCOPE ONLY; never read by the business path. Same rule as probe_api_key: it exists so the dashboard needs no key from the operator, and it is NEVER displayed anywhere, masked or otherwise.",
+				},
+				{
+					Name:        "probe_base_url",
+					Type:        pluginapi.ConfigFieldTypeString,
+					Description: "Where the probe runner sends both of the above (default http://127.0.0.1:8317, CPA's own loopback listener). PROBE SCOPE ONLY; never read by the business path. Not a secret.",
 				},
 			},
 		},
