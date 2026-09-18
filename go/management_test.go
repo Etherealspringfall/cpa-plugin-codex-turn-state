@@ -2133,22 +2133,20 @@ func TestStatusMarksExpiredBucketsNotReady(t *testing.T) {
 const (
 	// Distinctive on purpose: the assertions below check these strings appear
 	// nowhere, so they must not collide with anything a formatter might emit.
-	testProbeAPIKey        = "sk-probe-api-never-show-me"
 	testProbeManagementKey = "mk-probe-management-never-show-me"
 )
 
 // probeConfigWithSecrets is probeRoleConfig plus every secret-bearing probe
 // field: a proxy carrying a password (testProxyWithPW, probe_scope_test.go) and
-// the two bearers. One fixture drives both halves of the contract -- the proxy
-// list rendered verbatim, the two keys rendered nowhere.
+// the bearer. One fixture drives both halves of the contract -- the proxy list
+// rendered verbatim, the key rendered nowhere.
 func probeConfigWithSecrets(dir string) string {
 	return probeRoleConfig(dir) + fmt.Sprintf(`probe_accounts:
   - codex-a.json
 probe_proxies:
   - %s
-probe_api_key: %s
 probe_management_key: %s
-`, testProxyWithPW, testProbeAPIKey, testProbeManagementKey)
+`, testProxyWithPW, testProbeManagementKey)
 }
 
 // The proxy list is served in the clear, which is a deliberate reversal of what
@@ -2210,14 +2208,14 @@ func TestProbeKeysAreNeverDisplayedOrLogged(t *testing.T) {
 	if strings.TrimSpace(logged) == "" {
 		t.Fatal("configure logged nothing; the leak assertions below would prove nothing")
 	}
-	for _, secret := range []string{testProbeAPIKey, testProbeManagementKey} {
+	for _, secret := range []string{testProbeManagementKey} {
 		if strings.Contains(logged, secret) {
 			t.Error("the configure log line carried a probe key verbatim")
 		}
 	}
 	// Presence, and only presence. "Is it configured at all" is the one question
 	// an operator answers from a log; anything more is a hint.
-	for _, want := range []string{"probe_api_key=set", "probe_management_key=set"} {
+	for _, want := range []string{"probe_management_key=set"} {
 		if !strings.Contains(logged, want) {
 			t.Errorf("the configure log line does not report %q, so a missing key would be invisible: %s", want, logged)
 		}
@@ -2239,7 +2237,7 @@ func TestProbeKeysAreNeverDisplayedOrLogged(t *testing.T) {
 			t.Fatalf("%s body is empty; the assertions below would prove nothing", name)
 		}
 		body := string(resp.Body)
-		for _, secret := range []string{testProbeAPIKey, testProbeManagementKey} {
+		for _, secret := range []string{testProbeManagementKey} {
 			if strings.Contains(body, secret) {
 				t.Errorf("%s leaked a probe key", name)
 			}
@@ -2248,7 +2246,7 @@ func TestProbeKeysAreNeverDisplayedOrLogged(t *testing.T) {
 		// as "***" reads as "nothing configured" while the plugin is in fact
 		// holding one, and it invites the next person to fill the field in for
 		// real.
-		for _, field := range []string{"probe_api_key", "probe_management_key"} {
+		for _, field := range []string{"probe_management_key"} {
 			if strings.Contains(body, field) {
 				t.Errorf("%s carries a %q field; these are never displayed, not even empty or masked", name, field)
 			}
@@ -2440,7 +2438,7 @@ func choicesConfig(dir, baseURL, mgmtKey string, accounts, models []string) stri
 	var b strings.Builder
 	fmt.Fprintf(&b, "role: probe\nstore_dir: %q\nlog_decisions: false\ndry_run: true\n", dir)
 	fmt.Fprintf(&b, "probe_base_url: %q\n", baseURL)
-	fmt.Fprintf(&b, "probe_api_key: %q\nprobe_management_key: %q\n", "sk-choices-api", mgmtKey)
+	fmt.Fprintf(&b, "probe_management_key: %q\n", mgmtKey)
 	for _, block := range []struct {
 		key    string
 		values []string
@@ -2499,15 +2497,6 @@ func choiceAccountByName(choices mgmtChoices, name string) (mgmtChoiceAccount, b
 		}
 	}
 	return mgmtChoiceAccount{}, false
-}
-
-func choiceModelByName(choices mgmtChoices, name string) (mgmtChoiceModel, bool) {
-	for _, model := range choices.Models {
-		if model.Name == name {
-			return model, true
-		}
-	}
-	return mgmtChoiceModel{}, false
 }
 
 // The route is keyless like the rest of /ops, and -- unlike the rest of /ops --

@@ -53,7 +53,6 @@ type fakeCPA struct {
 	mu     sync.Mutex
 	server *httptest.Server
 	seeds  map[string]fakeCredSeed
-	order  []string
 }
 
 // encodeJWT builds a token whose payload carries just the two non-secret claims
@@ -82,22 +81,9 @@ func newFakeCPA(t *testing.T, seeds ...fakeCredSeed) *fakeCPA {
 	return fake
 }
 
-func (f *fakeCPA) record(format string, args ...any) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.order = append(f.order, fmt.Sprintf(format, args...))
-}
-
-func (f *fakeCPA) calls() []string {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	return append([]string(nil), f.order...)
-}
-
 func (f *fakeCPA) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	switch {
 	case r.Method == http.MethodGet && r.URL.Path == probeRouteAuthFiles:
-		f.record("files")
 		f.writeJSON(w, map[string]any{"files": f.fileList()})
 	case r.Method == http.MethodGet && r.URL.Path == probeRouteAuthDownload:
 		f.serveDownload(w, r)
@@ -124,7 +110,6 @@ func (f *fakeCPA) fileList() []map[string]any {
 
 func (f *fakeCPA) serveDownload(w http.ResponseWriter, r *http.Request) {
 	name := r.URL.Query().Get("name")
-	f.record("download %s", name)
 	f.mu.Lock()
 	seed, found := f.seeds[name]
 	f.mu.Unlock()
@@ -959,28 +944,9 @@ func TestProbeRunNeverLeaksAProxyPassword(t *testing.T) {
 	}
 }
 
-func TestProbeShortAuthMasksTheEmail(t *testing.T) {
-	// Account names carry a customer email and are shown on the keyless transcript,
-	// so probeShortAuth must keep only the stable hex and tier and drop the email.
-	cases := []struct {
-		name string
-		in   string
-		want string
-	}{
-		{"normal", "codex-620f5a42-luo.swmu@gmail.com-pro.json", "620f5a42…pro"},
-		{"email with dashes", "codex-deadbeef-first-last@x.com-pro.json", "deadbeef…pro"},
-		{"no email", "codex-abcdef.json", "abcdef"},
-		{"empty", "", ""},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			got := probeShortAuth(tc.in)
-			if got != tc.want {
-				t.Fatalf("probeShortAuth(%q) = %q, want %q", tc.in, got, tc.want)
-			}
-			if strings.Contains(got, "@") {
-				t.Fatalf("probeShortAuth(%q) leaked an email: %q", tc.in, got)
-			}
-		})
-	}
-}
+// The probe transcript used to mask account names with its own copy of the
+// algorithm (probeShortAuth), kept in step with maskAuthLabel by hand. The copy
+// is gone and both sides call maskAuthLabel, whose own test (TestMaskAuthLabel)
+// is a strict superset of the cases this one held -- it additionally covers an
+// email in the final position and a name that is nothing but an email, which
+// are the two shapes that actually leak.

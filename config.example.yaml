@@ -78,7 +78,7 @@ plugins:
       #
       # 这是【探测范围】的一半，另一半是下面的 probe_accounts。
       # 目标桶数 = len(probe_accounts) × len(models)，
-      # probe.py --until-complete 以这些桶全部就绪为准。
+      # 看板上的 targets_ready / targets_total 就是按它算的。
       models:
         - gpt-5.5
         - gpt-5.6-luna
@@ -103,9 +103,10 @@ plugins:
 
       # 这一轮探测要覆盖哪几个账号。填账号 JSON 的【文件名】。
       #
-      # 空着 = 没选 → probe.py 【拒绝开跑】，不会默认打全量。
-      # 这是刻意的：探测要停对外业务、每个桶烧一次上游请求，
+      # 空着 = 没选 → 探测【拒绝开跑】，不会默认打全量。
+      # 这是刻意的：每个桶至少烧一次上游请求，
       # 「没选就等于全选」是唯一事后补救不了的错误。
+      # （探测本身不需要停业务：它直连上游，不碰 CPA 的任何状态。）
       #
       # 非法项（不是 codex-*.json 的形状）会被丢弃并记进 config_errors，
       # 但【不会】让插件拒绝启动 —— 探测范围写错不该把业务角色拖下线。
@@ -148,20 +149,16 @@ plugins:
       #  - socks5h://user:pass@exit-1.example:1080
       #  - http://user:pass@exit-2.example:8080
 
-      # ---- 看板里那个「开始探测」按钮要用的三项 ----
+      # ---- 看板里那个「开始探测」按钮要用的两项 ----
       #
-      # 插件自己跑探测需要两把钥匙。它们写在这里【只写一次】，就是为了让看板
-      # 上点一下就能跑 —— 页面既不显示也不索取任何密钥。
+      # 探测只需要这一把钥匙，而且是【只读】的：拉账号清单 + 下载每个账号自己的
+      # token，仅此两个 GET，绝不写 CPA。写在这里【只写一次】，就是为了让看板上
+      # 点一下就能跑 —— 页面既不显示也不索取任何密钥。
       #
-      # 为什么插件不能用 host.model.execute 去发请求：宿主会给插件自己发出的
-      # 请求打上 SkipInterceptorPluginID，那条请求永远不会回到本插件的响应钩子，
-      # 所以【采不到任何东西】（连通性自检采不到，就是同一个原因）。插件因此必须
-      # 像 probe.py 一样，向 CPA 自己的 /v1/responses 发一条真请求，走正常拦截链。
+      # 拿到 token 之后，探测【直连 chatgpt.com】，不经过 CPA。所以它不需要
+      # CPA 的 API key，也不受 CPA 调度影响，业务可以照常跑。
       #
-      # 这两个值比代理更机密：它们【不出现在任何地方】—— 不进 status、不进
-      # /config、不进日志，连掩码形式都没有。日志里只说 set / unset。
-      # probe_api_key 现在【已不再使用】：离线探测直连上游、用账号自己的
-      # access_token 鉴权，不再打 CPA 的 /v1/responses。留着只为兼容旧配置。
-      probe_api_key: ""            # 已废弃，留空即可
+      # 这个值比代理更机密：它【不出现在任何地方】—— 不进 status、不进 /config、
+      # 不进日志，连掩码形式都没有。日志里只说 set / unset。
       probe_management_key: ""     # 只读：拉账号清单 + 下载每账号 token，绝不改 CPA
       probe_base_url: http://127.0.0.1:8317

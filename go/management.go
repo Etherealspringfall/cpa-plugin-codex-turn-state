@@ -58,8 +58,8 @@ var dashboardHTML []byte
 const (
 	routeStatus       = "/codex-turn-state/status"
 	routeBucketsClear = "/codex-turn-state/buckets/clear"
-	// Named selftest, not probe: it cannot harvest, and sharing a name with
-	// scripts/probe.py would invite exactly the wrong conclusion from a green
+	// Named selftest, not probe: it cannot harvest, and sharing a name with the
+	// dashboard's 探测 would invite exactly the wrong conclusion from a green
 	// result. See selftestNote.
 	routeSelftest = "/codex-turn-state/selftest"
 	// routeDashboard is relative to the plugin's own resource prefix, so the
@@ -75,9 +75,8 @@ const (
 	// needs it -- the status document carries the proxy list in the clear now --
 	// but it stays exactly where it is, behind the management key and with no
 	// resource alias, because "the config, verbatim" is the shape any future
-	// secret lands in by default. probe_api_key and probe_management_key are
-	// already two such secrets, and neither is in configResponse for precisely
-	// that reason. An alias here would publish whatever this route grows next,
+	// secret lands in by default. probe_management_key is already such a secret,
+	// and it is not in configResponse for precisely that reason. An alias here would publish whatever this route grows next,
 	// with no error and no log line.
 	routeConfig = "/codex-turn-state/config"
 
@@ -108,9 +107,9 @@ const (
 	routeOpsScope = "/ops/scope"
 	// The probe runner's two controls, keyless like the rest of /ops and for the
 	// same reason: the whole point of running a probe from the dashboard is that
-	// nobody has to type a key to do it. The bearers the run itself needs come
-	// from probe_api_key and probe_management_key in the config, which is why
-	// neither route takes one and why neither response can ever echo one.
+	// nobody has to type a key to do it. The bearer the run itself needs comes
+	// from probe_management_key in the config, which is why neither route takes
+	// one and why neither response can ever echo it.
 	//
 	// Being in the resource list is deliberate, not incidental. A GET management
 	// route that declares a Menu is silently re-registered under the
@@ -202,9 +201,8 @@ func managementRegister(raw []byte) ([]byte, error) {
 			},
 			// The keyless actions. Unauthenticated by virtue of the resource
 			// prefix, GET-only by the host's rule, guarded by confirm=1 rather than
-			// by a key. None of them echoes probe_api_key or probe_management_key,
-			// which are the only values on this plugin that are never displayed at
-			// all. No Menu: the dashboard fires these with fetch, they are not
+			// by a key. None of them echoes probe_management_key, the only value on
+			// this plugin that is never displayed at all. No Menu: the dashboard fires these with fetch, they are not
 			// pages to navigate to.
 			{Path: routeOpsDryRun, Description: "翻转 dry_run（无需鉴权，需 confirm=1）"},
 			{Path: routeOpsRole, Description: "切换 role（无需鉴权，需 confirm=1）"},
@@ -919,8 +917,8 @@ type statusResponse struct {
 	// tickets and chat windows and a status fetch is not.
 	//
 	// The rest of the rule is unchanged and is the part to keep: anything added
-	// here is public. probe_api_key and probe_management_key are consequently NOT
-	// here in any form, not even a masked one.
+	// here is public. probe_management_key is consequently NOT here in any form,
+	// not even a masked one.
 	ProbeAccounts   []string `json:"probe_accounts"`
 	ProbeProxyCount int      `json:"probe_proxy_count"`
 	// ProbeProxies is plaintext, at the operator's explicit instruction. See
@@ -1129,10 +1127,10 @@ func handleStatus() pluginapi.ManagementResponse {
 // save. The status document now carries the proxy list itself, so the page no
 // longer calls this at all; it is kept as the keyed view of the configuration.
 //
-// What it must never grow: probe_api_key or probe_management_key. Those are not
-// editable from anywhere and are not displayed anywhere, so there is nothing for
-// a form to refill, and a field here would be a secret one accidental resource
-// alias away from being anonymous.
+// What it must never grow: probe_management_key. It is not editable from
+// anywhere and is not displayed anywhere, so there is nothing for a form to
+// refill, and a field here would be a secret one accidental resource alias away
+// from being anonymous.
 type configResponse struct {
 	Role           string   `json:"role"`
 	StoreDir       string   `json:"store_dir"`
@@ -1291,7 +1289,7 @@ func handleScopeSave(q url.Values) pluginapi.ManagementResponse {
 		TargetsTotal:       len(accounts) * len(models),
 		ConfigErrors:       problems,
 		Note: "已保存到插件自己的 scope 文件，立即生效，覆盖 config.yaml 里的同名项。" +
-			"采集仍须在宿主上运行 scripts/probe.py --until-complete。",
+			"采集由看板上的「探测」启动，续期循环每 60 秒重读一次范围。",
 	}
 	if out.ProbeAccounts == nil {
 		out.ProbeAccounts = []string{}
@@ -1428,7 +1426,7 @@ func isCodexAuth(file pluginapi.HostAuthFileEntry) bool {
 		return true
 	}
 	// Provider is not always populated on file-backed credentials; the naming
-	// convention is the fallback scripts/probe.py uses too.
+	// convention is the fallback the harvester uses too.
 	name := strings.ToLower(strings.TrimSpace(file.Name))
 	return strings.HasPrefix(name, "codex-") && strings.HasSuffix(name, ".json")
 }
@@ -1640,7 +1638,7 @@ type upstreamErrorBody struct {
 // plugin's own response interceptor. So it can prove the path is alive; it can
 // never fill a bucket.
 const (
-	selftestNote = "连通性自检不会落盘：host.model.execute 会跳过本插件的响应拦截器。采集请用 scripts/probe.py。"
+	selftestNote = "连通性自检不会落盘：host.model.execute 会跳过本插件的响应拦截器。采集请用看板上的「探测」。"
 	// Said plainly rather than left to inference: HostModelExecutionResponse
 	// carries only StatusCode, Headers and Body, so when we do not pin a
 	// credential there is no way to learn which one answered. Reporting a guess
@@ -1664,10 +1662,12 @@ const (
 // exact (account, model) pair without having to disable anything. Left out, the
 // scheduler chooses and the answer says so rather than guessing.
 //
-// This handler never enables or disables a credential. That needs a snapshot
-// and a guaranteed restore (scripts/probe.py has both, including signal
-// handlers and a --restore fallback); a half-completed toggle here would leave
-// the operator's accounts switched off with nothing to put them back.
+// This handler never enables or disables a credential -- nothing in this plugin
+// does any more. A toggle needs a snapshot and a guaranteed restore, and a
+// half-completed one would leave the operator's accounts switched off with
+// nothing to put them back. The offline harvester removed the need entirely by
+// holding each account's own token, so attribution never depended on being the
+// only enabled credential.
 func handleSelftest(body []byte) pluginapi.ManagementResponse {
 	var req selftestRequest
 	if len(strings.TrimSpace(string(body))) > 0 {

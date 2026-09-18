@@ -37,7 +37,7 @@
 //
 // probeRunState.Lines is rendered on a page that needs no key. No token,
 // turn-state value, or proxy userinfo may reach it: proxies render through
-// probeShowProxy/maskProxyURL, account names through probeShortAuth (they carry
+// probeShowProxy/maskProxyURL, account names through maskAuthLabel (they carry
 // a customer email), and everything bound for Lines passes probeRedact as a
 // second line of defence. The management key this file reads is never logged.
 package main
@@ -271,7 +271,7 @@ func probeRunUpdate(mutate func(run *probeRunState)) {
 //
 // Every line goes through probeRedact first. Callers are expected to have masked
 // any proxy URL already, with maskProxyURL, and any account name with
-// probeShortAuth; this is the second line of defence, not the first, and it
+// maskAuthLabel; this is the second line of defence, not the first, and it
 // exists because Lines is served to a reader who has presented no key.
 func probeRunLog(format string, args ...any) {
 	line := probeRedact(fmt.Sprintf(format, args...))
@@ -483,7 +483,7 @@ func probeHarvestBucket(ctx context.Context, cfg pluginConfig, pool *probeClient
 	}
 	defer probeRelease(key)
 
-	short := probeShortAuth(cred.name)
+	short := maskAuthLabel(cred.name)
 	if !probeAccountReady(cred.name, time.Now()) {
 		// The upstream asked for this credential to be left alone. Silent: the
 		// renewal loop would otherwise say so once a minute per bucket.
@@ -630,7 +630,7 @@ func probeDownloadCreds(ctx context.Context, client *probeClient, accounts []str
 		if ctx.Err() != nil {
 			return creds
 		}
-		short := probeShortAuth(name)
+		short := maskAuthLabel(name)
 		blob, errDownload := client.downloadAuth(ctx, name)
 		if errDownload != nil {
 			probeRunLog("%s: could not read credential: %s", short, probeRedact(errDownload.Error()))
@@ -1064,39 +1064,6 @@ func stringField(blob map[string]any, key string) string {
 		return value
 	}
 	return ""
-}
-
-// probeShortAuth renders a credential file name without the customer email that
-// sits inside it, for the keyless run transcript.
-// codex-<hex>-<email>-<tier>.json becomes "<hex>…<tier>"; the hex and the tier
-// are stable and identify the account without publishing whose it is.
-//
-// The email-bearing segment is dropped BEFORE the first/last pick, not after:
-// a name whose email is the last segment (codex-<hex>-<email>.json) would
-// otherwise publish the address. This mirrors maskAuthLabel in management.go,
-// which the dashboard uses for the same reason; the two are kept in step by
-// hand because that file was written concurrently.
-func probeShortAuth(name string) string {
-	trimmed := strings.TrimSuffix(name, ".json")
-	trimmed = strings.TrimPrefix(trimmed, "codex-")
-	if trimmed == "" {
-		return name
-	}
-	kept := make([]string, 0, 4)
-	for _, part := range strings.Split(trimmed, "-") {
-		if !strings.Contains(part, "@") {
-			kept = append(kept, part)
-		}
-	}
-	switch len(kept) {
-	case 0:
-		// Nothing but an email: publish neither half.
-		return "…"
-	case 1:
-		return kept[0]
-	default:
-		return kept[0] + "…" + kept[len(kept)-1]
-	}
 }
 
 // --- CPA read client -----------------------------------------------------
