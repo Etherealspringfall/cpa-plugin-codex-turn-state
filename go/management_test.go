@@ -465,16 +465,98 @@ func TestManagementDataRoutesCarryNoMenu(t *testing.T) {
 	}
 }
 
+// Exactly one resource may carry a Menu, and it is the dashboard shell.
+//
+// The invariant is about the Menu, not the resource count. There are two
+// resources now -- the shell and an anonymous /status the shell fetches -- and
+// there may be more later. What must never grow is the set of *menu-bearing*
+// ones: a Menu turns a resource into a management-centre entry, and every such
+// entry lives on the unauthenticated /v0/resource prefix. One page is intended
+// to be reachable without a key (the user asked for a no-login dashboard);
+// anything else acquiring a Menu would be an accident that quietly publishes it.
 func TestManagementRegisterExposesExactlyOneMenuResource(t *testing.T) {
 	dir := t.TempDir()
 	mustConfigure(t, probeRoleConfig(dir))
 
 	reg := driveManagementRegister(t)
-	if len(reg.Resources) != 1 {
-		t.Fatalf("declared %d resources, want exactly 1 (the HTML shell)", len(reg.Resources))
+	if len(reg.Resources) == 0 {
+		t.Fatal("no resources declared; this test would pass vacuously")
 	}
-	if strings.TrimSpace(reg.Resources[0].Menu) == "" {
-		t.Error("the shell resource has no Menu label, so it will not appear in the management centre")
+
+	var withMenu []mgmtRoute
+	for _, res := range reg.Resources {
+		if strings.TrimSpace(res.Menu) != "" {
+			withMenu = append(withMenu, res)
+		}
+	}
+	if len(withMenu) != 1 {
+		t.Fatalf("declared %d resources with a Menu, want exactly 1 (the shell); the rest must stay off the menu", len(withMenu))
+	}
+	if withMenu[0].Path != "/dashboard" {
+		t.Errorf("the menu-bearing resource is %q, want /dashboard", withMenu[0].Path)
+	}
+}
+
+// The anonymous /status resource is the dashboard's data source: same handler
+// and same JSON as the authenticated management status, reachable without a key
+// because the resource prefix is not authenticated. It must NOT carry a Menu --
+// a Menu is for pages an operator navigates to, and this is a fetch target; the
+// menu-bearing entry is the dashboard alone (see the test above).
+func TestManagementRegisterExposesAnonymousStatusResource(t *testing.T) {
+	dir := t.TempDir()
+	mustConfigure(t, probeRoleConfig(dir))
+
+	reg := driveManagementRegister(t)
+	var status *mgmtRoute
+	for i := range reg.Resources {
+		if reg.Resources[i].Path == "/status" {
+			status = &reg.Resources[i]
+			break
+		}
+	}
+	if status == nil {
+		t.Fatal("no /status resource declared; the dashboard has nothing to fetch from")
+	}
+	if strings.TrimSpace(status.Menu) != "" {
+		t.Errorf("the /status resource carries Menu=%q; it is a fetch target, not a page", status.Menu)
+	}
+}
+
+// The status document served on the anonymous resource path is the same one the
+// authenticated route returns, so it must be held to the same secrecy bar. The
+// account filenames it exposes are the user's informed choice; the token values
+// are never anyone's choice. This re-runs the no-leak check against the resource
+// path specifically, because that is the one an unauthenticated caller reaches.
+func TestAnonymousStatusResourceNeverLeaksTokenValues(t *testing.T) {
+	dir := t.TempDir()
+	mustConfigure(t, probeRoleConfig(dir))
+
+	issued := wallClock().Add(-time.Minute)
+	secrets := []string{
+		seedMgmtBucket(t, dir, "codex-alpha.json", "gpt-5.5", issued),
+		seedMgmtBucket(t, dir, "codex-beta.json", "gpt-5.6-sol", issued),
+	}
+
+	resp := driveManagement(t, http.MethodGet, "/v0/resource/plugins/codex-turn-state/status", nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("anonymous status returned %d, want 200: %s", resp.StatusCode, truncateMgmtLog(resp.Body))
+	}
+	if len(resp.Body) == 0 {
+		t.Fatal("anonymous status body is empty; the leak check below would prove nothing")
+	}
+	for i, secret := range secrets {
+		if strings.Contains(string(resp.Body), secret[:40]) {
+			t.Errorf("anonymous status leaked token %d", i)
+		}
+	}
+	// Prove the body is the real status document, not an error or a stub, so
+	// the leak assertions were exercised against actual bucket data.
+	var status mgmtStatus
+	if err := json.Unmarshal(resp.Body, &status); err != nil {
+		t.Fatalf("anonymous status body is not a status document: %v", err)
+	}
+	if b, ok := mgmtBucketByKey(status, "codex-alpha.json", "gpt-5.5"); !ok || !b.Ready {
+		t.Error("seeded bucket missing from anonymous status; leak check saw no real data")
 	}
 }
 
@@ -1419,6 +1501,125 @@ func TestSelftestUpstreamFieldsHaveNoOmitempty(t *testing.T) {
 		if !strings.Contains(string(src), tag) {
 			t.Errorf("%s is not declared with a bare %s tag; an omitempty here would make the response shape vary", field, tag)
 		}
+	}
+}
+
+// --- 6c. 312 degraded state is attributed but never stored ---------------
+//
+// A 312 is the throttled/degraded state, not a template (FINDINGS.md): it is
+// what the upstream issues under load, the same signal as server_is_overloaded.
+// The harvest path runs attribution over it anyway -- only so the log can name
+// *which* account is throttled, "account X is degraded" rather than "auth=-" --
+// but it must never reach the store. Storing a 312 and later injecting it would
+// replay a degraded token, which the upstream rejects as
+// "could not be decrypted". This is the store's half of that rule; the
+// classifier's half is tested in the upstream-error section above.
+
+// harvestResponseHeaders builds the response headers a probe would see, with the
+// turn-state value the caller wants attributed.
+func harvestResponseHeaders(value string) http.Header {
+	h := http.Header{}
+	h.Set(testHeader, value)
+	return h
+}
+
+// resetHarvestState clears the in-memory bucket cache. harvestFromResponse
+// short-circuits a repeat write when the cache already holds the same value for
+// a key (Codex mints a fresh token per turn, so an identical one means a
+// replay), and that cache is process-global and not reset between tests. A test
+// that drives the harvest path must start from a clean cache or a prior test's
+// entry could suppress the write under examination.
+func resetHarvestState(t *testing.T) {
+	t.Helper()
+	state.mu.Lock()
+	state.buckets = make(map[string]templateEntry)
+	state.mu.Unlock()
+	t.Cleanup(func() {
+		state.mu.Lock()
+		state.buckets = make(map[string]templateEntry)
+		state.mu.Unlock()
+	})
+}
+
+// A 312 arriving on the probe response is recognised, but leaves no file. This
+// drives the real harvest entry point (harvestFromResponse) rather than the
+// writer beneath it, so it covers the decision, not just the guard.
+func TestHarvestNeverStoresDegradedState(t *testing.T) {
+	dir := t.TempDir()
+	mustConfigure(t, probeRoleConfig(dir))
+	resetHarvestState(t)
+
+	issued := wallClock().Add(-time.Minute)
+	meta := map[string]any{testAuthKey: "codex-alpha.json"}
+
+	state.mu.Lock()
+	cfg := state.config
+	state.mu.Unlock()
+
+	// A 312 with a complete bucket key: attribution is not even needed, so the
+	// only thing keeping it out of the store is the degraded-length rule itself.
+	harvestFromResponse(cfg, harvestResponseHeaders(fakeToken(312, issued)), meta, "gpt-5.5")
+
+	if files := regularFiles(t, dir); len(files) != 0 {
+		t.Errorf("a 312 degraded value was written to the store: %v", files)
+	}
+	loaded, err := loadStore(dir, wallClock(), testTTL, cfg.TemplateLength)
+	if err != nil {
+		t.Fatalf("loadStore: %v", err)
+	}
+	if len(loaded) != 0 {
+		t.Errorf("loadStore found %d templates after only a 312 was seen, want 0", len(loaded))
+	}
+}
+
+// The contrast that proves the test above is not simply observing a broken
+// harvest path: the same entry point, given a 292, does store. Without this a
+// harvestFromResponse that wrote nothing at all would pass the 312 test.
+func TestHarvestStoresTemplateButNotDegraded(t *testing.T) {
+	dir := t.TempDir()
+	mustConfigure(t, probeRoleConfig(dir))
+	resetHarvestState(t)
+
+	issued := wallClock().Add(-time.Minute)
+	meta := map[string]any{testAuthKey: "codex-alpha.json"}
+
+	state.mu.Lock()
+	cfg := state.config
+	state.mu.Unlock()
+
+	// First a 312 for the same bucket: must not create a file.
+	harvestFromResponse(cfg, harvestResponseHeaders(fakeToken(312, issued)), meta, "gpt-5.5")
+	if files := regularFiles(t, dir); len(files) != 0 {
+		t.Fatalf("the 312 was stored: %v", files)
+	}
+
+	// Then a 292 for the same bucket: must create exactly one file.
+	harvestFromResponse(cfg, harvestResponseHeaders(fakeToken(292, issued)), meta, "gpt-5.5")
+	loaded, err := loadStore(dir, wallClock(), testTTL, cfg.TemplateLength)
+	if err != nil {
+		t.Fatalf("loadStore: %v", err)
+	}
+	if len(loaded) != 1 {
+		t.Fatalf("after a 312 then a 292, loadStore found %d templates, want 1", len(loaded))
+	}
+	if _, ok := loaded[bucketKey("codex-alpha.json", "gpt-5.5")]; !ok {
+		t.Error("the 292 was not stored under its own bucket key")
+	}
+}
+
+// The writer is the last line of defence: even if some future caller hands it a
+// 312 directly, it refuses. (The store's other tests cover length rejection;
+// this states it as part of the degraded-state contract so the two halves sit
+// together.)
+func TestWriteStoreRecordRefusesDegradedLength(t *testing.T) {
+	dir := t.TempDir()
+	rec := storeRecordFor("codex-alpha.json", "gpt-5.5", wallClock().Add(-time.Minute), 312)
+
+	if err := writeStoreRecord(dir, rec, 292); err == nil {
+		t.Error("writeStoreRecord accepted a 312 record; a degraded value must never be stored")
+	}
+	if files := regularFiles(t, dir); len(files) != 0 {
+		t.Errorf("a rejected 312 write still left a file: %v", files)
 	}
 }
 

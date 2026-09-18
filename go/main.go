@@ -682,6 +682,33 @@ func interceptAfterAuth(raw []byte) ([]byte, error) {
 	authID := metadataString(req.Metadata, selectedAuthMetadataKey)
 	model := pickModel(req.Model, req.RequestedModel)
 	value := headerValue(req.Headers, turnStateHeader)
+	attribution := attributionObserved
+
+	// The same metadata gap the collection side has, mirrored here. A minimal
+	// request carries no metadata, so selected_auth_id is absent
+	// (publishSelectedAuthMetadata early-returns on an empty map,
+	// conductor_execution.go:1726). Real Codex traffic sends session metadata and
+	// never enters this branch, but a metadata-less request under a single-account
+	// deployment would otherwise never be substituted -- a real defect, and it
+	// also blocks a minimal-request substitution demo.
+	//
+	// Inferred under the same invariant harvesting uses: exactly one enabled Codex
+	// account (spec §7). With two enabled, a guess would inject one account's 292
+	// into another's request -- rule 1 -- so anything but a clean sole account
+	// leaves authID empty and the request untouched. The inferred account is used
+	// only for the bucket-key lookup; every substitution rule below (replace-only,
+	// dry_run, TTL, length) is unchanged.
+	//
+	// Gated on a present value for two reasons: an empty request has nothing to
+	// replace in replace-only mode, so a host lookup would be wasted; and it means
+	// that even in always mode this fallback can never supply the account that
+	// would inject a template onto a headerless request, which spec §0 forbids.
+	if authID == "" && model != "" && value != "" {
+		if sole, _, errSole := soleEnabledCodexAuth(); errSole == nil && sole != "" {
+			authID = sole
+			attribution = attributionInferred
+		}
+	}
 
 	if authID == "" || model == "" {
 		// Without a full key the request cannot be attributed to a bucket, and
@@ -718,6 +745,13 @@ func interceptAfterAuth(raw []byte) ([]byte, error) {
 	state.mu.Unlock()
 
 	decision, reason, replacement := decideHeader(cfg, value, tmpl, haveTmpl, harvestedOK, now)
+	// Mark an inferred attribution in the log the same way the harvest side does:
+	// "substituted account X's template" and "substituted the sole enabled
+	// account's template" are different claims, and a wrong inference here is a
+	// cross-account leak, so which one was made must be auditable after the fact.
+	if attribution == attributionInferred {
+		reason += " (inferred: sole enabled account)"
+	}
 	logDecision(decision, authID, model, len(value), reason)
 
 	if replacement == "" || cfg.DryRun {
@@ -818,29 +852,54 @@ func harvestFromResponse(cfg pluginConfig, headers http.Header, metadata map[str
 	// So fall back to the invariant the spec already imposes: probing enables
 	// exactly one Codex account at a time (spec §7 step 2), which makes the
 	// account a property of the setup rather than something to read off the
-	// request. All four conditions must hold, and every one of them is load
-	// bearing -- with two accounts enabled this would be a coin toss between
-	// them, and a wrong guess feeds one account's token to another.
+	// request. Every condition is load bearing -- with two accounts enabled this
+	// would be a coin toss between them, and a wrong guess feeds one account's
+	// token to another.
+	//
+	// Inference runs for any recognised length, 292 or 312, not only the template
+	// length. A 312 is never stored, but attributing it lets the degraded-state
+	// log below name the throttled account instead of printing auth=-, which is
+	// the difference between "this account is throttled" and "attribution broke".
 	//
 	// The role check is belt-and-braces: response hooks are only registered for
 	// the probe and in-band harvest is forced off for business, so this path is
 	// already unreachable there. It is written out anyway so the rule reads
 	// completely here instead of resting on a registration elsewhere.
-	if authID == "" && model != "" && len(value) == cfg.TemplateLength && cfg.isProbe() {
+	recognisedLen := len(value) == cfg.TemplateLength || len(value) == cfg.ReplaceLength
+	if authID == "" && model != "" && recognisedLen && cfg.isProbe() {
 		sole, enabledCount, errSole := soleEnabledCodexAuth()
 		switch {
 		case errSole != nil:
-			logDecision("skip", "", model, len(value),
-				"incomplete bucket key; cannot infer: credential list unavailable: "+errSole.Error())
-			return
+			// A 292 we cannot attribute is genuinely unharvestable, so it stops
+			// here. A 312 falls through to the degraded-state log, still worth
+			// emitting with auth=- so the throttling is visible.
+			if len(value) == cfg.TemplateLength {
+				logDecision("skip", "", model, len(value),
+					"incomplete bucket key; cannot infer: credential list unavailable: "+errSole.Error())
+				return
+			}
 		case sole == "":
-			logDecision("skip", "", model, len(value),
-				fmt.Sprintf("incomplete bucket key; refusing to infer: %d enabled Codex accounts, need exactly 1", enabledCount))
-			return
+			if len(value) == cfg.TemplateLength {
+				logDecision("skip", "", model, len(value),
+					fmt.Sprintf("incomplete bucket key; refusing to infer: %d enabled Codex accounts, need exactly 1", enabledCount))
+				return
+			}
 		default:
 			authID = sole
 			attribution = attributionInferred
 		}
+	}
+
+	// A replace_length value is the degraded/throttled state, not a template.
+	// This is logged distinctly from an incomplete key because an operator
+	// retrying a probe reads exactly this line: "no 292 to harvest because the
+	// account is throttled" must not look like "the bucket key is broken", which
+	// sends them chasing a metadata bug instead of waiting out the throttle. The
+	// attribution above ran only to name the account here; a 312 is never stored.
+	if len(value) == cfg.ReplaceLength {
+		logDecision("pass", authID, model, len(value),
+			"upstream issued degraded state (len=replace_length), no template to harvest — account throttled or honeymoon closed")
+		return
 	}
 
 	if authID == "" || model == "" {
@@ -848,8 +907,7 @@ func harvestFromResponse(cfg pluginConfig, headers http.Header, metadata map[str
 		return
 	}
 	if len(value) != cfg.TemplateLength {
-		// A replace_length value is the degraded state, not a template. Storing
-		// it would defeat the entire point of the substitution.
+		// Neither a template nor the known degraded length. Nothing to harvest.
 		logDecision("pass", authID, model, len(value), "length not template")
 		return
 	}

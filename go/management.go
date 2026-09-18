@@ -53,6 +53,12 @@ const (
 	// routeDashboard is relative to the plugin's own resource prefix, so the
 	// browser-facing URL is /v0/resource/plugins/codex-turn-state/dashboard.
 	routeDashboard = "/dashboard"
+	// routeStatusResource is the unauthenticated, resource-prefix alias of the
+	// status route: /v0/resource/plugins/codex-turn-state/status. Its resolved
+	// path ends in the same /codex-turn-state/status suffix routeStatus matches
+	// on, so both dispatch to handleStatus with no extra case. It exists so the
+	// dashboard can render on open, before the operator has entered any key.
+	routeStatusResource = "/status"
 )
 
 // managementRegister answers management.register with the route table.
@@ -80,6 +86,21 @@ func managementRegister(raw []byte) ([]byte, error) {
 				Path:        routeDashboard,
 				Menu:        "Codex Turn-State",
 				Description: "探测/业务状态看板：桶就绪度、角色、dry_run",
+			},
+			{
+				// Read-only status, unauthenticated by virtue of the resource
+				// prefix. No Menu: it is data the dashboard fetches, not a page
+				// to navigate to, and it must not be confused with routeDashboard.
+				//
+				// Privacy note for anyone about to expose port 8317: this makes
+				// the status document anonymously readable, and each bucket's
+				// auth_id is the credential filename, which contains the customer
+				// email. That is the user's informed choice (they asked for a
+				// no-login page). clear and selftest are deliberately NOT mirrored
+				// here -- they are destructive or spend quota, so they stay behind
+				// the management key.
+				Path:        routeStatusResource,
+				Description: "只读状态（无需鉴权），供看板拉取",
 			},
 		},
 	})
@@ -216,6 +237,12 @@ type statusAccount struct {
 }
 
 // handleStatus reports configuration, bucket readiness and decision tallies.
+//
+// Reachable both authenticated (/v0/management/...) and anonymously
+// (/v0/resource/plugins/codex-turn-state/status); see managementRegister for
+// why the anonymous alias exists and what it exposes. It stays strictly
+// read-only, and it never emits a template value -- only lengths, readiness and
+// timestamps -- so anonymous read is bounded to that.
 func handleStatus() pluginapi.ManagementResponse {
 	now := time.Now()
 

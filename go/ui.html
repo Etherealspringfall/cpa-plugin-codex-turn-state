@@ -6,9 +6,28 @@
   scripts/build.sh 编出新的 .so 并重启 CPA 才会生效 —— 它不是从磁盘读的，
   编辑服务器上的 ui.html 不会有任何效果。
 
-  页面自身由 /v0/resource/plugins/codex-turn-state/ 伺服，那条路由【不鉴权】，
-  所以这里不包含任何数据：一切都靠带 X-Management-Key 头去调 /v0/management/
-  下的接口现取。不要往这个文件里写任何密钥、账号名或 token。
+  ── 鉴权模型（读之前先看这段）──────────────────────────────────────────
+
+  分两层，界线是「看」还是「动」：
+
+    不鉴权 GET   ── dashboard（页面本身）/ status（数据）
+                    挂在 /v0/resource/plugins/<id>/ 下，那个前缀不鉴权且只接受
+                    GET（ServeResourceHTTP 第一行就挡掉非 GET）。
+    要管理密钥   ── selftest（烧额度）/ clear（清库，破坏性）/ dry_run / role
+                    前两个是插件自己的 POST /v0/management/codex-turn-state/*，
+                    后两个是 CPA 自己的 PATCH .../plugins/<id>/config。
+
+  【这是用户在知情下选的】：打开页面、看数据不设登录门 —— 但凡是会改状态或烧
+  额度的动作都要密钥。前提是 CPA 只绑 127.0.0.1、要走 SSH 隧道才能到。密钥是
+  一次性索取的：第一次点四个操作里的任意一个时弹一次，之后本标签页内不再问，
+  只存 sessionStorage，不落磁盘、不进 URL。
+
+  ⚠ 由此产生一个必须记住的事实：status 不鉴权可读，而它返回的 auth_id 就是
+    账号文件名，【含客户邮箱】。哪天有人考虑把 8317 暴露到公网、或者在它前面
+    挂反代，先回来看这一行 —— 那等于把客户邮箱列表做成了匿名可读接口。破坏性
+    动作有密钥挡着，但「看」这一层是敞开的，别忘了它也泄露信息。
+
+  不要往这个文件里写任何密钥、账号名或 token。
 -->
 <html lang="zh-CN">
 <head>
@@ -78,15 +97,14 @@ section { margin-bottom: 18px; }
   border-radius: 8px; padding: 12px 14px;
 }
 
-/* ---------- 密钥输入门 ---------- */
-#gate { max-width: 520px; margin: 8vh auto; }
-#gate p { color: var(--muted); margin: 8px 0 14px; }
-#gate input {
+/* ---------- 模态里的密钥输入（惰性索取，不是登录门） ---------- */
+#modalInput {
   width: 100%; padding: 9px 11px; font-family: inherit; font-size: 14px;
+  margin-top: 4px;
   background: var(--raised); color: var(--fg);
   border: 1px solid var(--border); border-radius: 6px;
 }
-#gate input:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+#modalInput:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
 
 /* ---------- 顶栏 ---------- */
 header.bar { margin-bottom: 14px; }
@@ -106,6 +124,10 @@ header.bar { margin-bottom: 14px; }
 .badge.dry-on b { color: var(--warn); }
 .badge.dry-off { background: var(--bad-bg); border-color: var(--bad); }
 .badge.dry-off b { color: var(--bad); }
+/* 访问性质标识。中性呈现：陈述事实，不做告警 —— 不鉴权是用户明确选的配置，
+   不是异常状态。虚线边框区别于其它「运行参数」类徽章。 */
+.badge.open { border-style: dashed; }
+.badge.open b { color: var(--muted); font-weight: 600; }
 .freshness { font-size: 12px; color: var(--muted); text-align: right; }
 .freshness.stale { color: var(--bad); }
 
@@ -224,21 +246,7 @@ select {
 </head>
 <body>
 
-<!-- 密钥输入门：页面本身不鉴权，数据接口鉴权，所以密钥在这里要。 -->
-<div id="gate" hidden>
-  <h1>codex-turn-state</h1>
-  <p>这个页面本身不鉴权，数据接口鉴权。请粘贴 CPA 管理密钥。<br>
-     密钥只存在本标签页的 sessionStorage 里，关掉标签页即失效，不会写入 URL 或磁盘。</p>
-  <div id="gateNotice"></div>
-  <form id="gateForm" autocomplete="off">
-    <input id="gateKey" type="password" placeholder="管理密钥" autocomplete="off" spellcheck="false">
-    <div class="row" style="margin-top:10px">
-      <button class="btn primary" type="submit">进入</button>
-    </div>
-  </form>
-</div>
-
-<div id="app" class="wrap" hidden>
+<div id="app" class="wrap">
   <header class="bar">
     <div class="row">
       <h1>codex-turn-state</h1>
@@ -301,6 +309,7 @@ select {
   <div class="box" role="dialog" aria-modal="true" aria-labelledby="modalTitle">
     <h3 id="modalTitle"></h3>
     <div class="lines" id="modalLines"></div>
+    <input id="modalInput" type="password" autocomplete="off" spellcheck="false" hidden>
     <div class="acts">
       <button class="btn" id="modalCancel" type="button">取消</button>
       <button class="btn" id="modalOk" type="button"></button>
@@ -311,14 +320,21 @@ select {
 <script>
 "use strict";
 
-// 密钥只放 sessionStorage。localStorage 会跨标签页、跨重启留存，管理密钥不该
-// 有那种寿命；URL 更不行（会进历史记录、Referer 和反代日志）。
+// 密钥只放 sessionStorage。这把钥匙能改 CPA 的全局配置，localStorage 那种
+// 跨标签页、跨重启的寿命不值得为省一次输入去换；URL 更不行（会进历史记录、
+// Referer 和反代日志）。
 var KEY_STORE = "cts.mgmtKey";
 var POLL_MS = 10000;
 
-var MGMT = "/v0/management";
-var API = MGMT + "/codex-turn-state";
-var CONFIG_API = MGMT + "/plugins/codex-turn-state/config";
+// 不鉴权、GET-only。只有查看数据（status）走这里，页面打开直接拉。
+var RES = "/v0/resource/plugins/codex-turn-state";
+// 要管理密钥。破坏性 / 烧额度的动作都在这儿：
+//   MGMT_API/selftest、MGMT_API/buckets/clear —— 插件自己的鉴权接口
+//   CONFIG_API（PATCH dry_run/role）        —— CPA 自己的接口
+// clear 会清库、selftest 会烧额度，匿名 GET 挡不住故意或爬虫/预取，所以这两个
+// 和 dry_run/role 一样保持鉴权，统一走一次性密钥。
+var MGMT_API = "/v0/management/codex-turn-state";
+var CONFIG_API = "/v0/management/plugins/codex-turn-state/config";
 
 var state = {
   key: null,
@@ -394,16 +410,15 @@ function notify(kind, message) {
   return line;
 }
 
-function gateNotice(message) {
-  var box = $("gateNotice");
-  clear(box);
-  if (message) {
-    box.appendChild(el("div", { cls: "notice err" }, [el("div", { cls: "msg", text: message })]));
-  }
+// 「清除密钥」只在手上确实握着密钥时才有意义，否则是个空按钮。
+function renderKeyState() {
+  $("btnForget").hidden = !state.key;
 }
 
 /* ---------------------------- 模态确认 ---------------------------- */
 
+// opts.input 为 true 时是取值对话框：确认后 resolve 输入的字符串，取消 resolve
+// null。否则是确认对话框：resolve 布尔。
 function confirmDialog(opts) {
   return new Promise(function (resolve) {
     var modal = $("modal");
@@ -415,25 +430,42 @@ function confirmDialog(opts) {
     });
     var ok = $("modalOk");
     var cancel = $("modalCancel");
+    var input = $("modalInput");
     ok.textContent = opts.confirmText || "确认";
     ok.className = "btn " + (opts.danger ? "danger" : "primary");
 
+    input.hidden = !opts.input;
+    input.value = "";
+    if (opts.input) { input.placeholder = opts.placeholder || ""; }
+
     function done(v) {
       modal.hidden = true;
+      input.value = "";           // 别把密钥留在 DOM 里
+      input.hidden = true;
       ok.removeEventListener("click", onOk);
       cancel.removeEventListener("click", onCancel);
+      input.removeEventListener("keydown", onEnter);
       document.removeEventListener("keydown", onKey);
       resolve(v);
     }
-    function onOk() { done(true); }
-    function onCancel() { done(false); }
-    function onKey(e) { if (e.key === "Escape") { done(false); } }
+    function onOk() {
+      if (opts.input) {
+        var v = input.value.trim();
+        done(v ? v : null);
+      } else {
+        done(true);
+      }
+    }
+    function onCancel() { done(opts.input ? null : false); }
+    function onKey(e) { if (e.key === "Escape") { onCancel(); } }
+    function onEnter(e) { if (e.key === "Enter") { e.preventDefault(); onOk(); } }
 
     ok.addEventListener("click", onOk);
     cancel.addEventListener("click", onCancel);
     document.addEventListener("keydown", onKey);
     modal.hidden = false;
-    cancel.focus();
+    if (opts.input) { input.addEventListener("keydown", onEnter); input.focus(); }
+    else { cancel.focus(); }
   });
 }
 
@@ -444,17 +476,35 @@ function setKey(k) {
   try { sessionStorage.setItem(KEY_STORE, k); } catch (e) { /* 隐私模式下忽略 */ }
 }
 
+// 只丢弃密钥，【不动页面】。只读部分本来就不需要密钥，把整页退回登录态会把
+// 一个配置接口的鉴权失败放大成「看板挂了」。
 function forgetKey(reason) {
   state.key = null;
   try { sessionStorage.removeItem(KEY_STORE); } catch (e) { /* 忽略 */ }
-  stopPolling();
-  state.data = null;
-  state.lastGood = null;
-  $("app").hidden = true;
-  $("gate").hidden = false;
-  gateNotice(reason || null);
-  $("gateKey").value = "";
-  $("gateKey").focus();
+  renderKeyState();
+  if (reason) { notify("err", reason); }
+}
+
+// 惰性索取：四个操作（dry_run / role / clear / selftest）第一次点任意一个时
+// 走到这里，同一标签页内只问一次。返回 Promise<string|null>，null 表示取消。
+function ensureKey(purpose) {
+  if (state.key) { return Promise.resolve(state.key); }
+  return confirmDialog({
+    title: "需要 CPA 管理密钥",
+    confirmText: "确定",
+    input: true,
+    placeholder: "管理密钥",
+    lines: [
+      { text: purpose },
+      { text: "查看数据不需要密钥，但任何会改状态或烧额度的动作（dry_run、role、清空桶、连通性自检）都要，插件绕不过去。" },
+      { text: "密钥只存在本标签页，关掉即失效，不写磁盘、不进 URL。同一标签页内不会再问第二次。" }
+    ]
+  }).then(function (v) {
+    if (!v) { return null; }
+    setKey(v);
+    renderKeyState();
+    return v;
+  });
 }
 
 // ApiError 携带服务端原话。403 的原因有好几种（远程管理关闭、IP 被封 30 分钟），
@@ -465,26 +515,42 @@ function ApiError(status, message) {
 }
 ApiError.prototype = Object.create(Error.prototype);
 
-function api(path, opts) {
-  opts = opts || {};
-  var init = {
-    method: opts.method || "GET",
-    headers: { "X-Management-Key": state.key },
-    cache: "no-store"
-  };
-  if (opts.body !== undefined) {
-    init.headers["Content-Type"] = "application/json";
-    init.body = JSON.stringify(opts.body);
-  }
-  return fetch(path, init).then(function (res) {
-    return res.text().then(function (raw) {
-      var parsed = null;
-      if (raw) { try { parsed = JSON.parse(raw); } catch (e) { parsed = null; } }
-      if (res.ok) { return parsed === null ? {} : parsed; }
-      var msg = (parsed && (parsed.error || parsed.message)) || raw || ("HTTP " + res.status);
-      throw new ApiError(res.status, String(msg));
-    });
+function readResponse(res) {
+  return res.text().then(function (raw) {
+    var parsed = null;
+    if (raw) { try { parsed = JSON.parse(raw); } catch (e) { parsed = null; } }
+    if (res.ok) { return parsed === null ? {} : parsed; }
+    var msg = (parsed && (parsed.error || parsed.message)) || raw || ("HTTP " + res.status);
+    throw new ApiError(res.status, String(msg));
   });
+}
+
+function qs(params) {
+  var parts = [];
+  Object.keys(params || {}).forEach(function (k) {
+    var v = params[k];
+    if (v === undefined || v === null || v === "") { return; }
+    parts.push(encodeURIComponent(k) + "=" + encodeURIComponent(String(v)));
+  });
+  return parts.length ? ("?" + parts.join("&")) : "";
+}
+
+// 不鉴权的 resource 接口：GET-only，不带任何鉴权头。只有 status 走这里。
+function resGet(path, params) {
+  return fetch(RES + path + qs(params), { method: "GET", cache: "no-store" })
+    .then(readResponse);
+}
+
+// 鉴权的 management 接口：带管理密钥 + JSON body。调用前必须先 ensureKey()。
+// selftest / clear / config 都走这条。用 POST/PATCH 而非 GET query，鉴权动作
+// 不需要防浏览器预取，也不该把参数留进历史记录。
+function mgmtSend(url, method, body) {
+  return fetch(url, {
+    method: method,
+    headers: { "X-Management-Key": state.key, "Content-Type": "application/json" },
+    cache: "no-store",
+    body: JSON.stringify(body)
+  }).then(readResponse);
 }
 
 // 401/403 一律退回输入态。401 是密钥本身不对；403 另有原因，把服务端原话带上。
@@ -522,6 +588,9 @@ function renderBadges(d) {
   badge("ttl", (d.ttl_seconds || 0) + "s");
   badge("长度", (d.template_length || 0) + " → 换 " + (d.replace_length || 0));
   badge("store_dir", d.store_dir || "—");
+  // 陈述当前页面的访问性质：查看数据匿名，任何改动 / 烧额度的动作都要密钥。
+  // 谁打开这个页面都该知道「能看到」不等于「有权操作」。
+  badge("访问", "只读不鉴权 · 操作需密钥", "open");
 }
 
 function renderFreshness() {
@@ -691,8 +760,7 @@ function render() {
 /* ---------------------------- 轮询 ---------------------------- */
 
 function refresh() {
-  if (!state.key) { return Promise.resolve(); }
-  return api(API + "/status").then(function (d) {
+  return resGet("/status").then(function (d) {
     state.data = d;
     state.lastGood = new Date();
     state.lastError = null;
@@ -735,8 +803,17 @@ function actionError(err) {
   notify("err", (err && err.message) ? err.message : String(err));
 }
 
-function patchConfig(patch) {
-  return api(CONFIG_API, { method: "PATCH", body: patch });
+// 先确保有密钥再发。用户取消输入就当作放弃这次操作，返回 null 静默收场。
+// 四个动作（dry_run/role/clear/selftest）都经过这里，所以一次性密钥对它们统一。
+function authedSend(url, method, body, purpose) {
+  return ensureKey(purpose).then(function (key) {
+    if (!key) { return null; }
+    return mgmtSend(url, method, body);
+  });
+}
+
+function patchConfig(patch, purpose) {
+  return authedSend(CONFIG_API, "PATCH", patch, purpose);
 }
 
 function doToggleDryRun() {
@@ -764,7 +841,10 @@ function doToggleDryRun() {
   p.then(function (go) {
     if (!go) { return; }
     return withBusy(function () {
-      return patchConfig({ dry_run: turningOn }).then(function () {
+      return patchConfig({ dry_run: turningOn },
+        "要把 dry_run 改成 " + (turningOn ? "ON" : "OFF") + "。"
+      ).then(function (r) {
+        if (r === null) { return; }      // 用户没给密钥，放弃
         notify("ok", "dry_run 已切换为 " + (turningOn ? "ON（只记录）" : "OFF（改写真实流量）"));
         return refresh();
       });
@@ -789,7 +869,8 @@ function doToggleRole() {
   }).then(function (go) {
     if (!go) { return; }
     return withBusy(function () {
-      return patchConfig({ role: next }).then(function () {
+      return patchConfig({ role: next }, "要把 role 切到 " + next + "。").then(function (r) {
+        if (r === null) { return; }      // 用户没给密钥，放弃
         notify("info", "role 已切到 " + next +
           "。若接下来发现钩子没被调用（probe 采不到 / business 不替换），重启一次 cli-proxy-api。");
         return refresh();
@@ -810,8 +891,10 @@ function doClearBucket(auth, model) {
   }).then(function (go) {
     if (!go) { return; }
     return withBusy(function () {
-      return api(API + "/buckets/clear", { method: "POST", body: { auth_id: auth, model: model } })
-        .then(function (r) {
+      return authedSend(MGMT_API + "/buckets/clear", "POST",
+        { auth_id: auth, model: model }, "要清空桶 " + auth + " / " + model + "。"
+      ).then(function (r) {
+          if (r === null) { return; }      // 用户没给密钥，放弃
           notify("ok", "已清空 " + (r && r.cleared !== undefined ? r.cleared : 1) + " 个桶：" + auth + " / " + model);
           return refresh();
         });
@@ -832,8 +915,10 @@ function doClearAll() {
   }).then(function (go) {
     if (!go) { return; }
     return withBusy(function () {
-      return api(API + "/buckets/clear", { method: "POST", body: { all: true } })
-        .then(function (r) {
+      return authedSend(MGMT_API + "/buckets/clear", "POST",
+        { all: true }, "要清空全部桶。"
+      ).then(function (r) {
+          if (r === null) { return; }      // 用户没给密钥，放弃
           notify("ok", "已清空 " + (r && r.cleared !== undefined ? r.cleared : "全部") + " 个桶。");
           return refresh();
         });
@@ -902,9 +987,13 @@ function doSelfTest(opts) {
     if (!go) { return; }
     var body = { model: model };
     if (auth) { body.auth_id = auth; }
+    var purpose = auth
+      ? ("要对 " + auth + " / " + model + " 跑一次连通性自检（会烧额度）。")
+      : ("要对 " + model + " 跑一次连通性自检（会烧额度）。");
     return withBusy(function () {
-      return api(API + "/selftest", { method: "POST", body: body })
+      return authedSend(MGMT_API + "/selftest", "POST", body, purpose)
         .then(function (r) {
+          if (r === null) { return; }      // 用户没给密钥，放弃
           notify(selfTestKind(r), selfTestMessage(r, model));
           return refresh();
         });
@@ -921,20 +1010,12 @@ function doSelfTest(opts) {
 
 /* ---------------------------- 启动 ---------------------------- */
 
-$("gateForm").addEventListener("submit", function (e) {
-  e.preventDefault();
-  var k = $("gateKey").value.trim();
-  if (!k) { gateNotice("请输入管理密钥。"); return; }
-  setKey(k);
-  gateNotice(null);
-  $("gate").hidden = true;
-  $("app").hidden = false;
-  refresh().then(function () {
-    if (state.key) { startPolling(); }
-  });
+$("btnForget").addEventListener("click", function () {
+  state.key = null;
+  try { sessionStorage.removeItem(KEY_STORE); } catch (e) { /* 忽略 */ }
+  renderKeyState();
+  notify("ok", "已清除本标签页的管理密钥。下次改 dry_run / role 时会重新询问。");
 });
-
-$("btnForget").addEventListener("click", function () { forgetKey("密钥已清除。"); });
 
 $("btnPause").addEventListener("click", function () {
   state.paused = !state.paused;
@@ -950,17 +1031,11 @@ $("btnClearAll").addEventListener("click", doClearAll);
 $("btnSelftest").addEventListener("click", function () { doSelfTest(); });
 
 (function boot() {
-  var saved = null;
-  try { saved = sessionStorage.getItem(KEY_STORE); } catch (e) { saved = null; }
-  if (saved) {
-    state.key = saved;
-    $("gate").hidden = true;
-    $("app").hidden = false;
-    refresh().then(function () { if (state.key) { startPolling(); } });
-  } else {
-    $("gate").hidden = false;
-    $("gateKey").focus();
-  }
+  // 没有登录门：直接拉数据渲染。sessionStorage 里若还留着密钥就捡回来，纯粹是
+  // 为了同一标签页内改 dry_run / role 时不再问第二次。
+  try { state.key = sessionStorage.getItem(KEY_STORE) || null; } catch (e) { state.key = null; }
+  renderKeyState();
+  refresh().then(startPolling);
 })();
 </script>
 </body>
