@@ -710,3 +710,134 @@ func TestProbeRunNeverLeaksAProxyPassword(t *testing.T) {
 		t.Fatal("no masked proxy appears anywhere, so this test proved nothing")
 	}
 }
+
+// --- concurrency ---------------------------------------------------------
+
+// The sweep used to fire one bucket at a time, and spent almost all of a
+// thirteen-minute run waiting on an upstream that answers in anything between six
+// and sixty seconds. A pinned credential's models are independent, so they go
+// together now.
+//
+// Worth asserting explicitly because a regression here is invisible: the sweep
+// still works and still fills the same buckets, it just takes four times as long,
+// which nothing else in this suite would notice.
+func TestProbeFiresOneAccountsModelsTogether(t *testing.T) {
+	resetProbeRunner(t)
+	shrinkProbeWaits(t)
+
+	var counter sync.Mutex
+	inFlight, peak := 0, 0
+	fake := newFakeCPA(t, fakeAuthSeed{name: probeTestAccount, authIndex: "0"})
+	fake.onFire = func() {
+		counter.Lock()
+		inFlight++
+		if inFlight > peak {
+			peak = inFlight
+		}
+		counter.Unlock()
+		// Held open so overlap is observable at all: without it each request
+		// could finish before the next begins and the peak would read 1 even
+		// though the calls really were concurrent.
+		time.Sleep(60 * time.Millisecond)
+		counter.Lock()
+		inFlight--
+		counter.Unlock()
+	}
+
+	options := probeTestOptions(t.TempDir(), fake.server.URL)
+	options.models = []string{"m-1", "m-2", "m-3", "m-4"}
+	mustConfigure(t, probeTestConfig(t, options))
+
+	if errStart := probeRunStart(); errStart != nil {
+		t.Fatalf("probeRunStart refused a complete config: %v", errStart)
+	}
+	if run := waitForProbeRun(t); run.Error != "" {
+		t.Fatalf("the sweep failed: %s", run.Error)
+	}
+
+	counter.Lock()
+	observed := peak
+	counter.Unlock()
+	if observed < 2 {
+		t.Fatalf("peak concurrent fires = %d, want at least 2: the models were fired one after another", observed)
+	}
+	if observed > probeMaxInFlight {
+		t.Fatalf("peak concurrent fires = %d, want at most probeMaxInFlight (%d)", observed, probeMaxInFlight)
+	}
+}
+
+// Grouping is what makes concurrency safe: every request in a round is attributed
+// to whichever credential is currently the sole enabled one, so two credentials'
+// models sharing a round would hand one account's token to the other -- the first
+// rule this plugin exists to keep. Adjacent-only merging is the guard, and this
+// pins it against a target list that stopped being account-major.
+func TestProbeGroupTargetsNeverMergesTwoAccounts(t *testing.T) {
+	groups := probeGroupTargets([]probeTarget{
+		{account: "a.json", model: "m-1"},
+		{account: "a.json", model: "m-2"},
+		{account: "b.json", model: "m-1"},
+		{account: "a.json", model: "m-3"},
+	})
+
+	if len(groups) != 3 {
+		t.Fatalf("got %d groups, want 3 -- an interleaved list must not collapse into one round per account", len(groups))
+	}
+	if groups[0].account != "a.json" || len(groups[0].models) != 2 {
+		t.Fatalf("first group = %+v, want a.json with two models", groups[0])
+	}
+	if groups[1].account != "b.json" || len(groups[1].models) != 1 {
+		t.Fatalf("second group = %+v, want b.json alone", groups[1])
+	}
+	if groups[2].account != "a.json" || len(groups[2].models) != 1 {
+		t.Fatalf("third group = %+v, want a.json's trailing model in its own round", groups[2])
+	}
+}
+
+// The second exit exists for the models the first one did not serve. Re-firing
+// the whole set would double the quota spent on an account whose good model
+// already landed, and the 2026-09-18 run showed both exits returning identical
+// results on every bucket -- so the cost is real and the yield is not.
+func TestProbeSecondExitOnlyRefiresWhatTheFirstMissed(t *testing.T) {
+	resetProbeRunner(t)
+	shrinkProbeWaits(t)
+
+	fake := newFakeCPA(t, fakeAuthSeed{
+		name:      probeTestAccount,
+		authIndex: "0",
+		proxyURL:  "socks5h://exit-original.invalid:1080",
+	})
+	// "lucky" fills on whichever exit is live when it is asked; "stubborn" never
+	// does, which is the shape of a model whose honeymoon has closed.
+	fake.onFire = func() { seedLiveTemplate(probeTestAccount, "lucky") }
+
+	options := probeTestOptions(t.TempDir(), fake.server.URL)
+	options.models = []string{"lucky", "stubborn"}
+	options.proxies = []string{
+		"socks5h://prober:" + testProxySecret + "@exit-1.invalid:1080",
+		"socks5h://prober:" + testProxySecret + "@exit-2.invalid:1080",
+	}
+	mustConfigure(t, probeTestConfig(t, options))
+
+	if errStart := probeRunStart(); errStart != nil {
+		t.Fatalf("probeRunStart refused a complete config: %v", errStart)
+	}
+	if run := waitForProbeRun(t); run.Error != "" {
+		t.Fatalf("the sweep failed: %s", run.Error)
+	}
+
+	lucky, stubborn := 0, 0
+	for _, call := range fake.calls() {
+		switch call {
+		case "fire lucky":
+			lucky++
+		case "fire stubborn":
+			stubborn++
+		}
+	}
+	if lucky != 1 {
+		t.Fatalf("fired lucky %d times, want 1: a model that already filled must not be re-fired on the next exit", lucky)
+	}
+	if stubborn != 2 {
+		t.Fatalf("fired stubborn %d times, want 2 (one per configured exit)", stubborn)
+	}
+}

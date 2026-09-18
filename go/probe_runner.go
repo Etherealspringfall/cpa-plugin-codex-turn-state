@@ -98,6 +98,13 @@ const (
 	probeMgmtTimeout    = 30 * time.Second
 	probeRestoreTimeout = 2 * time.Minute
 
+	// probeMaxInFlight bounds how many of one account's models are fired at once.
+	// The models of a pinned account are independent, so the ceiling is politeness
+	// rather than correctness: a scope with twenty models should not open twenty
+	// simultaneous upstream requests on a single credential. Four covers the usual
+	// four- or five-model scope in one or two rounds.
+	probeMaxInFlight = 4
+
 	// probeMaxBodyBytes caps what is read from a response. The bodies of interest
 	// are small JSON documents; an unbounded read here would let a misrouted
 	// request pull an arbitrary amount into the plugin's heap.
@@ -111,14 +118,20 @@ const (
 var (
 	// probeBucketWait is how long one exit gets to produce a live template.
 	//
-	// Eight seconds against scripts/probe.py's ninety, and the difference is not
+	// Three seconds against scripts/probe.py's ninety, and the difference is not
 	// impatience. The script polled CPA's management API from another process, so
 	// the harvest, the store write and the index update all had to land before it
 	// could see anything. Here the harvest runs on the response interceptor in
 	// this same process, before the POST above it returns: anything that is going
 	// to arrive has already arrived, and this window only has to absorb the
 	// one-second throttle in refreshStoreLocked.
-	probeBucketWait = 8 * time.Second
+	//
+	// The 2026-09-18 run settles the size empirically: every bucket that filled,
+	// filled in the *same second* the POST returned -- "fired ... http=200" and
+	// "ready ..." carry one timestamp. The window is therefore pure loss on every
+	// bucket that does not fill, which is most of them, so it is cut to just over
+	// the one-second throttle it exists to absorb.
+	probeBucketWait = 3 * time.Second
 	probePollEvery  = time.Second
 
 	// probeSettle is the pause after flipping credential state. CPA reloads that
@@ -393,43 +406,58 @@ func probeSweep(ctx context.Context, cfg pluginConfig, accounts, models, proxies
 		return
 	}
 
-	// sole is the credential currently left enabled. Targets arrive grouped by
-	// account, so this flips once per account rather than once per bucket -- the
-	// same shape scripts/probe.py has, and each flip costs one PATCH per
-	// credential plus a settle.
-	sole := ""
-	for _, target := range targets {
+	// One pass per account rather than per bucket. Sole-enablement is what makes a
+	// harvest attributable, so it has to change once per account and no oftener --
+	// each flip costs one PATCH per credential plus a settle.
+	for _, group := range probeGroupTargets(targets) {
 		if ctx.Err() != nil {
 			probeRunLog("stopped on request")
 			return
 		}
-		probeRunUpdate(func(run *probeRunState) { run.Current = target.account + " / " + target.model })
+		probeRunUpdate(func(run *probeRunState) {
+			run.Current = fmt.Sprintf("%s (%d model(s))", group.account, len(group.models))
+		})
 
-		if sole != target.account {
-			if errEnable := client.enableOnly(ctx, auths, target.account); errEnable != nil {
-				probeRunFail(fmt.Errorf("could not make %s the sole enabled Codex credential: %w", target.account, errEnable))
-				return
-			}
-			sole = target.account
-			probeRunLog("%s is now the sole enabled Codex credential", target.account)
-			if !probeSleep(ctx, probeSettle) {
-				probeRunLog("stopped on request")
-				return
-			}
+		if errEnable := client.enableOnly(ctx, auths, group.account); errEnable != nil {
+			probeRunFail(fmt.Errorf("could not make %s the sole enabled Codex credential: %w", group.account, errEnable))
+			return
+		}
+		probeRunLog("%s is now the sole enabled Codex credential", group.account)
+		if !probeSleep(ctx, probeSettle) {
+			probeRunLog("stopped on request")
+			return
 		}
 
-		harvested, errFatal := probeOneBucket(ctx, cfg, client, target, proxies, snapshot, touched)
-		if errFatal != nil {
+		if errFatal := probeOneAccount(ctx, cfg, client, group, proxies, snapshot, touched); errFatal != nil {
 			probeRunFail(errFatal)
 			return
 		}
-		probeRunUpdate(func(run *probeRunState) { run.Done++ })
-		if harvested {
-			probeRunLog("ready %s / %s", target.account, target.model)
+	}
+}
+
+// probeAccountGroup is one credential's pending models, in scope order.
+type probeAccountGroup struct {
+	account string
+	models  []string
+}
+
+// probeGroupTargets collapses the account-major target list into one entry per
+// account, which is what lets a whole account's models be fired together.
+//
+// It relies on probePendingTargets emitting account-major order and only merges
+// adjacent runs, so a list that ever stopped being grouped would produce two
+// entries for one account rather than silently interleaving two credentials'
+// models into one pinned round -- the failure that would cross accounts.
+func probeGroupTargets(targets []probeTarget) []probeAccountGroup {
+	groups := make([]probeAccountGroup, 0, len(targets))
+	for _, target := range targets {
+		if last := len(groups) - 1; last >= 0 && groups[last].account == target.account {
+			groups[last].models = append(groups[last].models, target.model)
 			continue
 		}
-		probeRunLog("no template for %s / %s", target.account, target.model)
+		groups = append(groups, probeAccountGroup{account: target.account, models: []string{target.model}})
 	}
+	return groups
 }
 
 // probeOneBucket fills one bucket, trying each configured exit in turn.
@@ -438,7 +466,7 @@ func probeSweep(ctx context.Context, cfg pluginConfig, accounts, models, proxies
 // out is not an error: it means that exit is not in a honeymoon right now, which
 // is exactly what the next candidate is for. The only fatal outcome is a failure
 // to *switch* the exit -- see setProxyVerified.
-func probeOneBucket(ctx context.Context, cfg pluginConfig, client *probeClient, target probeTarget, proxies []string, snapshot []probeRestoreEntry, touched map[string]bool) (bool, error) {
+func probeOneAccount(ctx context.Context, cfg pluginConfig, client *probeClient, group probeAccountGroup, proxies []string, snapshot []probeRestoreEntry, touched map[string]bool) error {
 	// A nil entry means "leave the credential's own exit alone", which is what an
 	// empty probe_proxies asks for. It is not the same as an empty string: an
 	// empty string would clear the credential's override, and that is a change
@@ -452,39 +480,94 @@ func probeOneBucket(ctx context.Context, cfg pluginConfig, client *probeClient, 
 		}
 	}
 
+	// remaining shrinks as models fill, so exit 2 only re-fires what exit 1 missed
+	// rather than the whole set. The exit itself is a per-credential setting, so it
+	// is switched once per round, not once per model -- which is where the old
+	// shape spent a PATCH and a settle per bucket.
+	remaining := append([]string(nil), group.models...)
+
 	for index, candidate := range attempts {
-		if ctx.Err() != nil {
-			return false, nil
+		if len(remaining) == 0 || ctx.Err() != nil {
+			break
 		}
 		if candidate != nil {
-			entry := probeEntryFor(snapshot, target.account)
+			entry := probeEntryFor(snapshot, group.account)
 			if entry == nil {
-				return false, fmt.Errorf("no snapshot entry for %s, so its exit could not be changed safely", target.account)
+				return fmt.Errorf("no snapshot entry for %s, so its exit could not be changed safely", group.account)
 			}
 			// Marked before the write, not after. A PATCH that answers 200 and
 			// then fails its read-back may still have changed something, and an
 			// exit we are unsure about is exactly the one that must be restored.
-			touched[target.account] = true
+			touched[group.account] = true
 			if errProxy := client.setProxyVerified(ctx, entry, *candidate); errProxy != nil {
-				return false, errProxy
+				return errProxy
 			}
-			probeRunLog("exit %d/%d for %s -> %s (verified by read-back)", index+1, len(attempts), target.account, probeShowProxy(*candidate))
+			probeRunLog("exit %d/%d for %s -> %s (verified by read-back), %d model(s) to try",
+				index+1, len(attempts), group.account, probeShowProxy(*candidate), len(remaining))
 			if !probeSleep(ctx, probeSettle) {
-				return false, nil
+				break
 			}
 		}
-
-		status, note := client.fire(ctx, target.model)
-		probeRunLog("fired %s on %s: http=%d%s", target.model, target.account, status, note)
-
-		if probeWaitForBucket(ctx, cfg, target) {
-			return true, nil
-		}
-		if candidate != nil {
-			probeRunLog("exit %d/%d yielded no template for %s within %s", index+1, len(attempts), target.model, probeBucketWait)
-		}
+		remaining = probeFireRound(ctx, cfg, client, group.account, remaining)
 	}
-	return false, nil
+
+	// Whatever is still here was refused by every exit. Counted as done all the
+	// same: the sweep processed it, it just came back empty.
+	for _, model := range remaining {
+		probeRunLog("no template for %s / %s", group.account, model)
+	}
+	if len(remaining) > 0 {
+		missed := len(remaining)
+		probeRunUpdate(func(run *probeRunState) { run.Done += missed })
+	}
+	return nil
+}
+
+// probeFireRound fires every still-unfilled model of the pinned account at once
+// and returns the ones that produced no template.
+//
+// Concurrency is safe here precisely because the credential is pinned:
+// attribution rests on "the sole enabled Codex credential", which is a property
+// of the enable flags and not of which request happens to be in flight, and the
+// model rides on each individual response. Firing one at a time spent the whole
+// sweep waiting on an upstream that answers in anything between six and sixty
+// seconds -- the 2026-09-18 run took thirteen and a half minutes, of which almost
+// all was one request waiting for the previous one to come back.
+func probeFireRound(ctx context.Context, cfg pluginConfig, client *probeClient, account string, models []string) []string {
+	filled := make([]bool, len(models))
+	gate := make(chan struct{}, probeMaxInFlight)
+	var inFlight sync.WaitGroup
+
+	for index, model := range models {
+		inFlight.Add(1)
+		go func(index int, model string) {
+			defer inFlight.Done()
+			select {
+			case gate <- struct{}{}:
+				defer func() { <-gate }()
+			case <-ctx.Done():
+				return
+			}
+			if ctx.Err() != nil {
+				return
+			}
+			status, note := client.fire(ctx, model)
+			probeRunLog("fired %s on %s: http=%d%s", model, account, status, note)
+			filled[index] = probeWaitForBucket(ctx, cfg, probeTarget{account: account, model: model})
+		}(index, model)
+	}
+	inFlight.Wait()
+
+	still := make([]string, 0, len(models))
+	for index, model := range models {
+		if !filled[index] {
+			still = append(still, model)
+			continue
+		}
+		probeRunLog("ready %s / %s", account, model)
+		probeRunUpdate(func(run *probeRunState) { run.Done++ })
+	}
+	return still
 }
 
 // probeWaitForBucket polls this process's own store until the bucket holds a
