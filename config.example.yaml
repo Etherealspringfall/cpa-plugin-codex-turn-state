@@ -98,7 +98,8 @@ plugins:
       #
       #   所以把某个账号从 probe_accounts 里去掉，【不会】让它停止被替换 ——
       #   只是没人给它采桶，它自然就没得换（空窗）。反过来，加进来也不会
-      #   凭空生成桶，采集只有 probe.py 一条路。
+      #   凭空生成桶，采集只有插件内置的离线探测一条路（前端点击即跑，
+      #   直连上游、不经过 CPA，到期前 5 分钟自动续采）。
 
       # 这一轮探测要覆盖哪几个账号。填账号 JSON 的【文件名】。
       #
@@ -149,6 +150,8 @@ plugins:
       #
       # 这两个值比代理更机密：它们【不出现在任何地方】—— 不进 status、不进
       # /config、不进日志，连掩码形式都没有。日志里只说 set / unset。
-      probe_api_key: ""            # 打 POST /v1/responses 用
-      probe_management_key: ""     # 改账号启用位和 proxy_url 用
+      # probe_api_key 现在【已不再使用】：离线探测直连上游、用账号自己的
+      # access_token 鉴权，不再打 CPA 的 /v1/responses。留着只为兼容旧配置。
+      probe_api_key: ""            # 已废弃，留空即可
+      probe_management_key: ""     # 只读：拉账号清单 + 下载每账号 token，绝不改 CPA
       probe_base_url: http://127.0.0.1:8317

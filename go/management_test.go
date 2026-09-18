@@ -4,10 +4,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -28,6 +30,11 @@ const (
 	// the rest of the keyless actions live.
 	opsProbeStartPath  = mgmtResourcePath + "ops/probe/start"
 	opsProbeCancelPath = mgmtResourcePath + "ops/probe/cancel"
+
+	// The scope editor's menu, on the same unauthenticated prefix. Unlike its
+	// neighbours it only reads, so it takes no confirm=1 -- which is itself part
+	// of the contract asserted below.
+	opsChoicesPath = mgmtResourcePath + "ops/choices"
 )
 
 // --- wire shapes ---------------------------------------------------------
@@ -2307,5 +2314,526 @@ func TestProbeRunRoutesAreKeylessResourcesGuardedByConfirm(t *testing.T) {
 	// be the exact failure confirm=1 exists to prevent.
 	if snapshot := probeRunSnapshot(); snapshot.Running {
 		t.Error("a probe run is in flight after two requests that were refused for lack of confirm=1")
+	}
+}
+
+// --- /ops/choices --------------------------------------------------------
+//
+// The scope editor's menu replaces three hand-typed lists with checkboxes, so
+// the properties worth pinning are the ones that decide whether the operator can
+// trust what they tick:
+//
+//   - it answers with no key and no confirm, or the page renders empty boxes;
+//   - `selected` mirrors the saved scope, or a save silently drops whatever the
+//     page failed to re-tick;
+//   - `label` never carries the customer's email, because this route is
+//     anonymously readable;
+//   - a credential list that cannot be fetched still renders, with the reason.
+
+// choicesCPAFile is one entry of the auth-files listing the fake publishes.
+// Fields are a map rather than a struct so a case can publish a document with
+// the wrong shape if it ever needs to.
+type choicesCPAFile map[string]any
+
+// choicesCPA stands in for CPA's GET /v0/management/auth-files, the only call
+// /ops/choices makes.
+//
+// Local to this file rather than probe_runner_test.go's fakeCPA, which stamps
+// provider "codex" on every entry it publishes: two of the cases below turn on
+// entries the filter must reject, and one of those is a non-Codex provider.
+type choicesCPA struct {
+	server *httptest.Server
+
+	// Everything below is read by the server goroutine and written by the test
+	// goroutine, so it all lives under one mutex rather than relying on the
+	// happens-before edge a request round trip happens to provide.
+	mu sync.Mutex
+	// status is what the listing answers with. 401 is a case, not a malfunction:
+	// it is what a stale probe_management_key produces in production.
+	status int
+	files  []choicesCPAFile
+	// hold blocks the handler until the test closes it, standing in for a CPA
+	// that has accepted the connection and stopped answering.
+	hold chan struct{}
+	// authSeen records the Authorization headers received, so a test can assert
+	// the route really presents the configured key rather than having reached an
+	// unauthenticated listing by accident.
+	authSeen []string
+}
+
+func newChoicesCPA(t *testing.T, files ...choicesCPAFile) *choicesCPA {
+	t.Helper()
+	fake := &choicesCPA{status: http.StatusOK, files: files}
+	fake.server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fake.mu.Lock()
+		hold, status, files := fake.hold, fake.status, fake.files
+		fake.authSeen = append(fake.authSeen, r.Header.Get("Authorization"))
+		fake.mu.Unlock()
+
+		// Outside the lock: a stalled handler holding it would block every other
+		// request instead of just this one.
+		if hold != nil {
+			<-hold
+		}
+		if r.URL.Path != probeRouteAuthFiles {
+			http.Error(w, `{"error":"no such route"}`, http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(status)
+		if status != http.StatusOK {
+			// Shaped like CPA's own refusal, body and all: a response body is one
+			// of the things that could carry something quotable into the error
+			// string the page renders.
+			_, _ = w.Write([]byte(`{"error":"unauthorized"}`))
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"files": files})
+	}))
+	t.Cleanup(fake.server.Close)
+	return fake
+}
+
+// refuse makes the listing answer with status and an error body.
+func (f *choicesCPA) refuse(status int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.status = status
+}
+
+// stall makes every request block until the test ends, so the plugin's own
+// timeout is the only thing that can end the call.
+func (f *choicesCPA) stall(t *testing.T) {
+	t.Helper()
+	gate := make(chan struct{})
+	f.mu.Lock()
+	f.hold = gate
+	f.mu.Unlock()
+	t.Cleanup(func() { close(gate) })
+}
+
+func (f *choicesCPA) authHeaders() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.authSeen...)
+}
+
+// The credentials the fake publishes. Spelled in the production shape --
+// codex-<hex>-<email>-<tier>.json -- because the masking under test is defined
+// against exactly that shape. The addresses are at example.com, which RFC 2606
+// reserves, so nothing here is a real customer.
+const (
+	choicesAuthPro  = "codex-620f5a42-luo.swmu@example.com-pro.json"
+	choicesAuthPlus = "codex-aa11bb22-someone@example.com-plus.json"
+	// A backup copy, which must never become a checkbox: ticking one would put an
+	// operator's backup into a sweep that enables credentials.
+	choicesAuthBak = "codex-620f5a42-luo.swmu@example.com-pro.json.bak"
+	// Not a Codex credential at all. CPA holds these alongside; probing one would
+	// spend a request on a provider this plugin knows nothing about.
+	choicesAuthOther = "gemini-someone@example.com.json"
+)
+
+// choicesConfig is a probe-role config pointed at a fake CPA. Written here
+// rather than reusing probeTestConfig so these cases do not move when the
+// runner's fixtures do.
+func choicesConfig(dir, baseURL, mgmtKey string, accounts, models []string) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "role: probe\nstore_dir: %q\nlog_decisions: false\ndry_run: true\n", dir)
+	fmt.Fprintf(&b, "probe_base_url: %q\n", baseURL)
+	fmt.Fprintf(&b, "probe_api_key: %q\nprobe_management_key: %q\n", "sk-choices-api", mgmtKey)
+	for _, block := range []struct {
+		key    string
+		values []string
+	}{{"probe_accounts", accounts}, {"models", models}} {
+		if len(block.values) == 0 {
+			continue
+		}
+		fmt.Fprintf(&b, "%s:\n", block.key)
+		for _, value := range block.values {
+			fmt.Fprintf(&b, "  - %q\n", value)
+		}
+	}
+	return b.String()
+}
+
+type mgmtChoiceAccount struct {
+	Name     string `json:"name"`
+	Label    string `json:"label"`
+	Disabled bool   `json:"disabled"`
+	Selected bool   `json:"selected"`
+}
+
+type mgmtChoiceModel struct {
+	Name     string `json:"name"`
+	Selected bool   `json:"selected"`
+}
+
+// mgmtChoices mirrors the wire shape the dashboard decodes. Error is spelled
+// without omitempty on the production side; decoding it here as a plain string
+// is what would break if that changed to a pointer or vanished when empty.
+type mgmtChoices struct {
+	Accounts []mgmtChoiceAccount `json:"accounts"`
+	Models   []mgmtChoiceModel   `json:"models"`
+	Error    string              `json:"error"`
+}
+
+// mustChoices fetches /ops/choices exactly as the dashboard does: a bare GET on
+// the unauthenticated prefix, no key, no confirm, no parameters.
+func mustChoices(t *testing.T) (mgmtChoices, mgmtResponse) {
+	t.Helper()
+	resp := driveResource(t, opsChoicesPath, url.Values{})
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET %s returned %d, want 200 (body: %s)", opsChoicesPath, resp.StatusCode, truncateMgmtLog(resp.Body))
+	}
+	var out mgmtChoices
+	if err := json.Unmarshal(resp.Body, &out); err != nil {
+		t.Fatalf("decode choices: %v (body: %s)", err, truncateMgmtLog(resp.Body))
+	}
+	return out, resp
+}
+
+func choiceAccountByName(choices mgmtChoices, name string) (mgmtChoiceAccount, bool) {
+	for _, account := range choices.Accounts {
+		if account.Name == name {
+			return account, true
+		}
+	}
+	return mgmtChoiceAccount{}, false
+}
+
+func choiceModelByName(choices mgmtChoices, name string) (mgmtChoiceModel, bool) {
+	for _, model := range choices.Models {
+		if model.Name == name {
+			return model, true
+		}
+	}
+	return mgmtChoiceModel{}, false
+}
+
+// The route is keyless like the rest of /ops, and -- unlike the rest of /ops --
+// takes no confirm=1. Both halves matter: a key would leave the dashboard, which
+// holds none, with empty checkboxes, and a confirm requirement would do the same,
+// because the page fetches this on load before there is anything to confirm.
+func TestChoicesIsAKeylessResourceNeedingNoConfirm(t *testing.T) {
+	dir := t.TempDir()
+	fake := newChoicesCPA(t, choicesCPAFile{"name": choicesAuthPro, "provider": "codex"})
+	mustConfigure(t, choicesConfig(dir, fake.server.URL, "mk-choices", nil, []string{"gpt-5.5"}))
+
+	reg := driveManagementRegister(t)
+	if len(reg.Resources) == 0 {
+		t.Fatal("no resources declared; this test would pass vacuously")
+	}
+	var declared *mgmtRoute
+	for index, res := range reg.Resources {
+		if res.Path == "/ops/choices" {
+			declared = &reg.Resources[index]
+		}
+	}
+	if declared == nil {
+		t.Fatal("/ops/choices is not registered as a resource, so it would demand a management key the dashboard does not have")
+	}
+	// A Menu on a GET route is the documented way one gets silently re-registered
+	// under the resource prefix. This one belongs there on purpose, and a Menu
+	// would also misrepresent a fetched document as a page to navigate to.
+	if strings.TrimSpace(declared.Menu) != "" {
+		t.Errorf("/ops/choices declares Menu %q; it is fetched by the page, not navigated to", declared.Menu)
+	}
+	for _, route := range reg.Routes {
+		if route.Path == "/ops/choices" {
+			t.Error("/ops/choices is also a management route; a keyless route must live only on the unauthenticated prefix")
+		}
+	}
+
+	// The fetch itself: no key, no confirm, and a body that decodes.
+	choices, _ := mustChoices(t)
+	if len(choices.Models) == 0 {
+		t.Error("choices returned no models on a keyless fetch; the checkboxes would render empty")
+	}
+}
+
+// The listing is CPA's, filtered to Codex credentials, with the saved scope
+// already ticked. Each assertion below stands for one way the editor would
+// mislead: an unfiltered list offers a checkbox that cannot be probed, and a
+// missing `selected` makes the next save drop whatever the operator did not
+// re-tick from memory.
+func TestChoicesListsCPACredentialsAndMarksTheScope(t *testing.T) {
+	dir := t.TempDir()
+	const mgmtKey = "mk-choices-never-show-me"
+	fake := newChoicesCPA(t,
+		// Out of order on purpose: the page must not reshuffle between refreshes.
+		choicesCPAFile{"name": choicesAuthPlus, "provider": "codex", "disabled": true},
+		choicesCPAFile{"name": choicesAuthPro, "provider": "codex", "disabled": false},
+		choicesCPAFile{"name": choicesAuthBak, "provider": "codex"},
+		choicesCPAFile{"name": choicesAuthOther, "provider": "gemini"},
+	)
+	mustConfigure(t, choicesConfig(dir, fake.server.URL, mgmtKey,
+		[]string{choicesAuthPro},
+		// One known model and one the fallback menu has never heard of, so the
+		// union is exercised in both directions at once.
+		[]string{"gpt-5.5", "gpt-local-only"}))
+
+	choices, resp := mustChoices(t)
+	if choices.Error != "" {
+		t.Fatalf("choices reported an error against a healthy CPA: %q", choices.Error)
+	}
+
+	// --- accounts ---
+	gotNames := make([]string, 0, len(choices.Accounts))
+	for _, account := range choices.Accounts {
+		gotNames = append(gotNames, account.Name)
+	}
+	// Sorted by name -- which puts the "620f..." credential ahead of the
+	// "aa11..." one the fake published first -- and neither the .bak copy nor the
+	// non-Codex credential is present.
+	wantNames := []string{choicesAuthPro, choicesAuthPlus}
+	if len(gotNames) != len(wantNames) {
+		t.Fatalf("accounts = %v, want exactly %v (a .bak copy or a non-Codex credential leaked into the menu)", gotNames, wantNames)
+	}
+	for index, want := range wantNames {
+		if gotNames[index] != want {
+			t.Fatalf("accounts = %v, want %v in that order", gotNames, wantNames)
+		}
+	}
+
+	selected, _ := choiceAccountByName(choices, choicesAuthPro)
+	if !selected.Selected {
+		t.Error("the account in probe_accounts came back unselected; the page would render the saved scope as empty")
+	}
+	if selected.Disabled {
+		t.Error("an enabled credential came back disabled")
+	}
+	unselected, _ := choiceAccountByName(choices, choicesAuthPlus)
+	if unselected.Selected {
+		t.Error("an account that is not in probe_accounts came back selected; ticking it was nobody's decision")
+	}
+	// CPA's own flag, passed through rather than used as a filter: a disabled
+	// credential is still a legitimate target, and hiding it would look like the
+	// account had been deleted.
+	if !unselected.Disabled {
+		t.Error("a credential CPA reports as disabled came back enabled")
+	}
+
+	// --- models ---
+	wantModels := []struct {
+		name     string
+		selected bool
+	}{
+		{"gpt-5.5", true},        // configured and in the fallback menu
+		{"gpt-5.6-sol", false},   // menu only
+		{"gpt-6-astra", false},   // menu only
+		{"gpt-local-only", true}, // configured by hand, unknown to the menu
+	}
+	if len(choices.Models) != len(wantModels) {
+		t.Fatalf("models = %+v, want %d entries (the union of the configured list and the fallback menu, de-duplicated)", choices.Models, len(wantModels))
+	}
+	for index, want := range wantModels {
+		got := choices.Models[index]
+		if got.Name != want.name {
+			t.Fatalf("models[%d] = %q, want %q; the union must be sorted so the checkboxes do not reshuffle", index, got.Name, want.name)
+		}
+		if got.Selected != want.selected {
+			t.Errorf("model %q selected=%v, want %v", got.Name, got.Selected, want.selected)
+		}
+	}
+
+	// --- what must not be in the body ---
+	body := string(resp.Body)
+	if strings.Contains(body, mgmtKey) {
+		t.Error("the choices body carries probe_management_key; this route answers without any key at all")
+	}
+	if strings.Contains(body, "probe_management_key\"") {
+		t.Error("the choices body carries a probe_management_key field; these are never displayed, not even empty")
+	}
+	// The fetch really was authenticated. Without this the test would still pass
+	// against a route that reached an unauthenticated listing by accident.
+	headers := fake.authHeaders()
+	if len(headers) == 0 {
+		t.Fatal("the fake CPA saw no request; the accounts above came from somewhere else")
+	}
+	if headers[0] != "Bearer "+mgmtKey {
+		t.Errorf("CPA was called with Authorization %q, want the configured probe_management_key as a bearer", headers[0])
+	}
+}
+
+// The labels are the whole reason this route can be keyless. A credential
+// filename carries a customer's email address, and this document is readable by
+// anyone who can reach the plugin, so what the page *displays* must not contain
+// one.
+//
+// The four shapes below are the ones that decide whether the rule holds: the
+// normal one, a name with no email at all, a name with extra dashes, and the
+// empty string. The last two cases pin the safety property directly -- an email
+// in the final position, which a first-and-last rule applied in the wrong order
+// would publish.
+func TestMaskAuthLabel(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{
+			name: "the normal codex-<hex>-<email>-<tier>.json shape",
+			in:   "codex-620f5a42-luo.swmu@gmail.com-pro.json",
+			want: "620f5a42…pro",
+		},
+		{
+			name: "no email in the name at all",
+			in:   "codex-620f5a42-pro.json",
+			want: "620f5a42…pro",
+		},
+		{
+			// An email containing a dash splits into parts, and the middle carries
+			// a tag nobody needs to see. First and last survive; the rest does not.
+			name: "extra dashes around the email",
+			in:   "codex-620f5a42-luo-swmu@gmail.com-team-pro.json",
+			want: "620f5a42…pro",
+		},
+		{
+			name: "empty string",
+			in:   "",
+			want: "",
+		},
+		{
+			// The case the ordering exists for: drop the email parts first, and
+			// only then take first and last. The other order publishes the address.
+			name: "email in the final position",
+			in:   "codex-620f5a42-luo@gmail.com.json",
+			want: "620f5a42",
+		},
+		{
+			name: "nothing but an email",
+			in:   "codex-luo@gmail.com.json",
+			want: "…",
+		},
+	}
+	for _, c := range cases {
+		got := maskAuthLabel(c.in)
+		if got != c.want {
+			t.Errorf("%s: maskAuthLabel(%q) = %q, want %q", c.name, c.in, got, c.want)
+		}
+		// Belt and braces, and cheap: whatever the shape, an "@" in a label means
+		// an address reached a page that needs no key.
+		if strings.Contains(got, "@") {
+			t.Errorf("%s: maskAuthLabel(%q) = %q, which still carries an email address", c.name, c.in, got)
+		}
+	}
+}
+
+// A credential list that cannot be fetched must still leave a usable page: 200,
+// an empty account list, the models half intact, and a sentence saying why. A
+// 5xx here would blank the whole editor over a setting the operator could fix in
+// ten seconds if anything told them what it was.
+func TestChoicesDegradesWhenCredentialListUnavailable(t *testing.T) {
+	t.Run("management key unset", func(t *testing.T) {
+		dir := t.TempDir()
+		fake := newChoicesCPA(t, choicesCPAFile{"name": choicesAuthPro, "provider": "codex"})
+		mustConfigure(t, choicesConfig(dir, fake.server.URL, "", nil, []string{"gpt-5.5"}))
+
+		choices, _ := mustChoices(t)
+		if len(choices.Accounts) != 0 {
+			t.Errorf("accounts = %+v, want [] when the credential list could not be fetched", choices.Accounts)
+		}
+		if !strings.Contains(choices.Error, "probe_management_key") {
+			t.Errorf("error = %q; it must name the setting that is missing, or the operator has nothing to act on", choices.Error)
+		}
+		// The models half needs no CPA call, so it must survive a failure of the
+		// half that does.
+		if len(choices.Models) != len(knownCodexModels) {
+			t.Errorf("models = %+v, want the fallback menu; a credential fetch failure must not take the model list with it", choices.Models)
+		}
+		// No request should have been made at all: firing an unauthenticated GET
+		// and reporting CPA's 401 would blame the server for a setting on this side.
+		if headers := fake.authHeaders(); len(headers) != 0 {
+			t.Errorf("CPA was called %d time(s) with no key configured; the refusal must be local", len(headers))
+		}
+	})
+
+	t.Run("cpa rejects the key", func(t *testing.T) {
+		dir := t.TempDir()
+		const mgmtKey = "mk-choices-stale-never-show-me"
+		fake := newChoicesCPA(t, choicesCPAFile{"name": choicesAuthPro, "provider": "codex"})
+		fake.refuse(http.StatusUnauthorized)
+		mustConfigure(t, choicesConfig(dir, fake.server.URL, mgmtKey, []string{choicesAuthPro}, []string{"gpt-5.5"}))
+
+		choices, resp := mustChoices(t)
+		if len(choices.Accounts) != 0 {
+			t.Errorf("accounts = %+v, want [] after a 401", choices.Accounts)
+		}
+		if !strings.Contains(choices.Error, "401") {
+			t.Errorf("error = %q; a 401 must be reported as one, because it means a wrong key rather than a wrong path", choices.Error)
+		}
+		if len(choices.Models) == 0 {
+			t.Error("the model list went missing along with the accounts")
+		}
+		// The failure path is the one most likely to quote something back. It must
+		// not quote the key.
+		if strings.Contains(string(resp.Body), mgmtKey) {
+			t.Error("the error body carries probe_management_key verbatim")
+		}
+	})
+}
+
+// An unresponsive CPA must not hang the dashboard. The page cannot render until
+// this returns, so "eventually" is not good enough: the fetch is bounded, and
+// what comes back is the same graceful degradation as any other fetch failure.
+func TestChoicesDoesNotHangOnUnresponsiveCPA(t *testing.T) {
+	dir := t.TempDir()
+	fake := newChoicesCPA(t, choicesCPAFile{"name": choicesAuthPro, "provider": "codex"})
+	fake.stall(t)
+	mustConfigure(t, choicesConfig(dir, fake.server.URL, "mk-choices", nil, []string{"gpt-5.5"}))
+
+	previous := choicesFetchTimeout
+	choicesFetchTimeout = 100 * time.Millisecond
+	t.Cleanup(func() { choicesFetchTimeout = previous })
+
+	// Driven by hand rather than through mustChoices: the call has to happen on
+	// another goroutine so this one can time it out, and t.Fatal must not be
+	// called from there -- it would stop the wrong goroutine and leave the test
+	// hanging on exactly the failure it is meant to report.
+	request, errMarshal := json.Marshal(map[string]any{
+		"Method": http.MethodGet, "Path": opsChoicesPath,
+		"Headers": http.Header{}, "Query": url.Values{}, "Body": nil,
+	})
+	if errMarshal != nil {
+		t.Fatalf("marshal resource request: %v", errMarshal)
+	}
+
+	type outcome struct {
+		raw []byte
+		err error
+	}
+	done := make(chan outcome, 1)
+	go func() {
+		raw, err := handleMethod(pluginabi.MethodManagementHandle, request)
+		done <- outcome{raw: raw, err: err}
+	}()
+
+	select {
+	case got := <-done:
+		if got.err != nil {
+			t.Fatalf("handleMethod(management.handle) GET %s: %v", opsChoicesPath, got.err)
+		}
+		var resp mgmtResponse
+		if result := decodeMgmtEnvelope(t, got.raw); len(result) > 0 {
+			if errUnmarshal := json.Unmarshal(result, &resp); errUnmarshal != nil {
+				t.Fatalf("decode resource response: %v", errUnmarshal)
+			}
+		}
+		if resp.StatusCode != 0 && resp.StatusCode != http.StatusOK {
+			t.Fatalf("a timed-out fetch returned %d, want 200 with the reason in the body", resp.StatusCode)
+		}
+		var choices mgmtChoices
+		if err := json.Unmarshal(resp.Body, &choices); err != nil {
+			t.Fatalf("decode choices: %v (body: %s)", err, truncateMgmtLog(resp.Body))
+		}
+		if choices.Error == "" {
+			t.Error("a timed-out fetch reported no error; the page would render an empty account list as if CPA held none")
+		}
+		if len(choices.Models) == 0 {
+			t.Error("the model list went missing on a timeout, though it needs no CPA call")
+		}
+	case <-time.After(10 * time.Second):
+		// Generous on purpose: what is asserted is "bounded", not "fast".
+		t.Fatal("/ops/choices did not return against an unresponsive CPA")
 	}
 }

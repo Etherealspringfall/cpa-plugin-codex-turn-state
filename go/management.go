@@ -32,6 +32,7 @@
 package main
 
 import (
+	"context"
 	_ "embed"
 	"encoding/json"
 	"fmt"
@@ -121,6 +122,26 @@ const (
 	// handleOpsResource and both require confirm=1.
 	routeOpsProbeStart  = "/ops/probe/start"
 	routeOpsProbeCancel = "/ops/probe/cancel"
+
+	// routeOpsChoices lists what there is to choose from: the Codex credentials
+	// CPA actually holds, and the model ids worth offering. It exists so the scope
+	// editor can be checkboxes instead of three hand-typed lists -- a mistyped
+	// credential name is not rejected anywhere (normaliseProbeScope checks the
+	// shape, not existence), so it survives as a scope entry that silently probes
+	// nothing.
+	//
+	// It is the one /ops route that reads rather than acts, which is why it does
+	// not go through handleOpsResource: confirm=1 guards things that change state
+	// or spend quota, and a bare GET of a list does neither. See the dispatch case
+	// in managementHandle.
+	//
+	// Keyless like its neighbours, and that is what constrains the body: every
+	// field it returns is equivalent to published. Credential filenames carry a
+	// customer's email, so the displayed `label` drops it (maskAuthLabel) and the
+	// full string appears only in `name`, which the page must post back as the
+	// selection value -- the same accepted exposure the status document's auth_id
+	// already carries, and no wider.
+	routeOpsChoices = "/ops/choices"
 )
 
 // managementRegister answers management.register with the route table.
@@ -189,6 +210,13 @@ func managementRegister(raw []byte) ([]byte, error) {
 			// so the operator never supplies one.
 			{Path: routeOpsProbeStart, Description: "启动探测运行（无需鉴权，需 confirm=1，烧额度）"},
 			{Path: routeOpsProbeCancel, Description: "取消探测运行（无需鉴权，需 confirm=1）"},
+			// The scope editor's menu. Read-only, so it is the one /ops route with
+			// no confirm=1 in its description: the page fetches it bare on load,
+			// before the operator has clicked anything, and a confirm requirement
+			// would make the checkboxes fail to populate rather than protect
+			// anything. No Menu, for the same reason as the rest: it is fetched by
+			// the page, not navigated to.
+			{Path: routeOpsChoices, Description: "可选账号/模型清单（无需鉴权，只读）"},
 		},
 	})
 }
@@ -237,6 +265,21 @@ func managementHandle(raw []byte) ([]byte, error) {
 			return okEnvelope(managementError(http.StatusMethodNotAllowed, "selftest is a POST route"))
 		}
 		return okEnvelope(handleSelftest(req.Body))
+	case hasRouteSuffix(path, routeOpsChoices):
+		// Deliberately not folded into the handleOpsResource group below. That
+		// function's contract is "everything past this point changes state or
+		// spends quota", which is what earns it the confirm=1 requirement; this
+		// route only reads, so requiring confirm would be ceremony that buys
+		// nothing and costs the dashboard its checkboxes -- the page fetches this
+		// on load, bare, before any click there could be a confirmation of.
+		//
+		// GET is still enforced here rather than left to the host: the host does
+		// restrict resource routes to GET, but that is the host's rule, and a
+		// second copy of it costs one line and survives the host changing its mind.
+		if method != http.MethodGet && method != "" {
+			return okEnvelope(managementError(http.StatusMethodNotAllowed, "choices is a GET route"))
+		}
+		return okEnvelope(handleChoicesResource())
 	case hasRouteSuffix(path, routeOpsDryRun),
 		hasRouteSuffix(path, routeOpsRole),
 		hasRouteSuffix(path, routeOpsClear),
@@ -381,6 +424,277 @@ func handleProbeCancelResource() pluginapi.ManagementResponse {
 		Cancelled: cancelled,
 		ProbeRun:  probeRunSnapshot(),
 	})
+}
+
+// --- /ops/choices ---------------------------------------------------------
+
+// knownCodexModels is the menu of Codex model ids the scope editor offers when
+// the operator has not already configured one.
+//
+// It is a menu, not a whitelist. Nothing validates against it: /ops/scope stores
+// whatever it is sent, normaliseProbeScope only rejects whitespace, and
+// modelChoices unions cfg.Models over the top of this list -- so a model id that
+// is missing here can still be configured by hand and still comes back checked.
+// That asymmetry is the point. When this list goes stale the operator loses a
+// checkbox; they never lose the ability to select a model, which is what a
+// whitelist here would eventually cost them.
+//
+// The ids are the ones observed in live traffic (see FINDINGS.md) rather than
+// anything CPA publishes -- CPA has no "list the models" route -- which is
+// exactly why it is expected to go stale and why nothing may depend on it being
+// complete.
+//
+// A var because Go has no constant slice; nothing writes to it.
+var knownCodexModels = []string{"gpt-5.5", "gpt-5.6-sol", "gpt-6-astra"}
+
+// choicesFetchTimeout bounds the single CPA call this route makes.
+//
+// The dashboard fetches /ops/choices on load and a person is waiting on it, so
+// the runner's 30-second probeMgmtTimeout is the wrong budget here: an
+// unresponsive CPA would hang the page rather than render it with a reason. Five
+// seconds is far longer than a loopback listing takes and far shorter than a
+// human's patience. A var so tests can shrink it; nothing in production writes
+// to it.
+var choicesFetchTimeout = 5 * time.Second
+
+// choiceAccount is one credential checkbox.
+//
+// Name is the full filename because that is what /ops/scope expects back, and
+// Label is what the page displays: they differ because the filename carries a
+// customer's email and this route answers without a key. See maskAuthLabel.
+type choiceAccount struct {
+	Name  string `json:"name"`
+	Label string `json:"label"`
+	// Disabled is CPA's own flag, passed through so the page can say "this one is
+	// switched off" rather than hiding the row. A disabled credential is still a
+	// legitimate probe target -- the sweep enables exactly one account at a time
+	// anyway -- so filtering it out here would remove a choice that works.
+	Disabled bool `json:"disabled"`
+	// Selected is whether the name is in cfg.ProbeAccounts right now, so the page
+	// renders the saved scope rather than an empty form the operator would have to
+	// re-tick from memory.
+	Selected bool `json:"selected"`
+}
+
+// choiceModel is one model checkbox.
+type choiceModel struct {
+	Name     string `json:"name"`
+	Selected bool   `json:"selected"`
+}
+
+// choicesResponse is the menu the scope editor renders.
+//
+// Error has no omitempty on purpose: the page reads this field unconditionally,
+// and a key that vanishes when it is empty forces it to distinguish "absent"
+// from "empty" for no gain.
+type choicesResponse struct {
+	Accounts []choiceAccount `json:"accounts"`
+	Models   []choiceModel   `json:"models"`
+	Error    string          `json:"error"`
+}
+
+// handleChoicesResource lists what the scope editor can offer.
+//
+// It degrades rather than fails. A credential list that cannot be fetched comes
+// back as 200 with accounts:[] and a populated error, because the page still has
+// to render: the models half needs no CPA call and is always usable, and an
+// operator looking at "probe_management_key is not set" can act on it, whereas a
+// 500 tells them only that something broke. That is also why the model list is
+// built before the fetch is attempted -- so a failure cannot take it with it.
+func handleChoicesResource() pluginapi.ManagementResponse {
+	state.mu.Lock()
+	cfg := state.config
+	state.mu.Unlock()
+
+	out := choicesResponse{
+		// [] rather than null in both slots: the page iterates these directly, and
+		// a null renders as a crash rather than as an empty list.
+		Accounts: []choiceAccount{},
+		Models:   modelChoices(cfg.Models),
+	}
+
+	accounts, errAccounts := choiceAccounts(cfg)
+	if errAccounts != nil {
+		out.Error = errAccounts.Error()
+		// Logged at the same level of detail that is returned, which is to say with
+		// no key in it: choiceAccounts redacts before it returns, so there is only
+		// one sanitised string and both destinations get it.
+		log.Printf(logPrefix+"choices: credential list unavailable: %s", out.Error)
+		return jsonResponse(http.StatusOK, out)
+	}
+	out.Accounts = accounts
+	return jsonResponse(http.StatusOK, out)
+}
+
+// choiceAccounts fetches CPA's Codex credentials and marks the ones already in
+// the scope.
+//
+// The listing comes from the probe runner's client rather than from
+// host.auth.list, which statusAccounts uses. The two differ in what they can
+// tell us: host.auth.list is the credential set as this plugin's host sees it,
+// while GET /v0/management/auth-files is the document the sweep itself will act
+// on -- the same route, the same filter, the same .bak exclusion. A checkbox must
+// name something the sweep can actually probe, so it is built from the sweep's
+// own view.
+//
+// The filter is not repeated here. probeClient.listCodexAuths already drops .bak
+// copies and non-Codex providers, and a second implementation of that rule is a
+// second thing to get wrong -- the .bak exclusion in particular, which exists
+// because enabling an operator's backup copy is a real hazard.
+func choiceAccounts(cfg pluginConfig) ([]choiceAccount, error) {
+	// Answered without a request when there is no key to make one with. The
+	// alternative -- firing an unauthenticated GET and reporting CPA's 401 -- would
+	// blame the server for a setting on this side, and 401 reads as "the key is
+	// wrong" rather than "there is no key".
+	if strings.TrimSpace(cfg.ProbeManagementKey) == "" {
+		return nil, fmt.Errorf("probe_management_key is not set, so CPA's credential list cannot be read; " +
+			"set it in config.yaml and reload, or keep listing probe_accounts by hand")
+	}
+
+	// Bounded here rather than relying on the client's own per-call timeout: that
+	// one is sized for a sweep, this one for a page. Cancelled on every return
+	// path, so a slow CPA cannot leave the request running behind the answer.
+	ctx, cancel := context.WithTimeout(context.Background(), choicesFetchTimeout)
+	defer cancel()
+
+	files, errList := newProbeClient(cfg).listCodexAuths(ctx)
+	if errList != nil {
+		// Redacted even though the paths that produce this error should carry
+		// nothing secret: the message can quote a response body, and this string is
+		// bound for an anonymously readable field and a log line. probeExplainStatus
+		// names probe_management_key by field name, never by value.
+		return nil, fmt.Errorf("could not read CPA's credential list: %s", probeRedact(errList.Error()))
+	}
+
+	selected := make(map[string]bool, len(cfg.ProbeAccounts))
+	for _, name := range cfg.ProbeAccounts {
+		selected[strings.TrimSpace(name)] = true
+	}
+
+	// listCodexAuths sorts by name, so the checkbox order is stable across
+	// refreshes without sorting again here.
+	out := make([]choiceAccount, 0, len(files))
+	for _, file := range files {
+		out = append(out, choiceAccount{
+			Name:     file.Name,
+			Label:    maskAuthLabel(file.Name),
+			Disabled: file.Disabled,
+			Selected: selected[file.Name],
+		})
+	}
+	return out, nil
+}
+
+// modelChoices is the union of the configured models and the known menu.
+//
+// A union rather than either half alone: the menu on its own would hide a model
+// the operator has configured by hand and make it look unselected (their next
+// save would then silently drop it), and the configured list on its own would
+// offer nothing to add on a fresh deploy, which is the moment the checkboxes are
+// most useful.
+//
+// De-duplication is by exact string, not case-insensitively. Model ids reach
+// CPA and the store verbatim -- bucketKey is built from the exact string -- so
+// "GPT-5.5" and "gpt-5.5" are two different buckets, and collapsing them here
+// would render one checkbox whose value is not the one that was configured.
+func modelChoices(configured []string) []choiceModel {
+	selected := make(map[string]bool, len(configured))
+	union := make(map[string]bool, len(configured)+len(knownCodexModels))
+	for _, raw := range configured {
+		name := strings.TrimSpace(raw)
+		if name == "" {
+			continue
+		}
+		selected[name] = true
+		union[name] = true
+	}
+	for _, name := range knownCodexModels {
+		union[name] = true
+	}
+
+	// Sorted because map iteration order is randomised: without this the checkbox
+	// list would reshuffle on every poll of the page.
+	names := make([]string, 0, len(union))
+	for name := range union {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+
+	out := make([]choiceModel, 0, len(names))
+	for _, name := range names {
+		out = append(out, choiceModel{Name: name, Selected: selected[name]})
+	}
+	return out
+}
+
+// maskAuthLabel renders a credential filename safe to display.
+//
+// The names look like codex-620f5a42-luo.swmu@gmail.com-pro.json: an id, a
+// customer's email address, and a tier. This route answers without a key, so the
+// email must not be in what the page shows -- 620f5a42…pro identifies the
+// credential to the operator just as well and identifies the customer to nobody.
+//
+// The rule is "drop every dash-separated part containing an @, then keep the
+// first and last of what survives". Dropping the email parts comes first, and
+// that ordering is the whole safety of the function rather than a detail: on
+// codex-620f5a42-luo@gmail.com.json the email is the *last* part, so a
+// first-and-last rule applied before the drop would publish exactly what this
+// exists to hide.
+//
+// Everything else is best-effort presentation. An unexpected shape yields a
+// shorter or odder label, never a leak, because the only branch that can emit
+// text is the one fed by parts that survived the @ filter.
+//
+// A shorten-this-name helper elsewhere in the package may look equivalent and is
+// not, unless it drops the @ parts before picking first and last. Anything that
+// merely abbreviates is fine for a log line, which is masked further downstream;
+// this one feeds a keyless HTTP response, where it is the last line of defence.
+func maskAuthLabel(name string) string {
+	trimmed := strings.TrimSpace(name)
+	if trimmed == "" {
+		// Nothing in, nothing out. Unreachable from the route -- listCodexAuths
+		// drops empty names -- but a masking helper that panics or invents a label
+		// on an empty string is a bad neighbour for whatever calls it next.
+		return ""
+	}
+
+	// The two fixed affixes carry no information: every credential here has them.
+	body := trimmed
+	if lower := strings.ToLower(body); strings.HasSuffix(lower, ".json") {
+		body = body[:len(body)-len(".json")]
+	}
+	if lower := strings.ToLower(body); strings.HasPrefix(lower, "codex-") {
+		body = body[len("codex-"):]
+	}
+
+	kept := make([]string, 0, 4)
+	for _, part := range strings.Split(body, "-") {
+		part = strings.TrimSpace(part)
+		// The @ test, not a list of known domains: a domain list is a thing to keep
+		// current, and the one it misses is the one that gets published.
+		if part == "" || strings.Contains(part, "@") {
+			continue
+		}
+		kept = append(kept, part)
+	}
+
+	switch len(kept) {
+	case 0:
+		// Everything was email-shaped. An ellipsis is a poor label, and it is the
+		// right answer anyway: the alternative is inventing an identifier out of
+		// the one field we just decided not to show. The checkbox still works --
+		// `name` carries the value the page posts back -- so this costs legibility
+		// for one unusually named credential and nothing else.
+		return "…"
+	case 1:
+		// One survivor is the whole label; joining it to itself would read as two
+		// fields where there is one.
+		return kept[0]
+	default:
+		// First and last, so a name with extra dashes in the middle still renders
+		// as the id and the tier rather than as an ever-growing string.
+		return kept[0] + "…" + kept[len(kept)-1]
+	}
 }
 
 // clearRequestFromQuery builds a clearRequest from the keyless clear route's

@@ -1,58 +1,58 @@
-// In-plugin probe runner: the port of scripts/probe.py's sweep.
+// In-plugin offline harvester: collects X-Codex-Turn-State straight from the
+// upstream, without routing through CPA or touching any CPA state.
 //
-// # Why this makes a real HTTP request instead of calling host.model.execute
+// # Why direct, and why that is safe
 //
-// The host tags every plugin-issued execution with SkipInterceptorPluginID set
-// to the calling plugin's own id, so a request fired through host.model.execute
-// is routed *past* this plugin's response interceptor and can never reach
-// harvestFromResponse. That is why the self-test says, in so many words, that it
-// cannot collect: it can prove the path is alive, it can never fill a bucket.
+// The earlier design harvested by driving CPA: it disabled every Codex account
+// but one (so a harvest on CPA's own response hook could be attributed), PATCHed
+// a proxy into the credential, POSTed to CPA's /v1/responses, and restored all
+// of that afterwards. It cost a real incident when a run died mid-flip and left
+// credentials disabled, and it could never run alongside business traffic.
 //
-// A sweep has to travel the normal interceptor chain, and the only way to do
-// that from inside the process is to be an ordinary client of CPA's public API:
-// POST /v1/responses on CPA's own listener, with a real API key, exactly as
-// scripts/probe.py does from the host side.
+// This harvester instead reads each account's own access_token out of its
+// credential file (a read-only management call, never a write) and calls
+// https://chatgpt.com/backend-api/codex/responses directly, as that account,
+// through that account's own exit. CPA never sees the request. Because we hold
+// the token, the harvest is attributed with certainty -- no sole-enablement, so
+// every account stays enabled and every account × model can fire in parallel.
 //
-// # What it inherits from scripts/probe.py
+// Three rules make it safe to run against live credentials:
+//   - It never writes anything to CPA. The only CPA calls are two GETs:
+//     auth-files (the account list) and auth-files/download (one token).
+//   - It never refreshes a token. An expired token is skipped and left for CPA
+//     to refresh in its own business; refreshing here could rotate the refresh
+//     token and break live traffic. (Access tokens were measured good for days,
+//     so this costs almost nothing.)
+//   - Substitution and harvest now coexist in one process: the business role
+//     reads the store on the request hook while this goroutine fills it.
 //
-// The shape is deliberately the same, because that script is the proven
-// reference: snapshot account state before touching anything, make one account
-// the sole enabled Codex credential so the harvest can be attributed, try each
-// configured exit in turn, and restore on every exit path.
+// # Renewal
 //
-// Two things are different on purpose, and both are improvements the script
-// could not make:
-//
-//   - Readiness is read from this process's own store rather than polled over
-//     the management API. The harvest happens on the response interceptor in
-//     this very process, so by the time the POST returns the bucket is already
-//     written; the wait only has to absorb the store scan's throttle.
-//   - The proxy read-back goes to the credential file itself
-//     (auth-files/download) rather than to the auth-files listing. The listing
-//     carries no per-account proxy field on this CPA build, which is exactly
-//     what stopped the script rotating exits here.
+// A harvested token lives ~3600s. The run does not stop after the first fill: it
+// keeps a background loop that tops up any in-scope bucket once it drops under a
+// few minutes of life left, so the store stays warm for as long as CPA serves
+// traffic. That is the operator's "最后5分钟再获取一遍".
 //
 // # What must never leak out of this file
 //
-// Lines is rendered on a page that needs no management key. A proxy URL's
-// userinfo must therefore never reach Lines, nor an error string, nor the
-// process log: every proxy value is rendered through maskProxyURL, and
-// everything bound for Lines passes through probeRedact as a second line of
-// defence. The two keys this file holds -- probe_api_key and
-// probe_management_key -- are never logged or returned in any form.
+// probeRunState.Lines is rendered on a page that needs no key. No token,
+// turn-state value, or proxy userinfo may reach it: proxies render through
+// probeShowProxy/maskProxyURL, account names through probeShortAuth (they carry
+// a customer email), and everything bound for Lines passes probeRedact as a
+// second line of defence. The management key this file reads is never logged.
 package main
 
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
 	"net/url"
-	"os"
-	"path/filepath"
 	"regexp"
 	"sort"
 	"strings"
@@ -60,85 +60,55 @@ import (
 	"time"
 )
 
-// probeRestoreFileName holds the pre-run account state, in the store directory
-// this plugin owns.
-//
-// scripts/probe.py keeps its snapshot in memory and in a file for the same
-// reason, and the memory half is not enough: a snapshot that exists only in a
-// process is lost the moment that process dies, and a sweep that dies after
-// disabling three of four accounts leaves the operator's credentials switched
-// off with nothing to put them back. That is not hypothetical here -- it cost a
-// real incident. The file is what makes the undo survive a plugin panic or a CPA
-// restart.
-const probeRestoreFileName = "probe-restore.json"
-
-// The routes this runner drives. They are named here rather than spelled inline
-// so a correction for a different CPA build is a one-line change, which is the
-// lesson scripts/probe.py records against CPA.PROXY_ROUTE.
+// The two read-only management routes this harvester uses. Named here rather
+// than inline so a correction for a different CPA build is a one-line change.
+// Nothing else is called on CPA -- there is deliberately no write route in this
+// file any more.
 const (
 	probeRouteAuthFiles    = "/v0/management/auth-files"
-	probeRouteAuthStatus   = "/v0/management/auth-files/status"
-	probeRouteAuthFields   = "/v0/management/auth-files/fields"
 	probeRouteAuthDownload = "/v0/management/auth-files/download"
-	probeRouteResponses    = "/v1/responses"
-	// probeProxyField is the credential field carrying one account's own exit.
-	// CPA's global proxy-url is a different setting entirely and is never written
-	// from here: it carries Kimi, xAI and all daily traffic.
-	probeProxyField = "proxy_url"
+)
+
+// The upstream endpoint and the client identity a probe presents. Both are vars
+// so a test can point them at an httptest server; production never writes them.
+// probeUserAgent mirrors a real codex-tui build, and the call goes out as the
+// same account CPA uses, from the same box -- so the upstream sees nothing it
+// would not see from ordinary Codex traffic.
+var (
+	probeUpstreamURL = "https://chatgpt.com/backend-api/codex/responses"
+	probeUserAgent   = "codex-tui/0.154.0 (Ubuntu 24.04; x86_64) OVH (codex-tui; 0.154.0)"
 )
 
 const (
-	// probeMaxLines bounds the transcript. A sweep over four accounts and five
-	// models emits a few hundred lines; keeping the last forty is enough to say
-	// where it stopped and why, and it means the run state cannot grow without
-	// limit in a process that is meant to stay up for weeks.
+	// probeMaxLines bounds the transcript. Keeping the last forty lines is enough
+	// to say where a run is and why, and it means the run state cannot grow
+	// without limit in a process meant to stay up for weeks.
 	probeMaxLines = 40
 
-	probeFireTimeout    = 120 * time.Second
-	probeMgmtTimeout    = 30 * time.Second
-	probeRestoreTimeout = 2 * time.Minute
+	// probeFireTimeout bounds one upstream call. Only the response headers are
+	// wanted and they arrive before the SSE body, so this is generous; it exists
+	// to stop a hung exit pinning a goroutine.
+	probeFireTimeout = 60 * time.Second
+	probeMgmtTimeout = 30 * time.Second
 
-	// probeMaxInFlight bounds how many of one account's models are fired at once.
-	// The models of a pinned account are independent, so the ceiling is politeness
-	// rather than correctness: a scope with twenty models should not open twenty
-	// simultaneous upstream requests on a single credential. Four covers the usual
-	// four- or five-model scope in one or two rounds.
+	// probeMaxInFlight bounds how many upstream requests are open at once across
+	// the whole run. Attribution no longer needs serialising -- each call carries
+	// its own token -- so this is politeness, not correctness: a scope of four
+	// accounts and several models should not open twenty sockets at once.
 	probeMaxInFlight = 4
 
-	// probeMaxBodyBytes caps what is read from a response. The bodies of interest
-	// are small JSON documents; an unbounded read here would let a misrouted
-	// request pull an arbitrary amount into the plugin's heap.
-	probeMaxBodyBytes = 64 << 10
+	// probeMaxBodyBytes caps what is read from a response. Only headers matter, so
+	// this is just a small polite drain that lets a socket be reused without
+	// pulling an SSE stream into the heap.
+	probeMaxBodyBytes = 1 << 10
 )
 
-// The three waits below are vars rather than consts so the tests can shrink
-// them; nothing in production writes to them. A sweep against a fake CPA
-// otherwise spends its whole time asleep, and a test suite that takes half a
-// minute to say "the restore ran in the right order" is one nobody runs.
+// Renewal cadence. Vars so tests can shrink them; production never writes them.
+// A bucket is topped up once its 3600s token has under probeRenewThreshold of
+// life left, checked every probeRenewInterval.
 var (
-	// probeBucketWait is how long one exit gets to produce a live template.
-	//
-	// Three seconds against scripts/probe.py's ninety, and the difference is not
-	// impatience. The script polled CPA's management API from another process, so
-	// the harvest, the store write and the index update all had to land before it
-	// could see anything. Here the harvest runs on the response interceptor in
-	// this same process, before the POST above it returns: anything that is going
-	// to arrive has already arrived, and this window only has to absorb the
-	// one-second throttle in refreshStoreLocked.
-	//
-	// The 2026-09-18 run settles the size empirically: every bucket that filled,
-	// filled in the *same second* the POST returned -- "fired ... http=200" and
-	// "ready ..." carry one timestamp. The window is therefore pure loss on every
-	// bucket that does not fill, which is most of them, so it is cut to just over
-	// the one-second throttle it exists to absorb.
-	probeBucketWait = 3 * time.Second
-	probePollEvery  = time.Second
-
-	// probeSettle is the pause after flipping credential state. CPA reloads that
-	// state asynchronously, and firing immediately can still hit the previous
-	// candidate set -- which would attribute the harvest to the wrong account,
-	// the one error per-account bucketing exists to prevent.
-	probeSettle = 2 * time.Second
+	probeRenewInterval  = 60 * time.Second
+	probeRenewThreshold = 5 * time.Minute
 )
 
 // probeRunState is the snapshot the dashboard polls. It carries progress and
@@ -155,20 +125,30 @@ type probeRunState struct {
 }
 
 // probeRunner holds the single in-process run. There is deliberately only one at
-// a time: a sweep disables every Codex account but one, so a second sweep
-// starting mid-flight would snapshot the first one's mutations as the "original"
-// state and then restore to that -- turning a temporary flip into a permanent
-// one.
+// a time: the run owns the renewal loop, and a second run would start a second
+// loop harvesting the same buckets on the same credentials for no gain. The run
+// no longer mutates any CPA state -- the harvest is a direct call to the
+// upstream -- so a stop is a clean cancel with nothing to put back.
 var probeRunner struct {
 	mu     sync.Mutex
 	run    probeRunState
 	cancel context.CancelFunc
 }
 
-// probeTarget is one bucket the sweep intends to fill.
+// probeTarget is one bucket the harvester intends to fill.
 type probeTarget struct {
 	account string
 	model   string
+}
+
+// probeCredential is one account's usable state, read once from its credential
+// file. It holds a secret (accessToken) and must never be logged.
+type probeCredential struct {
+	name        string
+	accessToken string
+	accountID   string
+	proxyURL    string
+	expiresAt   time.Time
 }
 
 // probeRunStart validates the run and launches it in the background. It returns
@@ -179,50 +159,28 @@ func probeRunStart() error {
 	cfg := state.config
 	state.mu.Unlock()
 
-	// Role first. Every other refusal below is about a run that could not work;
-	// this one is about a run that must not happen: the sweep flips the disabled
-	// flag on live credentials, and a business process doing that would take
-	// customer traffic down to fill a bucket it does not even write.
-	if !cfg.isProbe() {
-		return fmt.Errorf("role is %q, not %q: a sweep disables every Codex credential except the one being probed, which a business process must never do", cfg.Role, roleProbe)
-	}
-
 	accounts := append([]string(nil), cfg.ProbeAccounts...)
 	models := append([]string(nil), cfg.Models...)
 	proxies := append([]string(nil), cfg.ProbeProxies...)
 
 	switch {
 	case len(accounts) == 0:
-		// No fallback to "all of them". Probing is stop-the-world and spends one
-		// upstream request per bucket, so "nothing selected means everything" is
-		// the single mistake that cannot be undone afterwards.
+		// No fallback to "all of them": harvesting spends one upstream request per
+		// bucket and per renewal, so "nothing selected means everything" is the one
+		// mistake that quietly burns quota on credentials the operator did not pick.
 		return fmt.Errorf("probe_accounts is empty, so there is nothing to probe; refusing to widen an empty selection to every credential")
 	case len(models) == 0:
-		return fmt.Errorf("models is empty, so there is no bucket to fill; refusing to fall back to the full model list")
-	case strings.TrimSpace(cfg.ProbeAPIKey) == "":
-		return fmt.Errorf("probe_api_key is not set; it is the Bearer token for POST %s, and a different key from probe_management_key", probeRouteResponses)
+		return fmt.Errorf("models is empty, so there is no bucket to fill")
 	case strings.TrimSpace(cfg.ProbeManagementKey) == "":
-		return fmt.Errorf("probe_management_key is not set; without it the sweep cannot enable or disable a credential")
+		return fmt.Errorf("probe_management_key is not set; it is the Bearer for GET %s and %s, the two read-only calls that fetch the account list and each credential's token", probeRouteAuthFiles, probeRouteAuthDownload)
 	case strings.TrimSpace(cfg.StoreDir) == "":
-		// configure already refuses role=probe with no store_dir; this is here so
-		// a future relaxation there cannot silently remove the restore file.
-		return fmt.Errorf("store_dir is empty, so there is nowhere to write %s -- the file that makes the undo survive a crash", probeRestoreFileName)
-	}
-
-	// A restore file left behind means an earlier sweep died, or its restore
-	// failed, with credentials still flipped. Snapshotting now would record that
-	// half-disabled state as the original and make it permanent, which is the
-	// exact incident the file exists to prevent -- so this refuses rather than
-	// overwriting it.
-	restorePath := probeRestorePath(cfg.StoreDir)
-	if _, errStat := os.Stat(restorePath); errStat == nil {
-		return fmt.Errorf("%s still exists, so an earlier sweep did not finish putting credential state back; starting now would snapshot that state as the original and make it permanent. Re-apply or delete that file first", restorePath)
+		return fmt.Errorf("store_dir is empty, so a harvested template has nowhere to be written for the business role to read")
 	}
 
 	probeRunner.mu.Lock()
 	defer probeRunner.mu.Unlock()
 	if probeRunner.run.Running {
-		return fmt.Errorf("a probe sweep is already in flight; stop it before starting another")
+		return fmt.Errorf("a probe is already running; stop it before starting another")
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -235,9 +193,10 @@ func probeRunStart() error {
 	return nil
 }
 
-// probeRunCancel asks the running sweep to stop. It returns false when nothing
-// was running. Cancellation is a request, not a kill: the sweep still restores
-// every credential it touched before it reports itself finished.
+// probeRunCancel asks the running probe to stop. It returns false when nothing
+// was running. Cancellation ends the initial sweep and the renewal loop; there
+// is no credential state to restore, because the offline harvest never changed
+// any.
 func probeRunCancel() bool {
 	probeRunner.mu.Lock()
 	defer probeRunner.mu.Unlock()
@@ -245,12 +204,12 @@ func probeRunCancel() bool {
 		return false
 	}
 	probeRunner.cancel()
-	probeRunner.run.Lines = probeAppendLine(probeRunner.run.Lines, "stop requested; the sweep will restore credential state before it finishes")
+	probeRunner.run.Lines = probeAppendLine(probeRunner.run.Lines, "stop requested; the probe will finish the current harvest and exit")
 	return true
 }
 
 // probeRunSnapshot returns a copy of the run state, Lines included. The copy is
-// what makes it safe to hand to a JSON encoder while the sweep keeps appending.
+// what makes it safe to hand to a JSON encoder while the run keeps appending.
 func probeRunSnapshot() probeRunState {
 	probeRunner.mu.Lock()
 	defer probeRunner.mu.Unlock()
@@ -270,9 +229,9 @@ func probeRunUpdate(mutate func(run *probeRunState)) {
 // log.
 //
 // Every line goes through probeRedact first. Callers are expected to have masked
-// any proxy URL already, with maskProxyURL; this is the second line of defence,
-// not the first, and it exists because Lines is served to a reader who has
-// presented no key.
+// any proxy URL already, with maskProxyURL, and any account name with
+// probeShortAuth; this is the second line of defence, not the first, and it
+// exists because Lines is served to a reader who has presented no key.
 func probeRunLog(format string, args ...any) {
 	line := probeRedact(fmt.Sprintf(format, args...))
 	probeRunUpdate(func(run *probeRunState) {
@@ -281,9 +240,8 @@ func probeRunLog(format string, args ...any) {
 	log.Printf("%sprobe %s", logPrefix, line)
 }
 
-// probeRunFail records the reason a sweep stopped. The first error wins: what
-// went wrong first is what the operator needs, and anything that happened after
-// it is a consequence.
+// probeRunFail records the reason a run stopped. The first error wins: what went
+// wrong first is what the operator needs, and anything after it is a consequence.
 func probeRunFail(errRun error) {
 	if errRun == nil {
 		return
@@ -298,8 +256,8 @@ func probeRunFail(errRun error) {
 	log.Printf("%sprobe error: %s", logPrefix, message)
 }
 
-// probeRunFinish marks the sweep over. It is the outermost defer in probeSweep,
-// so it runs after the restore has had its say.
+// probeRunFinish marks the run over. It is the outermost defer in probeSweep and
+// runs once the renewal loop has returned on cancel.
 func probeRunFinish() {
 	probeRunner.mu.Lock()
 	defer probeRunner.mu.Unlock()
@@ -323,21 +281,22 @@ func probeAppendLine(lines []string, line string) []string {
 	return lines
 }
 
-// probeSweep is the whole run, and the only goroutine this file starts.
+// probeSweep is the whole run: read credentials, fill every pending bucket once,
+// then stay up renewing them. It is the only goroutine this file starts.
 func probeSweep(ctx context.Context, cfg pluginConfig, accounts, models, proxies []string) {
-	// Registered first, so it runs last: the state is not "finished" until the
-	// restore below has run.
+	// Registered first, so it runs last: the run is not "finished" until the
+	// renewal loop below has returned.
 	defer probeRunFinish()
 	// A panic in a native plugin takes the whole CPA process with it, so this
-	// goroutine catches its own. The restore defer is registered further down and
-	// therefore runs *before* this one, which is what makes a panic still put
-	// credential state back.
+	// goroutine catches its own.
 	defer func() {
 		if recovered := recover(); recovered != nil {
-			probeRunFail(fmt.Errorf("probe sweep panicked: %v", recovered))
+			probeRunFail(fmt.Errorf("probe panicked: %v", recovered))
 		}
 	}()
 
+	pool := newProbeClientPool()
+	defer pool.closeIdle()
 	client := newProbeClient(cfg)
 	defer client.http.CloseIdleConnections()
 
@@ -346,268 +305,306 @@ func probeSweep(ctx context.Context, cfg pluginConfig, accounts, models, proxies
 		probeRunFail(fmt.Errorf("could not list Codex credentials: %w", errList))
 		return
 	}
-	if len(auths) == 0 {
-		probeRunFail(fmt.Errorf("CPA reports no Codex credentials, so there is nothing to enable"))
-		return
-	}
-
-	// A selected account CPA does not know about would make the sweep quietly
-	// cover less than was asked for, so it stops the run instead.
+	// A selected account CPA does not know about would make the run quietly cover
+	// less than was asked for, so it stops instead.
 	known := make(map[string]bool, len(auths))
 	for _, auth := range auths {
 		known[auth.Name] = true
 	}
 	for _, account := range accounts {
 		if !known[account] {
-			probeRunFail(fmt.Errorf("selected account %q is not among CPA's Codex credentials; fix the selection rather than letting the sweep cover less than was asked for", account))
+			probeRunFail(fmt.Errorf("selected account %q is not among CPA's Codex credentials; fix the selection rather than probing something CPA cannot serve", account))
 			return
 		}
 	}
 
-	snapshot, errSnapshot := client.snapshotAccounts(ctx, auths)
-	if errSnapshot != nil {
-		probeRunFail(fmt.Errorf("could not snapshot credential state: %w", errSnapshot))
+	now := time.Now()
+	creds := probeDownloadCreds(ctx, client, accounts, now)
+	if len(creds) == 0 {
+		probeRunFail(fmt.Errorf("no usable credentials: every selected account's token was unreadable or already expired"))
 		return
 	}
 
-	// Rotation is gated on having read each probed account's own exit back.
-	// Without that there is no way to tell a working PATCH from one CPA ignored,
-	// and -- worse -- no way to record what the exit was before the run, so no way
-	// to put it back. Failing here costs nothing; discovering it mid-sweep costs
-	// the window and can leave a credential pointed at a probe exit.
-	if len(proxies) > 0 {
-		for _, account := range accounts {
-			if entry := probeEntryFor(snapshot, account); entry == nil || entry.ProxyURL == nil {
-				probeRunFail(fmt.Errorf("%d probe exit(s) are configured, but %s's own %s could not be read back from GET %s, so a switch could be neither confirmed nor undone; clear probe_proxies to probe on each credential's existing exit", len(proxies), account, probeProxyField, probeRouteAuthDownload))
-				return
-			}
-		}
-	}
-
-	// Persisted before the first mutation, never after: a snapshot written
-	// afterwards would be a snapshot of the damage.
-	if errWrite := writeProbeRestore(cfg.StoreDir, client.baseURL, snapshot); errWrite != nil {
-		probeRunFail(fmt.Errorf("could not write %s, so the flips would not be undoable after a crash; refusing to touch credential state: %w", probeRestorePath(cfg.StoreDir), errWrite))
-		return
-	}
-	probeRunLog("snapshot of %d credential state(s) written to %s", len(snapshot), probeRestorePath(cfg.StoreDir))
-
-	// touched records which credentials this sweep repointed. The restore closes
-	// over it, so it sees every entry added between here and the return.
-	touched := make(map[string]bool, len(accounts))
-	defer probeRestore(cfg.StoreDir, client, snapshot, touched)
-
+	idxOf := probeAccountIndex(accounts)
 	targets := probePendingTargets(cfg, accounts, models)
 	probeRunUpdate(func(run *probeRunState) { run.Total = len(targets) })
-	probeRunLog("sweep over %d account(s) x %d model(s): %d bucket(s) to fill, %d exit(s) configured",
-		len(accounts), len(models), len(targets), len(proxies))
-	if len(targets) == 0 {
-		probeRunLog("every selected bucket already holds a live template; nothing to fire")
+	probeRunLog("offline harvest: %d account(s) x %d model(s) = %d bucket(s) to fill, %d exit(s) in pool", len(accounts), len(models), len(targets), len(proxies))
+	if len(targets) > 0 {
+		probeFireBatch(ctx, cfg, pool, creds, targets, idxOf, proxies, true)
+	} else {
+		probeRunLog("every selected bucket already holds a live template")
+	}
+
+	if ctx.Err() != nil {
+		probeRunLog("stopped on request")
 		return
 	}
 
-	// One pass per account rather than per bucket. Sole-enablement is what makes a
-	// harvest attributable, so it has to change once per account and no oftener --
-	// each flip costs one PATCH per credential plus a settle.
-	for _, group := range probeGroupTargets(targets) {
-		if ctx.Err() != nil {
-			probeRunLog("stopped on request")
-			return
-		}
-		probeRunUpdate(func(run *probeRunState) {
-			run.Current = fmt.Sprintf("%s (%d model(s))", group.account, len(group.models))
-		})
+	// The run does not end here. Substitution needs live templates for as long as
+	// CPA serves traffic, so the goroutine stays up and tops up each bucket a few
+	// minutes before its token expires -- the operator's "最后5分钟再获取一遍". It
+	// runs until the run is cancelled or the plugin reloads.
+	probeRunLog("initial fill done; renewal active — buckets refresh automatically within %s of expiry", probeRenewThreshold)
+	probeRunUpdate(func(run *probeRunState) { run.Current = "renewal active" })
+	probeRenewLoop(ctx, pool)
+}
 
-		if errEnable := client.enableOnly(ctx, auths, group.account); errEnable != nil {
-			probeRunFail(fmt.Errorf("could not make %s the sole enabled Codex credential: %w", group.account, errEnable))
-			return
-		}
-		probeRunLog("%s is now the sole enabled Codex credential", group.account)
-		if !probeSleep(ctx, probeSettle) {
-			probeRunLog("stopped on request")
-			return
-		}
-
-		if errFatal := probeOneAccount(ctx, cfg, client, group, proxies, snapshot, touched); errFatal != nil {
-			probeRunFail(errFatal)
-			return
-		}
+// probeAccountIndex maps each selected account to its position, which is the
+// index probeExits uses to assign the proxy pool in order.
+func probeAccountIndex(accounts []string) map[string]int {
+	idx := make(map[string]int, len(accounts))
+	for i, name := range accounts {
+		idx[name] = i
 	}
+	return idx
 }
 
-// probeAccountGroup is one credential's pending models, in scope order.
-type probeAccountGroup struct {
-	account string
-	models  []string
-}
-
-// probeGroupTargets collapses the account-major target list into one entry per
-// account, which is what lets a whole account's models be fired together.
-//
-// It relies on probePendingTargets emitting account-major order and only merges
-// adjacent runs, so a list that ever stopped being grouped would produce two
-// entries for one account rather than silently interleaving two credentials'
-// models into one pinned round -- the failure that would cross accounts.
-func probeGroupTargets(targets []probeTarget) []probeAccountGroup {
-	groups := make([]probeAccountGroup, 0, len(targets))
+// probeFireBatch harvests a set of buckets concurrently, bounded by
+// probeMaxInFlight. countDone advances the progress bar (the initial fill wants
+// it; a renewal tick does not, having no fixed Total). It is the shared fan-out
+// for both callers so the concurrency rule lives in one place.
+func probeFireBatch(ctx context.Context, cfg pluginConfig, pool *probeClientPool, creds map[string]probeCredential, targets []probeTarget, idxOf map[string]int, proxies []string, countDone bool) {
+	sem := make(chan struct{}, probeMaxInFlight)
+	var wg sync.WaitGroup
 	for _, target := range targets {
-		if last := len(groups) - 1; last >= 0 && groups[last].account == target.account {
-			groups[last].models = append(groups[last].models, target.model)
-			continue
-		}
-		groups = append(groups, probeAccountGroup{account: target.account, models: []string{target.model}})
-	}
-	return groups
-}
-
-// probeOneBucket fills one bucket, trying each configured exit in turn.
-//
-// It returns (true, nil) as soon as the bucket goes live. A candidate that times
-// out is not an error: it means that exit is not in a honeymoon right now, which
-// is exactly what the next candidate is for. The only fatal outcome is a failure
-// to *switch* the exit -- see setProxyVerified.
-func probeOneAccount(ctx context.Context, cfg pluginConfig, client *probeClient, group probeAccountGroup, proxies []string, snapshot []probeRestoreEntry, touched map[string]bool) error {
-	// A nil entry means "leave the credential's own exit alone", which is what an
-	// empty probe_proxies asks for. It is not the same as an empty string: an
-	// empty string would clear the credential's override, and that is a change
-	// this path must not make.
-	attempts := make([]*string, 0, len(proxies)+1)
-	if len(proxies) == 0 {
-		attempts = append(attempts, nil)
-	} else {
-		for index := range proxies {
-			attempts = append(attempts, &proxies[index])
-		}
-	}
-
-	// remaining shrinks as models fill, so exit 2 only re-fires what exit 1 missed
-	// rather than the whole set. The exit itself is a per-credential setting, so it
-	// is switched once per round, not once per model -- which is where the old
-	// shape spent a PATCH and a settle per bucket.
-	remaining := append([]string(nil), group.models...)
-
-	for index, candidate := range attempts {
-		if len(remaining) == 0 || ctx.Err() != nil {
+		if ctx.Err() != nil {
 			break
 		}
-		if candidate != nil {
-			entry := probeEntryFor(snapshot, group.account)
-			if entry == nil {
-				return fmt.Errorf("no snapshot entry for %s, so its exit could not be changed safely", group.account)
+		cred, ok := creds[target.account]
+		if !ok {
+			// Its credential was unreadable or expired and already logged; count it
+			// done so the progress bar reaches Total rather than hanging one short.
+			if countDone {
+				probeRunUpdate(func(run *probeRunState) { run.Done++ })
 			}
-			// Marked before the write, not after. A PATCH that answers 200 and
-			// then fails its read-back may still have changed something, and an
-			// exit we are unsure about is exactly the one that must be restored.
-			touched[group.account] = true
-			if errProxy := client.setProxyVerified(ctx, entry, *candidate); errProxy != nil {
-				return errProxy
-			}
-			probeRunLog("exit %d/%d for %s -> %s (verified by read-back), %d model(s) to try",
-				index+1, len(attempts), group.account, probeShowProxy(*candidate), len(remaining))
-			if !probeSleep(ctx, probeSettle) {
-				break
-			}
+			continue
 		}
-		remaining = probeFireRound(ctx, cfg, client, group.account, remaining)
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(target probeTarget, cred probeCredential) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			probeHarvestBucket(ctx, cfg, pool, cred, target.model, proxies, idxOf[target.account])
+			if countDone {
+				probeRunUpdate(func(run *probeRunState) { run.Done++ })
+			}
+		}(target, cred)
 	}
+	wg.Wait()
+}
 
-	// Whatever is still here was refused by every exit. Counted as done all the
-	// same: the sweep processed it, it just came back empty.
-	for _, model := range remaining {
-		probeRunLog("no template for %s / %s", group.account, model)
+// probeHarvestBucket fills one bucket: it fires the account's assigned exit,
+// falling through the rest of the pool only on a transport failure, and stores a
+// 292. It is the one harvest path; the initial fill and the renewal loop both
+// call it, and the claim guard keeps them off each other's buckets.
+func probeHarvestBucket(ctx context.Context, cfg pluginConfig, pool *probeClientPool, cred probeCredential, model string, proxies []string, accountIdx int) {
+	key := bucketKey(cred.name, model)
+	if !probeClaim(key) {
+		// Another fire (the other loop, or an overtaking renewal tick) is already
+		// on this exact bucket. Firing a second upstream call for it would spend
+		// quota to overwrite a value with a near-identical one.
+		return
 	}
-	if len(remaining) > 0 {
-		missed := len(remaining)
-		probeRunUpdate(func(run *probeRunState) { run.Done += missed })
+	defer probeRelease(key)
+
+	short := probeShortAuth(cred.name)
+	for _, exit := range probeExits(proxies, accountIdx) {
+		if ctx.Err() != nil {
+			return
+		}
+		client, errClient := pool.get(exit)
+		if errClient != nil {
+			probeRunLog("%s %s: exit %s unusable, trying next: %s", short, model, probeShowProxy(exit), probeRedact(errClient.Error()))
+			continue
+		}
+		status, value, errFire := probeFireUpstream(ctx, client, cred, model)
+		if errFire != nil {
+			// A transport failure means this exit did not carry the request at all;
+			// the next one might. A rejected token or a throttle comes back as an
+			// HTTP status, not an error, so this really is the exit's fault.
+			probeRunLog("%s %s: exit %s failed at transport, trying next: %s", short, model, probeShowProxy(exit), probeRedact(errFire.Error()))
+			continue
+		}
+		probeConsume(cfg, cred.name, short, model, status, value, exit)
+		return
 	}
+	probeRunLog("%s %s: every configured exit failed at the transport level; nothing harvested", short, model)
+}
+
+// probeConsume decides what one upstream response means. Only a 200 carrying a
+// template-length turn-state is stored; a degraded length is the throttle this
+// plugin exists to route around and is logged, not stored.
+func probeConsume(cfg pluginConfig, name, short, model string, status int, value, exit string) {
+	if status != http.StatusOK {
+		probeRunLog("%s %s: http=%d via %s, no template (token rejected or upstream error)", short, model, status, probeShowProxy(exit))
+		return
+	}
+	switch {
+	case len(value) == cfg.TemplateLength:
+		if errStore := probeStore(cfg, name, model, value); errStore != nil {
+			probeRunLog("%s %s: harvested len=%d but store failed: %s", short, model, len(value), probeRedact(errStore.Error()))
+			return
+		}
+		probeRunLog("%s %s: harvested len=%d, fresh template stored", short, model, len(value))
+	case len(value) == cfg.ReplaceLength:
+		probeRunLog("%s %s: upstream returned degraded state len=%d (throttled or honeymoon closed), not stored", short, model, len(value))
+	case value == "":
+		probeRunLog("%s %s: http=200 but no turn-state header, nothing to harvest", short, model)
+	default:
+		probeRunLog("%s %s: unexpected turn-state len=%d, not stored", short, model, len(value))
+	}
+}
+
+// probeStore writes one harvested template to the same store the business role
+// reads. AuthID is the credential file name because that is exactly what the
+// request hook reads out of selected_auth_id and feeds to bucketKey -- storing
+// under anything else would silently break every substitution. Attribution is
+// "observed": we held the token, so the account is certain, not inferred.
+func probeStore(cfg pluginConfig, name, model, value string) error {
+	now := time.Now()
+	issued, ok := fernetIssuedAt(value)
+	if !ok {
+		issued = now
+	}
+	record := storeRecord{
+		AuthID:      name,
+		Model:       model,
+		Len:         len(value),
+		Value:       value,
+		IssuedAt:    issued.UTC().Format(time.RFC3339),
+		HarvestedAt: now.UTC().Format(time.RFC3339),
+		Attribution: attributionObserved,
+	}
+	if errWrite := writeStoreRecord(cfg.StoreDir, record, cfg.TemplateLength); errWrite != nil {
+		return errWrite
+	}
+	if errIndex := writeStoreIndex(cfg.StoreDir, now, cfg.ttl(), cfg.TemplateLength); errIndex != nil {
+		// The bucket file is on disk and is what the business role actually reads;
+		// a stale index is a monitoring gap, not a lost harvest. Log and keep it.
+		log.Printf("%sprobe index write failed: %v", logPrefix, errIndex)
+	}
+	state.mu.Lock()
+	state.buckets[bucketKey(name, model)] = templateEntry{value: value, issuedAt: issued}
+	state.mu.Unlock()
 	return nil
 }
 
-// probeFireRound fires every still-unfilled model of the pinned account at once
-// and returns the ones that produced no template.
-//
-// Concurrency is safe here precisely because the credential is pinned:
-// attribution rests on "the sole enabled Codex credential", which is a property
-// of the enable flags and not of which request happens to be in flight, and the
-// model rides on each individual response. Firing one at a time spent the whole
-// sweep waiting on an upstream that answers in anything between six and sixty
-// seconds -- the 2026-09-18 run took thirteen and a half minutes, of which almost
-// all was one request waiting for the previous one to come back.
-func probeFireRound(ctx context.Context, cfg pluginConfig, client *probeClient, account string, models []string) []string {
-	filled := make([]bool, len(models))
-	gate := make(chan struct{}, probeMaxInFlight)
-	var inFlight sync.WaitGroup
-
-	for index, model := range models {
-		inFlight.Add(1)
-		go func(index int, model string) {
-			defer inFlight.Done()
-			select {
-			case gate <- struct{}{}:
-				defer func() { <-gate }()
-			case <-ctx.Done():
-				return
-			}
-			if ctx.Err() != nil {
-				return
-			}
-			status, note := client.fire(ctx, model)
-			probeRunLog("fired %s on %s: http=%d%s", model, account, status, note)
-			filled[index] = probeWaitForBucket(ctx, cfg, probeTarget{account: account, model: model})
-		}(index, model)
-	}
-	inFlight.Wait()
-
-	still := make([]string, 0, len(models))
-	for index, model := range models {
-		if !filled[index] {
-			still = append(still, model)
+// probeDownloadCreds reads each selected account's usable state once. An account
+// whose token is unreadable or already expired is dropped, with a line saying
+// which -- never a stack trace with a token in it.
+func probeDownloadCreds(ctx context.Context, client *probeClient, accounts []string, now time.Time) map[string]probeCredential {
+	creds := make(map[string]probeCredential, len(accounts))
+	for _, name := range accounts {
+		if ctx.Err() != nil {
+			return creds
+		}
+		short := probeShortAuth(name)
+		blob, errDownload := client.downloadAuth(ctx, name)
+		if errDownload != nil {
+			probeRunLog("%s: could not read credential: %s", short, probeRedact(errDownload.Error()))
 			continue
 		}
-		probeRunLog("ready %s / %s", account, model)
-		probeRunUpdate(func(run *probeRunState) { run.Done++ })
+		cred, errParse := probeParseCredential(name, blob)
+		if errParse != nil {
+			probeRunLog("%s: credential unusable: %s", short, probeRedact(errParse.Error()))
+			continue
+		}
+		// Never refresh. An expired access token is skipped and left for CPA to
+		// refresh in the course of its own business; the next cycle reads the fresh
+		// one. Refreshing here could rotate the refresh token and pull the
+		// credential out from under live CPA traffic -- the one thing this whole
+		// offline design exists to avoid.
+		if !cred.expiresAt.IsZero() && !cred.expiresAt.After(now) {
+			probeRunLog("%s: access token expired; skipping (not refreshed here — CPA refreshes it, next cycle harvests)", short)
+			continue
+		}
+		creds[name] = cred
 	}
-	return still
+	return creds
 }
 
-// probeWaitForBucket polls this process's own store until the bucket holds a
-// live template, or the window closes.
-//
-// It cannot tell a degraded 312 from silence, and deliberately does not try.
-// The store only ever holds template-length values -- writeStoreRecord refuses
-// anything else -- so an exit that answered with a degraded state and one that
-// answered with nothing look identical from here. The response is the same
-// either way: move to the next exit.
-func probeWaitForBucket(ctx context.Context, cfg pluginConfig, target probeTarget) bool {
-	deadline := time.Now().Add(probeBucketWait)
+// probeRenewLoop keeps the store warm. Every probeRenewInterval it re-reads the
+// live scope (so an edit on the dashboard takes effect without a restart), finds
+// the in-scope buckets that are missing or under probeRenewThreshold of life,
+// and re-harvests them. It returns on cancel.
+func probeRenewLoop(ctx context.Context, pool *probeClientPool) {
+	ticker := time.NewTicker(probeRenewInterval)
+	defer ticker.Stop()
 	for {
-		if probeBucketLive(cfg, target) {
-			return true
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
 		}
-		if !time.Now().Before(deadline) {
-			return false
+		if ctx.Err() != nil {
+			return
 		}
-		if !probeSleep(ctx, probePollEvery) {
-			return false
+
+		state.mu.Lock()
+		cfg := state.config
+		state.mu.Unlock()
+		accounts := append([]string(nil), cfg.ProbeAccounts...)
+		models := append([]string(nil), cfg.Models...)
+		proxies := append([]string(nil), cfg.ProbeProxies...)
+		if len(accounts) == 0 || len(models) == 0 {
+			probeRunUpdate(func(run *probeRunState) { run.Current = "scope is empty; nothing to keep fresh" })
+			continue
 		}
+
+		now := time.Now()
+		var due []probeTarget
+		involved := make(map[string]bool)
+		for _, account := range accounts {
+			for _, model := range models {
+				remaining, live := probeBucketRemaining(cfg, account, model, now)
+				if !live || remaining < probeRenewThreshold {
+					due = append(due, probeTarget{account: account, model: model})
+					involved[account] = true
+				}
+			}
+		}
+		if len(due) == 0 {
+			probeRunUpdate(func(run *probeRunState) {
+				run.Current = fmt.Sprintf("all buckets fresh; next check in %s", probeRenewInterval)
+			})
+			continue
+		}
+
+		probeRunUpdate(func(run *probeRunState) {
+			run.Current = fmt.Sprintf("renewing %d bucket(s) near expiry", len(due))
+		})
+		// Download only the accounts that actually have something due, in scope
+		// order so the index still lines up with the proxy assignment.
+		var accountList []string
+		for _, account := range accounts {
+			if involved[account] {
+				accountList = append(accountList, account)
+			}
+		}
+		client := newProbeClient(cfg)
+		creds := probeDownloadCreds(ctx, client, accountList, now)
+		probeFireBatch(ctx, cfg, pool, creds, due, probeAccountIndex(accounts), proxies, false)
+		client.http.CloseIdleConnections()
 	}
 }
 
-// probeBucketLive asks the same two functions the business path asks, so "already
-// live" here means exactly what it means at substitution time. Anything else and
-// a sweep could report a bucket filled that the business role would still refuse
-// to use.
-func probeBucketLive(cfg pluginConfig, target probeTarget) bool {
-	now := time.Now()
+// probeBucketRemaining reports how long the live template for one bucket has
+// left, and whether there is one at all. A missing bucket returns (0, false),
+// which the renewal loop treats as "due now".
+func probeBucketRemaining(cfg pluginConfig, account, model string, now time.Time) (time.Duration, bool) {
 	state.mu.Lock()
 	defer state.mu.Unlock()
 	state.refreshStoreLocked(cfg, now)
-	_, live := state.freshestTemplateLocked(target.account, target.model, now, cfg.ttl())
-	return live
+	tmpl, live := state.freshestTemplateLocked(account, model, now, cfg.ttl())
+	if !live {
+		return 0, false
+	}
+	return tmpl.issuedAt.Add(cfg.ttl()).Sub(now), true
 }
 
-// probePendingTargets lists the buckets in scope that do not already hold a live
-// template, account-major so the sweep flips credential state once per account.
+// probePendingTargets lists the in-scope buckets that do not already hold a live
+// template, so the initial fill only spends a request where there is nothing to
+// substitute yet.
 func probePendingTargets(cfg pluginConfig, accounts, models []string) []probeTarget {
 	out := make([]probeTarget, 0, len(accounts)*len(models))
 	for _, account := range accounts {
@@ -622,10 +619,62 @@ func probePendingTargets(cfg pluginConfig, accounts, models []string) []probeTar
 	return out
 }
 
+// probeBucketLive reports whether one bucket already holds a live template.
+func probeBucketLive(cfg pluginConfig, target probeTarget) bool {
+	now := time.Now()
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	state.refreshStoreLocked(cfg, now)
+	_, live := state.freshestTemplateLocked(target.account, target.model, now, cfg.ttl())
+	return live
+}
+
+// probeExits is the order one account tries the pool in: its assigned exit first
+// (index i % N), then the rest in order, wrapping once. That satisfies both
+// readings of "assign the pool in order" -- account i starts at exit i -- and
+// gives every account a full fallback sequence if its first exit is down. An
+// empty pool yields a single direct attempt (the empty string), which the client
+// pool builds as a no-proxy transport.
+func probeExits(proxies []string, accountIdx int) []string {
+	if len(proxies) == 0 {
+		return []string{""}
+	}
+	n := len(proxies)
+	out := make([]string, 0, n)
+	for k := 0; k < n; k++ {
+		out = append(out, proxies[(accountIdx+k)%n])
+	}
+	return out
+}
+
+// probeActive prevents two harvests of the same bucket at once -- the initial
+// fill and the renewal loop share one harvest path, and a slow upstream call
+// could otherwise let a renewal tick fire a bucket a previous one is still on.
+// The key is bucketKey, so the guard is per (account, model), never global: two
+// different buckets still fire in parallel.
+var probeActive = struct {
+	mu  sync.Mutex
+	set map[string]bool
+}{set: map[string]bool{}}
+
+func probeClaim(key string) bool {
+	probeActive.mu.Lock()
+	defer probeActive.mu.Unlock()
+	if probeActive.set[key] {
+		return false
+	}
+	probeActive.set[key] = true
+	return true
+}
+
+func probeRelease(key string) {
+	probeActive.mu.Lock()
+	defer probeActive.mu.Unlock()
+	delete(probeActive.set, key)
+}
+
 // probeSleep waits for the given duration and reports whether the run is still
-// wanted. It returns false as soon as the sweep is cancelled, which is what
-// makes a stop take effect inside a settle or a poll rather than at the end of
-// the current bucket.
+// wanted. It returns false as soon as the run is cancelled.
 func probeSleep(ctx context.Context, wait time.Duration) bool {
 	timer := time.NewTimer(wait)
 	defer timer.Stop()
@@ -637,164 +686,188 @@ func probeSleep(ctx context.Context, wait time.Duration) bool {
 	}
 }
 
-// --- restore -------------------------------------------------------------
+// --- upstream ------------------------------------------------------------
 
-// probeRestoreEntry is one credential's pre-run state.
-type probeRestoreEntry struct {
-	Name string `json:"name"`
-	// AuthIndex is echoed back to CPA verbatim as the JSON it arrived as, so this
-	// code never has to decide whether it is a string or a number. Guessing wrong
-	// would address a PATCH at the wrong credential.
-	AuthIndex json.RawMessage `json:"auth_index,omitempty"`
-	Disabled  bool            `json:"disabled"`
-	// ProxyURL is a pointer so "CPA does not expose this credential's exit" stays
-	// distinct from "this credential has no exit set". The first means there is
-	// nothing to put back and nothing that could be put back correctly; the
-	// second means put an empty value back.
-	//
-	// It is written to the restore file in the clear, like the rest of that file:
-	// the file is 0600 and exists precisely so a failed run can be undone by
-	// hand, and a masked value would be useless for that. It is never logged --
-	// see probeRestore, which renders it through maskProxyURL.
-	ProxyURL *string `json:"proxy_url"`
-}
-
-// probeRestoreFile is the on-disk snapshot.
-type probeRestoreFile struct {
-	CapturedAt string              `json:"captured_at"`
-	BaseURL    string              `json:"base_url"`
-	Accounts   []probeRestoreEntry `json:"accounts"`
-}
-
-func probeRestorePath(storeDir string) string {
-	return filepath.Join(strings.TrimSpace(storeDir), probeRestoreFileName)
-}
-
-// probeEntryFor finds one credential's snapshot entry, or nil.
-func probeEntryFor(snapshot []probeRestoreEntry, name string) *probeRestoreEntry {
-	for index := range snapshot {
-		if snapshot[index].Name == name {
-			return &snapshot[index]
-		}
+// probeFireUpstream makes one direct call to the upstream as one account and
+// returns the HTTP status and the turn-state header. It reads only the headers:
+// the turn-state is there, and the SSE body is drained just enough to let the
+// socket be reused before being dropped -- generating the completion would spend
+// quota this probe has no use for. A transport error is returned as an error so
+// the caller can fall through to the next exit; an HTTP status is not.
+func probeFireUpstream(ctx context.Context, client *http.Client, cred probeCredential, model string) (int, string, error) {
+	payload := map[string]any{
+		"model":  model,
+		"stream": true,
+		"store":  false,
+		"input": []map[string]any{{
+			"type": "message",
+			"role": "user",
+			"content": []map[string]any{{
+				"type": "input_text",
+				"text": "ping",
+			}},
+		}},
+		"reasoning":           map[string]any{"effort": "low"},
+		"tool_choice":         "auto",
+		"parallel_tool_calls": false,
 	}
-	return nil
-}
-
-// writeProbeRestore persists the snapshot. The 0600 comes from atomicWrite,
-// which creates through os.CreateTemp and renames into place, so no reader ever
-// sees a half-written snapshot -- and a snapshot read half-written is a restore
-// that puts back half a state.
-func writeProbeRestore(storeDir, baseURL string, snapshot []probeRestoreEntry) error {
-	dir := strings.TrimSpace(storeDir)
-	if dir == "" {
-		return fmt.Errorf("store_dir is empty")
-	}
-	if errMkdir := os.MkdirAll(dir, 0o700); errMkdir != nil {
-		return errMkdir
-	}
-	doc := probeRestoreFile{
-		CapturedAt: time.Now().UTC().Format(time.RFC3339),
-		BaseURL:    baseURL,
-		Accounts:   snapshot,
-	}
-	data, errMarshal := json.MarshalIndent(doc, "", "  ")
+	raw, errMarshal := json.Marshal(payload)
 	if errMarshal != nil {
-		return errMarshal
+		return 0, "", errMarshal
 	}
-	return atomicWrite(probeRestorePath(dir), append(data, '\n'))
-}
 
-// probeRestore puts every credential back the way the snapshot found it. It runs
-// from a defer, so it runs on the clean path, on an abort, on a stop and on a
-// panic.
-//
-// Exits first, then the enable flags, and that order is the point: a credential
-// that ends up enabled is immediately schedulable, so it must already be
-// pointing at its own original exit by then. Re-enabling first would put live
-// business traffic through a probe exit for as long as the second loop takes.
-//
-// The context is a fresh one rather than the sweep's. The commonest reason this
-// function runs at all is that the sweep was cancelled, and a cancelled context
-// would fail every call here instantly -- turning "the operator pressed stop"
-// into "every credential is left switched off".
-func probeRestore(storeDir string, client *probeClient, snapshot []probeRestoreEntry, touched map[string]bool) {
-	ctx, cancel := context.WithTimeout(context.Background(), probeRestoreTimeout)
+	callCtx, cancel := context.WithTimeout(ctx, probeFireTimeout)
 	defer cancel()
-
-	probeRunLog("restoring credential exits, then enable/disable state")
-	var failures []string
-
-	for index := range snapshot {
-		entry := &snapshot[index]
-		// Only the credentials this sweep actually repointed. Writing an unchanged
-		// value back to a credential nobody touched is still a write to someone
-		// else's file, and the rule here is that a sweep only ever sets the probed
-		// account's own exit.
-		if entry.ProxyURL == nil || !touched[entry.Name] {
-			continue
-		}
-		if errProxy := client.setProxyVerified(ctx, entry, *entry.ProxyURL); errProxy != nil {
-			// Collected, not returned: every remaining credential still has to be
-			// put back, and stopping at the first problem is how a partial restore
-			// becomes a total one.
-			failures = append(failures, entry.Name+": exit not restored: "+probeRedact(errProxy.Error()))
-			continue
-		}
-		probeRunLog("exit restored for %s -> %s", entry.Name, probeShowProxy(*entry.ProxyURL))
+	request, errNew := http.NewRequestWithContext(callCtx, http.MethodPost, probeUpstreamURL, bytes.NewReader(raw))
+	if errNew != nil {
+		return 0, "", errNew
 	}
-
-	for index := range snapshot {
-		entry := &snapshot[index]
-		if errStatus := client.setDisabled(ctx, entry.Name, entry.AuthIndex, entry.Disabled); errStatus != nil {
-			failures = append(failures, entry.Name+": "+probeRedact(errStatus.Error()))
-		}
+	request.Header.Set("Authorization", "Bearer "+cred.accessToken)
+	if cred.accountID != "" {
+		request.Header.Set("Chatgpt-Account-Id", cred.accountID)
 	}
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Accept", "text/event-stream")
+	request.Header.Set("Originator", "codex-tui")
+	request.Header.Set("Session-Id", probeUUID())
+	request.Header.Set("User-Agent", probeUserAgent)
 
-	// Verified by re-reading rather than by trusting the PATCH answers. A 200 that
-	// did not take is the failure this whole file is shaped around, and the enable
-	// flags are the half that matters most: getting them wrong leaves the
-	// operator's credentials switched off.
-	if observed, errObserve := client.listCodexAuths(ctx); errObserve != nil {
-		failures = append(failures, "could not re-list credentials to verify the restore: "+probeRedact(errObserve.Error()))
-	} else {
-		current := make(map[string]bool, len(observed))
-		for _, auth := range observed {
-			current[auth.Name] = auth.Disabled
-		}
-		for index := range snapshot {
-			entry := &snapshot[index]
-			if got, found := current[entry.Name]; found && got != entry.Disabled {
-				failures = append(failures, fmt.Sprintf("%s: still disabled=%t, want %t", entry.Name, got, entry.Disabled))
-			}
-		}
+	response, errDo := client.Do(request)
+	if errDo != nil {
+		return 0, "", errDo
 	}
-
-	if len(failures) > 0 {
-		for _, failure := range failures {
-			probeRunLog("RESTORE FAILED %s", failure)
-		}
-		// The snapshot file is deliberately left behind: it is the only recovery
-		// path left, and the next probeRunStart refuses while it is there, which
-		// stops a second sweep cementing the damage.
-		probeRunLog("credentials may be left in the wrong state; %s has been kept so the flips can be re-applied by hand", probeRestorePath(storeDir))
-		probeRunUpdate(func(run *probeRunState) {
-			if run.Error == "" {
-				run.Error = "restore incomplete: credentials may be left in the wrong state, see the log"
-			}
-		})
-		return
-	}
-
-	if errRemove := os.Remove(probeRestorePath(storeDir)); errRemove != nil && !os.IsNotExist(errRemove) {
-		probeRunLog("could not remove %s: %s", probeRestorePath(storeDir), probeRedact(errRemove.Error()))
-		return
-	}
-	probeRunLog("credential state restored and verified")
+	defer func() { _ = response.Body.Close() }()
+	_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, probeMaxBodyBytes))
+	return response.StatusCode, response.Header.Get(turnStateHeader), nil
 }
 
-// --- CPA client ----------------------------------------------------------
+// probeUUID returns a random v4 UUID for the Session-Id header, using the
+// crypto/rand source already linked in. A failed read is near-impossible; the
+// fallback keeps a probe firing rather than aborting on an unreachable branch.
+func probeUUID() string {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return fmt.Sprintf("00000000-0000-4000-8000-%012x", time.Now().UnixNano()&0xffffffffffff)
+	}
+	b[6] = (b[6] & 0x0f) | 0x40
+	b[8] = (b[8] & 0x3f) | 0x80
+	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
+}
 
-// probeAuthFile is one entry of GET /v0/management/auth-files.
+// --- credential parsing --------------------------------------------------
+
+// probeParseCredential pulls the usable state out of a downloaded credential
+// file: the access token, the account id (from the token's own claims, which is
+// what the upstream expects in Chatgpt-Account-Id), the account's own exit, and
+// the token's expiry. Nothing here is logged.
+func probeParseCredential(name string, blob map[string]any) (probeCredential, error) {
+	token := strings.TrimSpace(stringField(blob, "access_token"))
+	if token == "" {
+		return probeCredential{}, fmt.Errorf("no access_token in credential file")
+	}
+	claims := probeJWTClaims(token)
+	cred := probeCredential{
+		name:        name,
+		accessToken: token,
+		accountID:   probeAccountID(claims, blob),
+		proxyURL:    strings.TrimSpace(stringField(blob, "proxy_url")),
+	}
+	if exp, ok := probeTokenExpiry(claims); ok {
+		cred.expiresAt = exp
+	}
+	return cred, nil
+}
+
+// probeJWTClaims decodes a JWT's middle segment. The claims it reads -- exp and
+// the account id -- are not secret; the token as a whole is, and is never logged.
+func probeJWTClaims(token string) map[string]any {
+	parts := strings.Split(token, ".")
+	if len(parts) != 3 {
+		return nil
+	}
+	data, errDecode := base64.RawURLEncoding.DecodeString(parts[1])
+	if errDecode != nil {
+		return nil
+	}
+	var claims map[string]any
+	if errUnmarshal := json.Unmarshal(data, &claims); errUnmarshal != nil {
+		return nil
+	}
+	return claims
+}
+
+// probeAccountID reads the chatgpt_account_id the upstream expects. It prefers
+// the token's own auth claim (authoritative) and falls back to the file's
+// top-level account_id.
+func probeAccountID(claims, blob map[string]any) string {
+	if claims != nil {
+		if auth, ok := claims["https://api.openai.com/auth"].(map[string]any); ok {
+			if id, ok := auth["chatgpt_account_id"].(string); ok && strings.TrimSpace(id) != "" {
+				return strings.TrimSpace(id)
+			}
+		}
+	}
+	return strings.TrimSpace(stringField(blob, "account_id"))
+}
+
+// probeTokenExpiry reads the token's exp claim. A token with no readable exp
+// returns ok=false and is treated as usable -- the upstream is the real arbiter,
+// and a 401 there is handled like any other non-200.
+func probeTokenExpiry(claims map[string]any) (time.Time, bool) {
+	if claims == nil {
+		return time.Time{}, false
+	}
+	exp, ok := claims["exp"].(float64)
+	if !ok {
+		return time.Time{}, false
+	}
+	return time.Unix(int64(exp), 0), true
+}
+
+// stringField reads a string value from a decoded JSON object, tolerating a
+// missing or non-string field by returning "".
+func stringField(blob map[string]any, key string) string {
+	if value, ok := blob[key].(string); ok {
+		return value
+	}
+	return ""
+}
+
+// probeShortAuth renders a credential file name without the customer email that
+// sits inside it, for the keyless run transcript.
+// codex-<hex>-<email>-<tier>.json becomes "<hex>…<tier>"; the hex and the tier
+// are stable and identify the account without publishing whose it is.
+//
+// The email-bearing segment is dropped BEFORE the first/last pick, not after:
+// a name whose email is the last segment (codex-<hex>-<email>.json) would
+// otherwise publish the address. This mirrors maskAuthLabel in management.go,
+// which the dashboard uses for the same reason; the two are kept in step by
+// hand because that file was written concurrently.
+func probeShortAuth(name string) string {
+	trimmed := strings.TrimSuffix(name, ".json")
+	trimmed = strings.TrimPrefix(trimmed, "codex-")
+	if trimmed == "" {
+		return name
+	}
+	kept := make([]string, 0, 4)
+	for _, part := range strings.Split(trimmed, "-") {
+		if !strings.Contains(part, "@") {
+			kept = append(kept, part)
+		}
+	}
+	switch len(kept) {
+	case 0:
+		// Nothing but an email: publish neither half.
+		return "…"
+	case 1:
+		return kept[0]
+	default:
+		return kept[0] + "…" + kept[len(kept)-1]
+	}
+}
+
+// --- CPA read client -----------------------------------------------------
+
 type probeAuthFile struct {
 	Name      string          `json:"name"`
 	AuthIndex json.RawMessage `json:"auth_index,omitempty"`
@@ -808,10 +881,10 @@ type probeHTTPResult struct {
 	body   []byte
 }
 
-// probeClient is this sweep's connection to CPA's public API.
+// probeClient is the harvester's read-only connection to CPA's management API.
+// It fetches the account list and each credential's token; it never writes.
 type probeClient struct {
 	baseURL string
-	apiKey  string
 	mgmtKey string
 	http    *http.Client
 }
@@ -821,27 +894,20 @@ func newProbeClient(cfg pluginConfig) *probeClient {
 	// this only catches a config built in-process -- a test, or a future caller
 	// that skips configure. It reuses main.go's constant rather than repeating the
 	// literal: two defaults that could drift apart is how a probe ends up talking
-	// to the wrong port and reporting it as the upstream being down.
+	// to the wrong port.
 	base := strings.TrimRight(strings.TrimSpace(cfg.ProbeBaseURL), "/")
 	if base == "" {
 		base = defaultProbeBaseURL
 	}
 	return &probeClient{
 		baseURL: base,
-		apiKey:  strings.TrimSpace(cfg.ProbeAPIKey),
 		mgmtKey: strings.TrimSpace(cfg.ProbeManagementKey),
-		http: &http.Client{
-			// Proxy is nil on purpose, and it is not a detail. This box has
-			// http_proxy/all_proxy set for the traffic CPA relays; the default
-			// transport honours those, and every call here would then be sent to
-			// an exit that cannot reach CPA's own listener and come back as a
-			// bogus 502. scripts/probe.py builds its opener with an empty
-			// ProxyHandler for exactly this reason.
-			//
-			// Timeouts are per call, via context, because the one POST wants two
-			// minutes and the management calls want thirty seconds.
-			Transport: &http.Transport{Proxy: nil},
-		},
+		// Proxy is nil on purpose: this client talks to CPA's own loopback
+		// listener, and honouring the box's http_proxy/all_proxy would send a
+		// loopback call out through an exit that cannot reach it and come back as a
+		// bogus 502. The per-exit clients for the upstream calls live in
+		// probeClientPool, built the same way for the same reason.
+		http: &http.Client{Transport: &http.Transport{Proxy: nil}},
 	}
 }
 
@@ -883,7 +949,7 @@ func (c *probeClient) call(ctx context.Context, method, path, token string, payl
 	}
 	defer func() { _ = response.Body.Close() }()
 
-	raw, errRead := io.ReadAll(io.LimitReader(response.Body, probeMaxBodyBytes))
+	raw, errRead := io.ReadAll(io.LimitReader(response.Body, 64<<10))
 	if errRead != nil {
 		return probeHTTPResult{status: response.StatusCode}, errRead
 	}
@@ -906,9 +972,8 @@ func probeExplainStatus(result probeHTTPResult, what string) error {
 
 // listCodexAuths returns CPA's Codex credentials, .bak copies excluded.
 //
-// The filter follows scripts/probe.py and isCodexAuth: provider when CPA reports
-// one, the naming convention otherwise. A .bak file is an operator's backup copy
-// and must never be enabled.
+// The filter is provider when CPA reports one, the naming convention otherwise.
+// A .bak file is an operator's backup copy and must never be probed.
 func (c *probeClient) listCodexAuths(ctx context.Context) ([]probeAuthFile, error) {
 	result, errCall := c.call(ctx, http.MethodGet, probeRouteAuthFiles, c.mgmtKey, nil, probeMgmtTimeout)
 	if errCall != nil {
@@ -943,202 +1008,68 @@ func (c *probeClient) listCodexAuths(ctx context.Context) ([]probeAuthFile, erro
 	return out, nil
 }
 
-// snapshotAccounts records every Codex credential's disabled flag and its own
-// exit, before anything is mutated.
-//
-// The exit is read out of the credential file rather than out of the listing,
-// because the listing does not carry it: as of 2026-09-18 GET
-// /v0/management/auth-files echoes no per-account proxy field on this build,
-// which is precisely what stops scripts/probe.py rotating exits here.
-//
-// A credential whose exit cannot be read gets a nil ProxyURL -- "nothing to put
-// back, and nothing that could be put back correctly". probeSweep refuses to
-// rotate in that case rather than switching blind.
-func (c *probeClient) snapshotAccounts(ctx context.Context, auths []probeAuthFile) ([]probeRestoreEntry, error) {
-	out := make([]probeRestoreEntry, 0, len(auths))
-	for _, auth := range auths {
-		entry := probeRestoreEntry{
-			Name:      auth.Name,
-			AuthIndex: auth.AuthIndex,
-			Disabled:  auth.Disabled,
-		}
-		value, readable, errRead := c.readProxyURL(ctx, auth.Name)
-		if errRead != nil {
-			// A transport failure before any mutation is a reason to stop, not to
-			// carry on with an incomplete snapshot: if CPA cannot be reached now,
-			// it cannot be reached to undo anything either.
-			return nil, fmt.Errorf("reading %s for %s: %w", probeProxyField, auth.Name, errRead)
-		}
-		if readable {
-			entry.ProxyURL = &value
-		}
-		out = append(out, entry)
-	}
-	return out, nil
-}
-
-// readProxyURL reports the exit recorded in one credential file.
-//
-// readable=false means CPA did not give us the file at all -- a build without
-// the download route answers 404, and that is the expected shape rather than an
-// error. A file that parses but carries no proxy_url is readable with an empty
-// value: absent and empty mean the same thing to CPA, and treating them alike is
-// what lets a cleared override verify correctly.
-func (c *probeClient) readProxyURL(ctx context.Context, name string) (string, bool, error) {
+// downloadAuth fetches one credential file whole. It is the only call that ever
+// carries a token back into this process, so its body is never logged; callers
+// pull the fields they need through probeParseCredential and drop the rest.
+func (c *probeClient) downloadAuth(ctx context.Context, name string) (map[string]any, error) {
 	path := probeRouteAuthDownload + "?name=" + url.QueryEscape(name)
 	result, errCall := c.call(ctx, http.MethodGet, path, c.mgmtKey, nil, probeMgmtTimeout)
 	if errCall != nil {
-		return "", false, errCall
+		return nil, errCall
 	}
 	if result.status != http.StatusOK {
-		return "", false, nil
+		return nil, probeExplainStatus(result, "GET "+probeRouteAuthDownload)
 	}
-	var doc map[string]any
-	if errUnmarshal := json.Unmarshal(result.body, &doc); errUnmarshal != nil {
-		return "", false, nil
+	var blob map[string]any
+	if errUnmarshal := json.Unmarshal(result.body, &blob); errUnmarshal != nil {
+		return nil, fmt.Errorf("GET %s returned a body that is not a JSON object: %w", probeRouteAuthDownload, errUnmarshal)
 	}
-	value, _ := doc[probeProxyField].(string)
-	return strings.TrimSpace(value), true, nil
+	return blob, nil
 }
 
-// setProxy points one credential at one exit, without checking that it took.
-// Only setProxyVerified should call it.
-func (c *probeClient) setProxy(ctx context.Context, entry *probeRestoreEntry, proxyURL string) error {
-	payload := map[string]any{
-		"name":          entry.Name,
-		probeProxyField: proxyURL,
-	}
-	if probeHasAuthIndex(entry.AuthIndex) {
-		payload["auth_index"] = entry.AuthIndex
-	}
-	result, errCall := c.call(ctx, http.MethodPatch, probeRouteAuthFields, c.mgmtKey, payload, probeMgmtTimeout)
-	if errCall != nil {
-		return errCall
-	}
-	if result.status != http.StatusOK {
-		return probeExplainStatus(result, "PATCH "+probeRouteAuthFields)
-	}
-	return nil
+// --- per-exit upstream clients -------------------------------------------
+
+// probeClientPool holds one http.Client per exit, built once and shared across
+// every fire that uses that exit. A scope of four accounts sharing two exits
+// opens two transports, not eight.
+type probeClientPool struct {
+	mu      sync.Mutex
+	clients map[string]*http.Client
 }
 
-// setProxyVerified points one credential at one exit and proves it took.
-//
-// Only ever the probed credential's own field. CPA's global proxy-url is never
-// written from here: it carries Kimi, xAI and all daily traffic, and repointing
-// that would move far more than one sweep.
-//
-// The read-back is the whole point of this function. A PATCH that answers 200
-// and changes nothing is the failure that looks like success: every exit then
-// appears to yield no template, while the real cause is that the exit never
-// changed at all. That misdiagnosis costs a whole stop-the-world window, so an
-// unconfirmed switch aborts the sweep rather than being counted as a failed
-// candidate.
-//
-// Neither the wanted nor the observed value is ever rendered raw -- both go
-// through maskProxyURL, because this error text reaches Lines.
-func (c *probeClient) setProxyVerified(ctx context.Context, entry *probeRestoreEntry, proxyURL string) error {
-	if errSet := c.setProxy(ctx, entry, proxyURL); errSet != nil {
-		return fmt.Errorf("could not switch the exit for %s to %s: %w", entry.Name, probeShowProxy(proxyURL), errSet)
-	}
-	observed, readable, errRead := c.readProxyURL(ctx, entry.Name)
-	if errRead != nil {
-		return fmt.Errorf("the exit for %s was PATCHed to %s but the read-back failed: %w", entry.Name, probeShowProxy(proxyURL), errRead)
-	}
-	if !readable {
-		return fmt.Errorf("the exit for %s was PATCHed to %s and CPA answered 200, but GET %s does not report %s back, so the switch cannot be confirmed; a sweep on an unconfirmed exit would only measure the credential's existing exit", entry.Name, probeShowProxy(proxyURL), probeRouteAuthDownload, probeProxyField)
-	}
-	if observed != strings.TrimSpace(proxyURL) {
-		return fmt.Errorf("the exit for %s was PATCHed to %s and CPA answered 200, but it reads back as %s, so the write did not take", entry.Name, probeShowProxy(proxyURL), probeShowProxy(observed))
-	}
-	return nil
+func newProbeClientPool() *probeClientPool {
+	return &probeClientPool{clients: map[string]*http.Client{}}
 }
 
-// setDisabled flips one credential's enable flag.
-func (c *probeClient) setDisabled(ctx context.Context, name string, authIndex json.RawMessage, disabled bool) error {
-	payload := map[string]any{"name": name, "disabled": disabled}
-	if probeHasAuthIndex(authIndex) {
-		payload["auth_index"] = authIndex
+// get returns the client for one exit, building it once. An empty proxyURL is a
+// direct connection -- and deliberately does NOT honour the box's
+// http_proxy/all_proxy env, for the same reason newProbeClient does not: those
+// exits are for the traffic CPA relays, not for a probe reaching out on its own.
+func (p *probeClientPool) get(proxyURL string) (*http.Client, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if client, ok := p.clients[proxyURL]; ok {
+		return client, nil
 	}
-	result, errCall := c.call(ctx, http.MethodPatch, probeRouteAuthStatus, c.mgmtKey, payload, probeMgmtTimeout)
-	if errCall != nil {
-		return errCall
-	}
-	if result.status != http.StatusOK {
-		verb := "enable"
-		if disabled {
-			verb = "disable"
+	transport := &http.Transport{Proxy: nil}
+	if proxyURL != "" {
+		parsed, errParse := url.Parse(proxyURL)
+		if errParse != nil {
+			return nil, fmt.Errorf("exit is not a valid URL: %w", errParse)
 		}
-		return probeExplainStatus(result, fmt.Sprintf("PATCH %s (%s %s)", probeRouteAuthStatus, verb, name))
+		transport.Proxy = http.ProxyURL(parsed)
 	}
-	return nil
+	client := &http.Client{Transport: transport}
+	p.clients[proxyURL] = client
+	return client, nil
 }
 
-// enableOnly makes one credential the sole enabled Codex candidate.
-//
-// This is mandatory, not a convenience. CPA's scheduler picks the credential
-// itself and the wire protocol has no "use this auth" knob, so the only reliable
-// way to attribute a harvested template to a known account is to make that
-// account the only one that could have answered. Guessing instead would break
-// the per-account bucketing this plugin exists to enforce.
-//
-// ==> While a sweep runs, every other Codex credential is DISABLED. Business
-// traffic must already be stopped.
-func (c *probeClient) enableOnly(ctx context.Context, auths []probeAuthFile, keep string) error {
-	for _, auth := range auths {
-		if errSet := c.setDisabled(ctx, auth.Name, auth.AuthIndex, auth.Name != keep); errSet != nil {
-			return errSet
-		}
+func (p *probeClientPool) closeIdle() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for _, client := range p.clients {
+		client.CloseIdleConnections()
 	}
-	return nil
-}
-
-// fire sends exactly one minimal request and reports what came back.
-//
-// The request carries NO X-Codex-Turn-State header, deliberately: sending a
-// stale value makes the upstream reuse that turn instead of minting a fresh
-// state, and a fresh state is the only thing this call exists to produce.
-//
-// A non-2xx is not a failure. The plugin harvests from the response headers, and
-// those ride on error responses too; the authority on success is the bucket
-// going live, which the caller checks.
-func (c *probeClient) fire(ctx context.Context, model string) (int, string) {
-	payload := map[string]any{
-		"model":  model,
-		"input":  "ping",
-		"stream": false,
-		// As small as the API allows. This call exists to mint a turn-state, not
-		// to produce text, and quota is real money.
-		"max_output_tokens": 16,
-	}
-	result, errCall := c.call(ctx, http.MethodPost, probeRouteResponses, c.apiKey, payload, probeFireTimeout)
-	if errCall != nil {
-		return 0, " (" + probeRedact(errCall.Error()) + ")"
-	}
-	if result.status >= 200 && result.status < 300 {
-		return result.status, ""
-	}
-
-	// The upstream's own error code is the actionable part:
-	// server_is_overloaded is the same signal as a degraded 312 (FINDINGS.md),
-	// i.e. "no template is available right now, try the next exit" rather than
-	// "something is broken".
-	note := ""
-	if upstream, okUpstream := upstreamErrorFrom(string(result.body)); okUpstream {
-		note = " code=" + orDash(upstream.Error.Code) + " type=" + orDash(upstream.Error.Type)
-	}
-	// The body itself goes to the process log and never to Lines. It is the one
-	// thing that identifies a wrong route or a wrong payload shape on a first
-	// real run, which is why it is kept at all -- but it is upstream-controlled
-	// text that may echo a URL back at us, and Lines is served without a key.
-	log.Printf("%sprobe fire model=%s http=%d body=%s", logPrefix, model, result.status,
-		probeTruncate(probeRedact(string(result.body)), 600))
-	return result.status, note
-}
-
-// probeHasAuthIndex reports whether CPA gave us an auth_index worth echoing back.
-func probeHasAuthIndex(raw json.RawMessage) bool {
-	trimmed := strings.TrimSpace(string(raw))
-	return trimmed != "" && trimmed != "null" && trimmed != `""`
 }
 
 // --- redaction -----------------------------------------------------------
@@ -1158,7 +1089,7 @@ var (
 )
 
 // probeRedact strips anything credential-shaped out of text bound for Lines, the
-// run error, or the process log. It mirrors redact() in scripts/probe.py.
+// run error, or the process log.
 func probeRedact(text string) string {
 	text = probeTokenRE.ReplaceAllString(text, "<turn-state redacted>")
 	text = probeBearerRE.ReplaceAllString(text, "${1}<redacted>")
@@ -1171,7 +1102,7 @@ func probeShowProxy(raw string) string {
 	if masked := maskProxyURL(raw); masked != "" {
 		return masked
 	}
-	return "(none)"
+	return "(direct)"
 }
 
 // probeTruncate bounds a quoted body, saying how much was dropped so nobody

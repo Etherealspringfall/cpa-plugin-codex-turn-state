@@ -19,13 +19,15 @@
     保存探测范围 ── 也在 .../ops/scope，同样不鉴权。插件把范围写进【自己的】
                     scope 文件，不经过 CPA 那条鉴权的 config PATCH —— 宿主没给
                     插件保存配置的接口，那条 PATCH 是唯一替代，而它要密钥。
-    代理 ──────── 是本插件配置里唯一的机密，明文只在鉴权的 management /config
-                    上回传，本页面【从不调用那条路由】。所以代理框是只写的：
-                    显示掩码，要改就整段重填。把它做成匿名可读 = 把账号密码摊
-                    给任何摸到隧道的人。
+    可选清单 ───── .../ops/choices，也不鉴权。它是【读】不是动作，所以不带
+                    confirm=1。账号和模型的勾选清单从它来：名字打错在任何一层
+                    都不会被拒，只会变成一条永远探不到东西的范围。
+    代理 ──────── 明文回传（走 status），框里显示的就是真值。这是操作员明确
+                    要求的：显示掩码的代价是改一条代理就得把整个池子重打一遍，
+                    那个编辑框基本没法用。【不要再把它「改进」成掩码。】
 
-  代理掩码是单向的 —— 匿名 status 只给条数和 socks5h://***@host:1080 这种掩码；
-  页面任何情况下都不会拿掩码去反推原值，也不会把带 *** 的行当真值存回配置。
+  ⚠ 代理明文可匿名读，是在知情下选的：CPA 只绑 127.0.0.1，够得到这个端口就等于
+  已经在这台机器上。哪天这个端口不再只在隧道里，这一条要第一个回来重估。
 
   【这是用户在知情下选的】：CPA 只绑 127.0.0.1、要走 SSH 隧道才够得到，所以
   「不鉴权」实际等于「能进隧道的人（就是用户自己）」。四个操作因此不设任何门。
@@ -202,9 +204,23 @@ td.acct.outscope, th.model.outscope, em.outscope { font-style: italic; color: va
 .check { display: flex; gap: 7px; align-items: baseline; padding: 2px 0; font-size: 12.5px; }
 .check input { flex: 0 0 auto; margin: 0; }
 .check span {
+  flex: 1 1 auto; min-width: 0;
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
+/* 条目上的两个状态标。都只是标注，【不】影响能不能勾：
+     .off  —— 这个凭据在 CPA 里是停用的。停用只是 CPA 不给它派业务流量，
+              探测是点名探的，照样探得到，所以勾选框保持可用。
+     .gone —— 配置里选着它，但服务端的清单里没有这一项。必须看得见：默默
+              把它从清单里漏掉，等于无声地把探测范围缩小了。 */
+.check .tag {
+  flex: 0 0 auto; font-style: normal; font-size: 10.5px; line-height: 1.6;
+  padding: 0 6px; border-radius: 999px;
+  border: 1px solid var(--border); background: var(--card); color: var(--muted);
+}
+.check .tag.off { border-color: var(--warn); background: var(--warn-bg); color: var(--warn); }
+.check .tag.gone { border-color: var(--bad); background: var(--bad-bg); color: var(--bad); }
+.check.isoff span { color: var(--muted); }
 .checks .empty { color: var(--faint); font-size: 12.5px; padding: 3px 0; }
 .addrow { margin-top: 7px; }
 #scopeModelAdd, #scopeProxies {
@@ -476,6 +492,12 @@ select {
 "use strict";
 
 var POLL_MS = 10000;
+// /ops/choices 比 status 冷得多（CPA 手里的凭据一天也未必变一次），所以它不跟着
+// status 每 10 秒刷一次，最快 60 秒一次。另外两种情况干脆不读：
+//   · 表单被动过     —— 清单一换，勾选框就要重建，会打断正在点的人。
+//   · 探测跑着的时候 —— 探测会逐个开关账号的启用位，那段时间读到的 disabled 是
+//                      过程量，刷进清单只会让标签闪个不停。
+var CHOICES_MS = 60000;
 
 // 不鉴权、GET-only。这个页面【只】用这一个前缀：status、四个操作、保存范围。
 // 鉴权的 management 路由（.../config 回明文代理，POST .../buckets/clear、
@@ -660,6 +682,7 @@ function confirmDialog(opts) {
 // /v0/resource/plugins/codex-turn-state/ 下面，宿主对那个前缀不做鉴权：
 //
 //   status                只读数据
+//   ops/choices           勾选清单的候选项（读，所以走 resGet，不带 confirm=1）
 //   ops/dry-run           ops/role          ops/clear       ops/selftest
 //   ops/scope             保存探测范围
 //   ops/probe/start       ops/probe/cancel  插件内探测
@@ -987,25 +1010,36 @@ function renderSelftestModels(d) {
 // 这三项是【探测范围】，不是业务开关：只决定下一轮探测去采哪些桶。业务端替不
 // 替换只看 store 里有没有桶，跟这里无关。
 //
-// 值的来源分两条，因为代理里可能带 userinfo（本插件配置里唯一的机密）：
-//   账号 / 模型 —— 匿名 status 就有，进页面即可勾选、直接保存。
-//   代理       —— 匿名 status 只给条数和掩码（socks5h://***@host:1080）。
-// 掩码是单向的：从 *** 推不回原值。所以代理是【只写】的 —— 框里永远显示掩码，
-// 整段重填才算改动；没动过时它逐字等于那串掩码，diff 为空，不会被提交。
+// 值的来源分两条：
+//   账号 / 模型 —— 勾选，候选清单来自 /ops/choices（服务端问 CPA 要的真实凭据
+//                  清单 + 值得提供的模型 id）。那条路由不在就退回老办法：从
+//                  status 的 probe_accounts / models / buckets 推。
+//   代理       —— 明文，一行一个，status 直接回传原值。没动过时 diff 为空。
+//
+// 勾选清单里的每一项都有两个字符串，不能混：
+//   name —— 提交值。账号的 name 是凭据文件名，【含客户邮箱】。
+//   text —— 显示值。choices 给的 label（服务端已经把邮箱去掉了）。
+// 渲染只碰 text；name 只活在 JS 里，既不渲染也不写进 DOM 属性。
 
 var scope = {
-  acctCandidates: [],
+  // 规范化后的候选项：{name, text, disabled, missing}，顺序即提交顺序。
+  acctItems: [],
   acctSelected: Object.create(null),
   hasAccounts: false,       // status 里有没有 probe_accounts（旧 .so 没有）
-  modelCandidates: [],
+  modelItems: [],
   modelSelected: Object.create(null),
-  extraModels: [],          // 手填进来、状态里还没有的模型 id
+  extraModels: [],          // 手填进来、清单里还没有的模型 id
   hasProxyFields: false,
   // 明文。status 直接回传原值，所以这里就是真值，没动过时 diff 为空。
   proxyText: "",
   dirty: false,             // 人动过表单。动过之后轮询就不再覆盖它
   acctSig: "",
-  modelSig: ""
+  modelSig: "",
+  // ---- /ops/choices 的读取结果。三者互斥地描述「清单能不能用」 ----
+  choices: null,            // {accounts:[…], models:[…]}；null = 还没拿到 / 拿不到
+  choicesErr: "",           // 非空 = 服务端够不到 CPA 的凭据清单，原话照抄
+  choicesMissing: false,    // 404：当前 .so 还没有这条路由
+  choicesAt: 0              // 上次【发起】读取的时刻，用来限速
 };
 
 function hasField(obj, k) {
@@ -1063,12 +1097,142 @@ function looksMasked(s) { return String(s).indexOf("***") >= 0; }
 // 旧 .so 不报时不要把复选框显示成「全都没勾」—— 那看着像人自己没选。
 function scopeAccountsEditable() { return scope.hasAccounts; }
 
-function selectedAccounts() {
-  return scope.acctCandidates.filter(function (a) { return !!scope.acctSelected[a]; });
+// 勾选顺序 = 清单顺序。提交的就是这个数组，服务端怎么列的就怎么发回去。
+function selectedNames(items, selected) {
+  var out = [];
+  items.forEach(function (it) { if (selected[it.name]) { out.push(it.name); } });
+  return out;
 }
 
-function selectedModels() {
-  return scope.modelCandidates.filter(function (m) { return !!scope.modelSelected[m]; });
+function selectedAccounts() { return selectedNames(scope.acctItems, scope.acctSelected); }
+
+function selectedModels() { return selectedNames(scope.modelItems, scope.modelSelected); }
+
+function hasItemNamed(items, name) {
+  for (var i = 0; i < items.length; i++) { if (items[i].name === name) { return true; } }
+  return false;
+}
+
+function countMissing(items) {
+  var n = 0;
+  items.forEach(function (it) { if (it.missing) { n++; } });
+  return n;
+}
+
+/* ------------------------- /ops/choices 与候选项 ------------------------- */
+
+// 只有「拿到了清单、路由存在、服务端没报错」才算可用。error 非空说明服务端够不
+// 到 CPA 的凭据清单，那时 accounts 多半是空的 —— 把一个空清单当真，会让所有已
+// 配的账号都显示成「清单里没有」，还不如整块退回旧来源，并把原话说出来。
+function usingChoices() {
+  return !!(scope.choices && !scope.choicesErr && !scope.choicesMissing);
+}
+
+// 服务端条目 → 规范形状。name 是唯一必需的字段（没有它就没有可提交的值）；
+// 其余缺了都能兜住，宁可少一个标签也不要因为形状没对上整块不显示。
+function choiceList(v) {
+  var out = [];
+  var seen = Object.create(null);
+  if (!Array.isArray(v)) { return out; }
+  v.forEach(function (x) {
+    if (!x || typeof x !== "object") { return; }
+    var name = (typeof x.name === "string") ? x.name : "";
+    if (!name || seen[name]) { return; }
+    seen[name] = true;
+    out.push({
+      name: name,
+      label: (typeof x.label === "string") ? x.label : "",
+      disabled: !!x.disabled,
+      selected: !!x.selected
+    });
+  });
+  return out;
+}
+
+// 只在没有 label 可用时才走这里：把 user@host 那一段换成省略号。账号名形如
+// codex-620f5a42-someone@example.com-pro.json，掐掉中段还剩得下前缀和后缀，
+// 够在矩阵里对上号，又不会把客户邮箱印在勾选清单上。
+function elideName(name) {
+  return String(name).replace(/[^\s\-@]+@[^\s\-@]+/, "…");
+}
+
+// choices 的条目 + 配置里选着、但清单里没有的条目。后者必须补进来并标出来：
+// 一个静悄悄消失的账号 = 探测范围被无声缩小，而页面上看不出发生过什么。
+// secret=true 的那一侧（账号）没有 label 就就地缩写，绝不整串显示。
+function itemsFromChoices(list, cfgNames, secret) {
+  var out = [];
+  var seen = Object.create(null);
+  (list || []).forEach(function (c) {
+    if (seen[c.name]) { return; }
+    seen[c.name] = true;
+    out.push({
+      name: c.name,
+      text: c.label || (secret ? elideName(c.name) : c.name),
+      disabled: !!c.disabled,
+      missing: false
+    });
+  });
+  (cfgNames || []).forEach(function (n) {
+    if (!n || seen[n]) { return; }
+    seen[n] = true;
+    out.push({
+      name: n,
+      text: secret ? elideName(n) : n,
+      disabled: false,
+      missing: true
+    });
+  });
+  return out;
+}
+
+// 退回路径的候选项。这一侧没有 label 可用 —— status 里就只有文件名，而矩阵那
+// 一列本来也印着同一个字符串，所以这里原样显示，不额外缩写：缩写会让两个只有
+// 邮箱段不同的账号在清单里长得一模一样。
+function itemsFromNames(names) {
+  var out = [];
+  (names || []).forEach(function (n) {
+    out.push({ name: n, text: n, disabled: false, missing: false });
+  });
+  return out;
+}
+
+// 永远 resolve：清单读不到不该把整次刷新拖成失败态 —— status 还在，页面照常能
+// 用，只是勾选清单退回旧来源。失败原因记在 scope 上，由 renderScopeMeta 说出来。
+function fetchChoices(force) {
+  var now = Date.now();
+  if (!force) {
+    if (scope.dirty) { return Promise.resolve(); }
+    if (scope.choicesAt && (now - scope.choicesAt) < CHOICES_MS) { return Promise.resolve(); }
+    var run = probeRunOf(state.data);
+    if (run && run.running) { return Promise.resolve(); }
+  }
+  scope.choicesAt = now;
+  // 读，不是动作，所以走 resGet 不带 confirm=1（见 management.go 的 routeOpsChoices）。
+  return resGet("/ops/choices").then(function (c) {
+    c = c || {};
+    scope.choices = { accounts: choiceList(c.accounts), models: choiceList(c.models) };
+    scope.choicesErr = (typeof c.error === "string") ? c.error : "";
+    scope.choicesMissing = false;
+  }).catch(function (err) {
+    // 404 和别的错必须分开说：前者是「这个 .so 还没有这个功能」，换 .so 才有；
+    // 后者是「有这个功能但这次没读到」，要去看服务端。糊成一句会让人找错方向。
+    var gone = (err instanceof ApiError) && err.status === 404;
+    scope.choices = null;
+    scope.choicesMissing = gone;
+    scope.choicesErr = gone ? "" : ((err && err.message) ? err.message : String(err));
+  });
+}
+
+// 清单读不到时那句解释。跟探测那一节「当前 .so 的 status 不返回 probe_run」
+// 是同一个套路：把降级说成一句人话，就地挂在相关控件旁边。
+function choicesWarning() {
+  if (scope.choicesMissing) {
+    return "当前 .so 没有 /ops/choices —— 账号和模型退回按 status 报的清单列（照旧能勾能存，只是名字是 CPA 报什么就是什么，没法核对哪个号还在）。换成新的 .so 并重启 CPA 才有。";
+  }
+  if (scope.choicesErr) {
+    return "服务端读不到可选清单，已退回按 status 报的清单列：" + scope.choicesErr;
+  }
+  return "";
 }
 
 function bucketModels(buckets) {
@@ -1082,11 +1246,22 @@ function bucketModels(buckets) {
 function syncScope(d) {
   scope.hasAccounts = hasField(d, "probe_accounts");
   var cfgAccts = strList(d.probe_accounts);
-  // 点了名但一个桶都没有的账号也要出现在清单里，否则「我明明选了它」没处看。
-  scope.acctCandidates = uniqSorted(uniqueAuthIds(d.buckets).concat(cfgAccts));
-
   var cfgModels = strList(d.models);
-  scope.modelCandidates = uniqSorted(cfgModels.concat(bucketModels(d.buckets), scope.extraModels));
+
+  if (usingChoices()) {
+    // 顺序就是服务端列出来的顺序，一个字都不重排 —— 保存时提交的就是它。
+    // 配置里选着但清单里没有的补在末尾（itemsFromChoices 里标 missing）。
+    scope.acctItems = itemsFromChoices(scope.choices.accounts, cfgAccts, true);
+    scope.modelItems = itemsFromChoices(scope.choices.models,
+      cfgModels.concat(scope.extraModels), false);
+  } else {
+    // 退回路径：/ops/choices 没有或读不到，清单只能从 status 推。这是它出现之
+    // 前的行为，原样保留 —— 旧 .so 上这个页面必须照常能用。
+    // 点了名但一个桶都没有的账号也要出现在清单里，否则「我明明选了它」没处看。
+    scope.acctItems = itemsFromNames(uniqSorted(uniqueAuthIds(d.buckets).concat(cfgAccts)));
+    scope.modelItems = itemsFromNames(
+      uniqSorted(cfgModels.concat(bucketModels(d.buckets), scope.extraModels)));
+  }
 
   scope.hasProxyFields = hasField(d, "probe_proxies") || hasField(d, "probe_proxy_count");
 
@@ -1094,6 +1269,12 @@ function syncScope(d) {
 
   var sel = Object.create(null);
   cfgAccts.forEach(function (a) { sel[a] = true; });
+  // choices 里的 selected 只在 status 不报 probe_accounts 时才用得上。勾选状态
+  // 必须和 scopeDiff 的基线（status）同源：两边各说各的，会让一个没动过的表单
+  // 显示成「有未保存的改动」，然后被存回一次谁也没要的改动。
+  if (!scope.hasAccounts && usingChoices()) {
+    scope.choices.accounts.forEach(function (c) { if (c.selected) { sel[c.name] = true; } });
+  }
   scope.acctSelected = sel;
 
   var msel = Object.create(null);
@@ -1106,47 +1287,93 @@ function syncScope(d) {
   scope.proxyText = strList(d.probe_proxies).join("\n");
 }
 
-function checksSig(candidates, selected, disabled) {
+// 签名覆盖每一个会改变这块 DOM 的东西：清单、显示名、两个状态标、勾选、整体
+// 停用位。漏掉任何一项，那一项就再也不会刷新了。
+function checksSig(items, selected, disabled) {
   return JSON.stringify([
-    candidates,
-    candidates.map(function (c) { return !!selected[c]; }),
+    items.map(function (it) { return [it.name, it.text, !!it.disabled, !!it.missing]; }),
+    items.map(function (it) { return !!selected[it.name]; }),
     !!disabled
   ]);
 }
 
+// 上一次渲染出来的顺序，按 box 记。重建之后靠它把焦点放回【同一项】—— 按下标
+// 放回去会在清单长短变化时落到隔壁那一行，那比丢焦点更糟：下一次空格就勾错号
+// 了。名字只留在这个闭包里，不写进 DOM 属性。
+var renderedNames = Object.create(null);
+
+function checkTitle(it) {
+  var bits = [it.text];
+  if (it.disabled) {
+    bits.push("这个凭据在 CPA 里是停用的。仍然可以勾 —— 停用只是 CPA 不给它派业务流量，探测是点名探的，照样探得到。");
+  }
+  if (it.missing) {
+    bits.push("配置里选着它，但服务端的清单里没有这一项。这里照样勾着，免得一次刷新就把探测范围悄悄缩小了；真要去掉，取消勾选再保存。");
+  }
+  return bits.join("\n");
+}
+
 // 只在清单或勾选真的变了时重建 DOM：每 10 秒把一排勾选框拆了重建，会把正在
-// 操作的人的焦点和滚动位置一起弄丢。
-function renderChecks(boxId, sigKey, candidates, selected, disabled, emptyText, onToggle) {
-  var sig = checksSig(candidates, selected, disabled);
+// 操作的人的焦点和滚动位置一起弄丢。真要重建时也把这两样还回去。
+function renderChecks(boxId, sigKey, items, selected, disabled, emptyText, onToggle) {
+  var sig = checksSig(items, selected, disabled);
   if (scope[sigKey] === sig) { return; }
   scope[sigKey] = sig;
 
   var box = $(boxId);
+  var keepTop = box.scrollTop;
+  var focusName = "";
+  var prev = renderedNames[boxId] || [];
+  var inputs = box.getElementsByTagName("input");
+  for (var i = 0; i < inputs.length; i++) {
+    if (inputs[i] === document.activeElement) { focusName = prev[i] || ""; break; }
+  }
+
   box.className = "checks" + (disabled ? " disabled" : "");
   clear(box);
-  if (!candidates.length) {
+  renderedNames[boxId] = items.map(function (it) { return it.name; });
+
+  if (!items.length) {
     box.appendChild(el("div", { cls: "empty", text: emptyText }));
     return;
   }
-  candidates.forEach(function (name) {
+
+  var refocus = null;
+  items.forEach(function (it) {
     var cb = el("input", { attrs: { type: "checkbox" } });
-    cb.checked = !!selected[name];
+    cb.checked = !!selected[it.name];
+    // 整体停用（旧 .so 报不出 probe_accounts）才禁用勾选框。条目自己的
+    // it.disabled 是 CPA 里的启用位，只挂个标，不挡勾。
     cb.disabled = !!disabled;
-    cb.addEventListener("change", function () { onToggle(name, cb.checked); });
-    // 账号名就是账号文件名，【可能含客户邮箱】。原样显示，不做二次查询、不显示
-    // 除文件名以外的任何账号信息，更不显示任何 token。
-    box.appendChild(el("label", { cls: "check" }, [
-      cb, el("span", { text: name, attrs: { title: name } })
-    ]));
+    cb.addEventListener("change", function () { onToggle(it.name, cb.checked); });
+    if (focusName && it.name === focusName) { refocus = cb; }
+
+    // 只显示 it.text。账号的 it.name 是凭据文件名【含客户邮箱】，它是提交值，
+    // 不进 DOM —— 不做二次查询、不显示除这个短名以外的任何账号信息，更没有
+    // 任何 token。
+    var kids = [cb, el("span", { text: it.text, attrs: { title: it.text } })];
+    if (it.disabled) { kids.push(el("i", { cls: "tag off", text: "CPA 已停用" })); }
+    if (it.missing) { kids.push(el("i", { cls: "tag gone", text: "清单里没有" })); }
+    box.appendChild(el("label", {
+      cls: "check" + (it.disabled ? " isoff" : ""),
+      attrs: { title: checkTitle(it) }
+    }, kids));
   });
+
+  box.scrollTop = keepTop;
+  // preventScroll 是为了不让「把焦点放回去」再把刚还原好的滚动位置顶掉。
+  // 老浏览器不认这个参数会当成无参调用，那也只是退回到「可能跳一下」。
+  if (refocus) { refocus.focus({ preventScroll: true }); }
 }
 
 function renderScopeChecks() {
   var acctOff = !scopeAccountsEditable();
-  renderChecks("scopeAccounts", "acctSig", scope.acctCandidates, scope.acctSelected, acctOff,
-    "一个账号都没有 —— CPA 没报账号列表，store 也是空的。",
+  renderChecks("scopeAccounts", "acctSig", scope.acctItems, scope.acctSelected, acctOff,
+    usingChoices()
+      ? "服务端说 CPA 手里一个 Codex 凭据都没有。"
+      : "一个账号都没有 —— CPA 没报账号列表，store 也是空的。",
     function (name, on) { scope.acctSelected[name] = on; onScopeEdited(); });
-  renderChecks("scopeModels", "modelSig", scope.modelCandidates, scope.modelSelected, false,
+  renderChecks("scopeModels", "modelSig", scope.modelItems, scope.modelSelected, false,
     "清单是空的。用下面的输入框补一个模型 id。",
     function (name, on) { scope.modelSelected[name] = on; onScopeEdited(); });
 }
@@ -1155,14 +1382,15 @@ function renderScopeChecks() {
 // 重建掉，然后更新那几处计数。
 function onScopeEdited() {
   scope.dirty = true;
-  scope.acctSig = checksSig(scope.acctCandidates, scope.acctSelected, !scopeAccountsEditable());
-  scope.modelSig = checksSig(scope.modelCandidates, scope.modelSelected, false);
+  scope.acctSig = checksSig(scope.acctItems, scope.acctSelected, !scopeAccountsEditable());
+  scope.modelSig = checksSig(scope.modelItems, scope.modelSelected, false);
   renderScopeMeta(state.data || {});
 }
 
 function renderScopeProxies() {
   var ta = $("scopeProxies");
-  // 始终可写。只写语义见 syncScope：显示掩码，整段重填才算改动。
+  // 明文，始终可写，不做掩码 —— 操作员明确要求过：掩码的代价是改一条代理就得
+  // 把整个池子重打一遍。别再「顺手改进」成掩码，那是从头来过。
   ta.readOnly = false;
   // 正在输入时不要动它的值，否则光标会跳。输入事件已经把值同步进 scope 了。
   if (document.activeElement !== ta && ta.value !== scope.proxyText) {
@@ -1175,17 +1403,32 @@ function renderScopeMeta(d) {
   var selA = selectedAccounts();
   var selM = selectedModels();
 
+  var warn = choicesWarning();
+
   var aNote = $("scopeAcctNote");
   clear(aNote);
-  aNote.appendChild(el("span", {
-    text: scopeAccountsEditable()
-      ? ("已选 " + selA.length + " / 候选 " + scope.acctCandidates.length)
-      : "当前 .so 的 status 不报 probe_accounts，勾选已停用 —— 不把猜出来的范围存回去"
-  }));
+  var aText;
+  if (!scopeAccountsEditable()) {
+    aText = "当前 .so 的 status 不报 probe_accounts，勾选已停用 —— 不把猜出来的范围存回去";
+  } else {
+    aText = "已选 " + selA.length + " / 候选 " + scope.acctItems.length;
+    var aGone = countMissing(scope.acctItems);
+    // 这句必须说出来：清单里少一个号，和「这个号被摘掉了」是两回事，而后者
+    // 不吭声就等于范围被无声缩小。
+    if (aGone) { aText += "；其中 " + aGone + " 项 CPA 已不再报告，仍勾着"; }
+  }
+  aNote.className = "hint" + ((!scopeAccountsEditable() || warn) ? " warn" : "");
+  aNote.appendChild(el("span", { text: aText }));
+  // 降级说明只挂一次（账号是第一列），文案里已经说清它同时影响模型。
+  if (warn) { aNote.appendChild(el("span", { text: "　" + warn })); }
 
   var mNote = $("scopeModelNote");
   clear(mNote);
-  mNote.appendChild(el("span", { text: "已选 " + selM.length + " / 候选 " + scope.modelCandidates.length }));
+  var mText = "已选 " + selM.length + " / 候选 " + scope.modelItems.length;
+  var mGone = countMissing(scope.modelItems);
+  if (mGone) { mText += "；其中 " + mGone + " 项不在服务端清单里"; }
+  mNote.className = "hint";
+  mNote.appendChild(el("span", { text: mText }));
 
   var pNote = $("scopeProxyNote");
   clear(pNote);
@@ -1310,7 +1553,7 @@ function addModelFromInput() {
     notify("err", "模型 id 里不该有空白字符：" + raw + "。一次加一个。");
     return;
   }
-  var known = scope.modelCandidates.indexOf(raw) >= 0;
+  var known = hasItemNamed(scope.modelItems, raw);
   if (!known && scope.extraModels.indexOf(raw) < 0) { scope.extraModels.push(raw); }
   var already = known && !!scope.modelSelected[raw];
   scope.modelSelected[raw] = true;
@@ -1440,6 +1683,9 @@ function doResetScope() {
   scope.modelSig = "";
   if (state.data) { renderScope(state.data); }
   notify("ok", "已放弃未保存的改动，表单退回当前配置。");
+  // 「放弃改动」= 把服务端那份再给我一遍。清单在表单被动过期间是不刷的，所以
+  // 这里强制读一次，省得还要等最多 60 秒才看到别人刚加的号。
+  fetchChoices(true).then(function () { if (state.data) { renderScope(state.data); } });
 }
 
 /* ---------------------------- 探测进度 ---------------------------- */
@@ -1545,8 +1791,11 @@ function retunePolling() {
 }
 
 function refresh() {
-  return resGet("/status").then(function (d) {
-    state.data = d;
+  // 清单和 status 并行取，一起渲染 —— 分两步会让首屏先画一遍退回清单再跳成
+  // 勾选清单。fetchChoices 永不 reject，也自己限速，所以下面的失败分支只会是
+  // status 的失败，降级语义（不清 state.data）跟以前一样。
+  return Promise.all([resGet("/status"), fetchChoices(false)]).then(function (got) {
+    state.data = got[0];
     state.lastGood = new Date();
     state.lastError = null;
     render();
@@ -1850,9 +2099,9 @@ $("scopeProxies").addEventListener("input", function () {
 });
 
 (function boot() {
-  // 没有登录门，也没有任何需要密钥的动作：看数据、四个操作、保存探测范围全部
-  // 走不鉴权的 resource 路由。代理是只写的 —— 框里显示掩码，要改就整段重填 ——
-  // 所以读明文那条鉴权路由这个页面从不调用。
+  // 没有登录门，也没有任何需要密钥的动作：看数据、四个操作、读可选清单、保存
+  // 探测范围，全部走不鉴权的 resource 路由。代理明文由 status 回传，所以那条
+  // 鉴权的 /config 路由这个页面从不调用。
   refresh().then(startPolling);
 })();
 </script>
