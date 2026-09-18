@@ -1623,6 +1623,262 @@ func TestWriteStoreRecordRefusesDegradedLength(t *testing.T) {
 	}
 }
 
+// --- 6d. sole-account attribution: the cross-account firewall ------------
+//
+// When a request or response carries no selected_auth_id, the plugin may infer
+// the account from the spec §7 invariant that a probe enables exactly one Codex
+// account at a time. That inference is the single most dangerous line in the
+// codebase: infer wrong and account A's template is written under, or injected
+// into, account B -- a direct breach of §0 rule 1 (a state is never shared
+// across accounts). The tests here exist to make that failure impossible to
+// introduce silently. The `count != 1` refusal in soleEnabledCodexAuth is the
+// firewall; the 2+ cases below are the ones that must never regress.
+//
+// codexAuthLister is a package-level seam (management.go). Every test that
+// swaps it MUST restore it and drop the cache, or the fake account list leaks
+// into every later test. resetAuthCache() is required after each swap because
+// the lookup sits behind a 2-second cache.
+
+// withAuthList installs a fake credential list for the duration of one test and
+// guarantees restoration. Centralising the swap/restore means no individual
+// test can forget the defer -- the failure mode the coordinator flagged.
+func withAuthList(t *testing.T, accounts []statusAccount, err error) {
+	t.Helper()
+	codexAuthLister = func() ([]statusAccount, error) {
+		return accounts, err
+	}
+	resetAuthCache()
+	t.Cleanup(func() {
+		codexAuthLister = listCodexAuths
+		resetAuthCache()
+	})
+}
+
+// readStoredRecord reads one bucket file back off disk as a storeRecord, so a
+// test can inspect fields the in-memory template entry drops -- Attribution in
+// particular, which is the audit trail distinguishing a read account from a
+// guessed one.
+func readStoredRecord(t *testing.T, dir, authID, model string) storeRecord {
+	t.Helper()
+	rel, err := bucketRelPath(authID, model)
+	if err != nil {
+		t.Fatalf("bucketRelPath(%q, %q): %v", authID, model, err)
+	}
+	data, err := os.ReadFile(filepath.Join(dir, rel))
+	if err != nil {
+		t.Fatalf("read stored record %s/%s: %v", authID, model, err)
+	}
+	var rec storeRecord
+	if err := json.Unmarshal(data, &rec); err != nil {
+		t.Fatalf("decode stored record %s/%s: %v", authID, model, err)
+	}
+	return rec
+}
+
+func enabledAccounts(names ...string) []statusAccount {
+	out := make([]statusAccount, len(names))
+	for i, name := range names {
+		out[i] = statusAccount{AuthID: name, Enabled: true}
+	}
+	return out
+}
+
+// harvestNoAuthMeta is the metadata a minimal probe request carries: none. The
+// account is absent, which is exactly what forces the inference path.
+var harvestNoAuthMeta = map[string]any{}
+
+// --- collection side: harvestFromResponse infers the account for a 292 ---
+
+// One enabled account: the 292 is stored, attributed by inference.
+func TestHarvestInfersSoleAccount(t *testing.T) {
+	dir := t.TempDir()
+	mustConfigure(t, probeRoleConfig(dir))
+	resetHarvestState(t)
+	withAuthList(t, enabledAccounts("codex-only.json"), nil)
+
+	state.mu.Lock()
+	cfg := state.config
+	state.mu.Unlock()
+
+	harvestFromResponse(cfg, harvestResponseHeaders(fakeToken(292, wallClock().Add(-time.Minute))), harvestNoAuthMeta, "gpt-5.5")
+
+	loaded, err := loadStore(dir, wallClock(), testTTL, cfg.TemplateLength)
+	if err != nil {
+		t.Fatalf("loadStore: %v", err)
+	}
+	if _, ok := loaded[bucketKey("codex-only.json", "gpt-5.5")]; !ok {
+		t.Fatalf("a 292 with one enabled account was not stored under that account; buckets: %v", bucketNames(loaded))
+	}
+	// The record must be marked inferred, not observed: an operator auditing the
+	// store has to be able to tell a guessed attribution from a read one.
+	rec := readStoredRecord(t, dir, "codex-only.json", "gpt-5.5")
+	if rec.Attribution != "inferred" {
+		t.Errorf("attribution = %q, want inferred", rec.Attribution)
+	}
+}
+
+// Two enabled accounts: THE firewall. With no metadata to say which account the
+// response belongs to, storing it would be a coin toss, and a wrong guess files
+// one account's template under the other -- §0 rule 1. It must refuse: nothing
+// on disk at all.
+func TestHarvestRefusesToInferWithMultipleAccounts(t *testing.T) {
+	dir := t.TempDir()
+	mustConfigure(t, probeRoleConfig(dir))
+	resetHarvestState(t)
+	withAuthList(t, enabledAccounts("codex-a.json", "codex-b.json"), nil)
+
+	state.mu.Lock()
+	cfg := state.config
+	state.mu.Unlock()
+
+	harvestFromResponse(cfg, harvestResponseHeaders(fakeToken(292, wallClock().Add(-time.Minute))), harvestNoAuthMeta, "gpt-5.5")
+
+	if files := regularFiles(t, dir); len(files) != 0 {
+		t.Errorf("a 292 was stored despite two enabled accounts; nothing must be written when the account is ambiguous: %v", files)
+	}
+	loaded, err := loadStore(dir, wallClock(), testTTL, cfg.TemplateLength)
+	if err != nil {
+		t.Fatalf("loadStore: %v", err)
+	}
+	if len(loaded) != 0 {
+		t.Errorf("loadStore found %d templates, want 0: an ambiguous 292 leaked into the store", len(loaded))
+	}
+}
+
+// Zero enabled accounts: nothing to attribute to, so nothing is stored.
+func TestHarvestRefusesToInferWithNoAccounts(t *testing.T) {
+	dir := t.TempDir()
+	mustConfigure(t, probeRoleConfig(dir))
+	resetHarvestState(t)
+	withAuthList(t, []statusAccount{{AuthID: "codex-off.json", Enabled: false}}, nil)
+
+	state.mu.Lock()
+	cfg := state.config
+	state.mu.Unlock()
+
+	harvestFromResponse(cfg, harvestResponseHeaders(fakeToken(292, wallClock().Add(-time.Minute))), harvestNoAuthMeta, "gpt-5.5")
+
+	if files := regularFiles(t, dir); len(files) != 0 {
+		t.Errorf("a 292 was stored with no enabled account: %v", files)
+	}
+}
+
+// Lister error: the credential list is unavailable, so the account cannot be
+// established and the 292 is dropped rather than guessed.
+func TestHarvestRefusesToInferWhenListerFails(t *testing.T) {
+	dir := t.TempDir()
+	mustConfigure(t, probeRoleConfig(dir))
+	resetHarvestState(t)
+	withAuthList(t, nil, fmt.Errorf("host.auth.list unavailable"))
+
+	state.mu.Lock()
+	cfg := state.config
+	state.mu.Unlock()
+
+	harvestFromResponse(cfg, harvestResponseHeaders(fakeToken(292, wallClock().Add(-time.Minute))), harvestNoAuthMeta, "gpt-5.5")
+
+	if files := regularFiles(t, dir); len(files) != 0 {
+		t.Errorf("a 292 was stored while the credential list was unavailable: %v", files)
+	}
+}
+
+// --- substitution side: interceptAfterAuth infers the account for a 312 --
+
+// One enabled account: a metadata-less 312 on a bucket with a live template is
+// substituted, the account supplied by inference.
+func TestSubstituteInfersSoleAccount(t *testing.T) {
+	dir := t.TempDir()
+	mustConfigure(t, businessConfig(dir, false))
+	resetHarvestState(t)
+	withAuthList(t, enabledAccounts("codex-only.json"), nil)
+
+	issued := wallClock().Add(-time.Minute)
+	template := fakeToken(292, issued)
+	mustWriteRecord(t, dir, storeRecord{
+		AuthID:      "codex-only.json",
+		Model:       "gpt-5.5",
+		Len:         292,
+		Value:       template,
+		IssuedAt:    issued.UTC().Format(time.RFC3339),
+		HarvestedAt: issued.UTC().Format(time.RFC3339),
+	})
+
+	// No auth id in the request: the account can only come from inference.
+	resp := interceptAfter(t, request("", "gpt-5.5", fakeToken(312, issued)))
+	if got := outgoingHeader(resp); got != template {
+		t.Errorf("outgoing header = %q, want the stored template; a metadata-less 312 under one account was not substituted", truncateMgmtLog([]byte(got)))
+	}
+}
+
+// Two enabled accounts: THE firewall, substitution side. A metadata-less 312
+// must NOT be substituted -- injecting one account's template into another
+// account's request is precisely §0 rule 1. The request is left untouched.
+func TestSubstituteRefusesToInferWithMultipleAccounts(t *testing.T) {
+	dir := t.TempDir()
+	mustConfigure(t, businessConfig(dir, false))
+	resetHarvestState(t)
+	withAuthList(t, enabledAccounts("codex-a.json", "codex-b.json"), nil)
+
+	issued := wallClock().Add(-time.Minute)
+	// A template exists for one of the accounts. The point is that ambiguity
+	// about *which* account this request belongs to must stop the substitution
+	// even though a template is available.
+	mustWriteRecord(t, dir, storeRecord{
+		AuthID:      "codex-a.json",
+		Model:       "gpt-5.5",
+		Len:         292,
+		Value:       fakeToken(292, issued),
+		IssuedAt:    issued.UTC().Format(time.RFC3339),
+		HarvestedAt: issued.UTC().Format(time.RFC3339),
+	})
+
+	resp := interceptAfter(t, request("", "gpt-5.5", fakeToken(312, issued)))
+	if got := outgoingHeader(resp); got != "" {
+		t.Errorf("the request was rewritten to %q despite two enabled accounts; an ambiguous request must be left untouched", truncateMgmtLog([]byte(got)))
+	}
+}
+
+// An empty request value never triggers inference, even under a single account.
+// Spec §0: a headerless request must never have a template injected onto it, and
+// this guard means even always-mode cannot reach the account that would do so.
+// The inference host call must not even run.
+func TestEmptyRequestNeverInfersAccount(t *testing.T) {
+	dir := t.TempDir()
+	mustConfigure(t, businessConfig(dir, false))
+	resetHarvestState(t)
+
+	issued := wallClock().Add(-time.Minute)
+	mustWriteRecord(t, dir, storeRecord{
+		AuthID:      "codex-only.json",
+		Model:       "gpt-5.5",
+		Len:         292,
+		Value:       fakeToken(292, issued),
+		IssuedAt:    issued.UTC().Format(time.RFC3339),
+		HarvestedAt: issued.UTC().Format(time.RFC3339),
+	})
+
+	// If inference is even attempted on an empty request, this lister records it
+	// -- and the test fails. The §0 guard must short-circuit before the call.
+	called := false
+	codexAuthLister = func() ([]statusAccount, error) {
+		called = true
+		return enabledAccounts("codex-only.json"), nil
+	}
+	resetAuthCache()
+	t.Cleanup(func() {
+		codexAuthLister = listCodexAuths
+		resetAuthCache()
+	})
+
+	resp := interceptAfter(t, request("", "gpt-5.5", ""))
+	if got := outgoingHeader(resp); got != "" {
+		t.Errorf("a headerless request was given a template (%q); spec §0 forbids injecting onto a request that carried no state", truncateMgmtLog([]byte(got)))
+	}
+	if called {
+		t.Error("account inference ran for an empty request; the §0 guard must short-circuit before the host lookup")
+	}
+}
+
 // --- 7. the readiness matrix --------------------------------------------
 
 // Degradation must be visible. A unit test has no host API, so host.auth.list

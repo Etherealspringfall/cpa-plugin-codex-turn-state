@@ -410,8 +410,16 @@ var (
 	authListFetched time.Time
 )
 
-// cachedCodexAuths is listCodexAuths behind a short cache. The host call happens
-// under the mutex so a burst of concurrent responses produces one lookup rather
+// codexAuthLister returns the current Codex credentials. It is a package
+// variable rather than a direct call so tests can inject a fixed list and
+// exercise the attribution fallbacks on both the harvest and substitution
+// paths -- above all the two-accounts case, where refusing to guess is what
+// keeps one account's template off another account's request. Production leaves
+// it pointed at the real host-backed lister.
+var codexAuthLister = listCodexAuths
+
+// cachedCodexAuths is codexAuthLister behind a short cache. The lookup happens
+// under the mutex so a burst of concurrent responses produces one call rather
 // than one each.
 func cachedCodexAuths() ([]statusAccount, error) {
 	authListMu.Lock()
@@ -419,9 +427,22 @@ func cachedCodexAuths() ([]statusAccount, error) {
 	if !authListFetched.IsZero() && time.Since(authListFetched) < authListCacheTTL {
 		return authListCache, authListErr
 	}
-	authListCache, authListErr = listCodexAuths()
+	authListCache, authListErr = codexAuthLister()
 	authListFetched = time.Now()
 	return authListCache, authListErr
+}
+
+// resetAuthCache clears the cached credential list so the next cachedCodexAuths
+// call goes back to codexAuthLister immediately. It exists for tests: after
+// injecting a new codexAuthLister they must drop the 2-second cache, or a stale
+// entry from a previous case would answer instead. Not used in production, where
+// the cache is meant to persist for its full window.
+func resetAuthCache() {
+	authListMu.Lock()
+	defer authListMu.Unlock()
+	authListCache = nil
+	authListErr = nil
+	authListFetched = time.Time{}
 }
 
 // listCodexAuths returns every Codex credential the host knows about, sorted by
