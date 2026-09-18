@@ -1577,7 +1577,7 @@ func TestHarvestNeverStoresDegradedState(t *testing.T) {
 
 	// A 312 with a complete bucket key: attribution is not even needed, so the
 	// only thing keeping it out of the store is the degraded-length rule itself.
-	harvestFromResponse(cfg, harvestResponseHeaders(fakeToken(312, issued)), meta, "gpt-5.5")
+	harvestFromResponse(cfg, harvestResponseHeaders(fakeToken(312, issued)), meta, "gpt-5.5", "")
 
 	if files := regularFiles(t, dir); len(files) != 0 {
 		t.Errorf("a 312 degraded value was written to the store: %v", files)
@@ -1607,13 +1607,13 @@ func TestHarvestStoresTemplateButNotDegraded(t *testing.T) {
 	state.mu.Unlock()
 
 	// First a 312 for the same bucket: must not create a file.
-	harvestFromResponse(cfg, harvestResponseHeaders(fakeToken(312, issued)), meta, "gpt-5.5")
+	harvestFromResponse(cfg, harvestResponseHeaders(fakeToken(312, issued)), meta, "gpt-5.5", "")
 	if files := regularFiles(t, dir); len(files) != 0 {
 		t.Fatalf("the 312 was stored: %v", files)
 	}
 
 	// Then a 292 for the same bucket: must create exactly one file.
-	harvestFromResponse(cfg, harvestResponseHeaders(fakeToken(292, issued)), meta, "gpt-5.5")
+	harvestFromResponse(cfg, harvestResponseHeaders(fakeToken(292, issued)), meta, "gpt-5.5", "")
 	loaded, err := loadStore(dir, wallClock(), testTTL, cfg.TemplateLength)
 	if err != nil {
 		t.Fatalf("loadStore: %v", err)
@@ -1719,7 +1719,7 @@ func TestHarvestInfersSoleAccount(t *testing.T) {
 	cfg := state.config
 	state.mu.Unlock()
 
-	harvestFromResponse(cfg, harvestResponseHeaders(fakeToken(292, wallClock().Add(-time.Minute))), harvestNoAuthMeta, "gpt-5.5")
+	harvestFromResponse(cfg, harvestResponseHeaders(fakeToken(292, wallClock().Add(-time.Minute))), harvestNoAuthMeta, "gpt-5.5", "")
 
 	loaded, err := loadStore(dir, wallClock(), testTTL, cfg.TemplateLength)
 	if err != nil {
@@ -1750,7 +1750,7 @@ func TestHarvestRefusesToInferWithMultipleAccounts(t *testing.T) {
 	cfg := state.config
 	state.mu.Unlock()
 
-	harvestFromResponse(cfg, harvestResponseHeaders(fakeToken(292, wallClock().Add(-time.Minute))), harvestNoAuthMeta, "gpt-5.5")
+	harvestFromResponse(cfg, harvestResponseHeaders(fakeToken(292, wallClock().Add(-time.Minute))), harvestNoAuthMeta, "gpt-5.5", "")
 
 	if files := regularFiles(t, dir); len(files) != 0 {
 		t.Errorf("a 292 was stored despite two enabled accounts; nothing must be written when the account is ambiguous: %v", files)
@@ -1775,7 +1775,7 @@ func TestHarvestRefusesToInferWithNoAccounts(t *testing.T) {
 	cfg := state.config
 	state.mu.Unlock()
 
-	harvestFromResponse(cfg, harvestResponseHeaders(fakeToken(292, wallClock().Add(-time.Minute))), harvestNoAuthMeta, "gpt-5.5")
+	harvestFromResponse(cfg, harvestResponseHeaders(fakeToken(292, wallClock().Add(-time.Minute))), harvestNoAuthMeta, "gpt-5.5", "")
 
 	if files := regularFiles(t, dir); len(files) != 0 {
 		t.Errorf("a 292 was stored with no enabled account: %v", files)
@@ -1794,7 +1794,7 @@ func TestHarvestRefusesToInferWhenListerFails(t *testing.T) {
 	cfg := state.config
 	state.mu.Unlock()
 
-	harvestFromResponse(cfg, harvestResponseHeaders(fakeToken(292, wallClock().Add(-time.Minute))), harvestNoAuthMeta, "gpt-5.5")
+	harvestFromResponse(cfg, harvestResponseHeaders(fakeToken(292, wallClock().Add(-time.Minute))), harvestNoAuthMeta, "gpt-5.5", "")
 
 	if files := regularFiles(t, dir); len(files) != 0 {
 		t.Errorf("a 292 was stored while the credential list was unavailable: %v", files)

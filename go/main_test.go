@@ -658,6 +658,72 @@ func TestBusinessRoleHarvestsFromLiveResponse(t *testing.T) {
 	}
 }
 
+// The join that makes in-band harvesting work at all.
+//
+// CPA hands the request hook the executor's metadata (which carries the selected
+// credential) and the response hook the handler's metadata (which never does),
+// so a response arrives with auth=- no matter how much real traffic it is. Both
+// hooks carry the same RequestID, and this pins that the plugin uses it: a
+// request that announces its account, then a response on the same RequestID with
+// no metadata at all, must still land in that account's bucket.
+//
+// If this regresses the symptom is silent -- every harvest is simply dropped as
+// "incomplete bucket key" and the store never fills from live traffic.
+func TestInBandHarvestAttributesByRequestID(t *testing.T) {
+	dir := t.TempDir()
+	mustConfigure(t, businessHarvestConfig(dir))
+	resetHarvestState(t)
+
+	const (
+		requestID = "req-correlate-1"
+		auth      = "codex-alpha.json"
+		model     = "gpt-5.5"
+	)
+
+	// The request hook sees the account; nothing is injected (no template held).
+	req := request(auth, model, "")
+	req.RequestID = requestID
+	interceptAfter(t, req)
+
+	// The response arrives with a fresh 292 and, as CPA really delivers it, no
+	// account in its metadata.
+	chunk := pluginapi.StreamChunkInterceptRequest{
+		RequestID:       requestID,
+		Model:           model,
+		ChunkIndex:      pluginapi.StreamChunkHeaderInitIndex,
+		ResponseHeaders: harvestResponseHeaders(fakeToken(292, wallClock().Add(-time.Minute))),
+		Metadata:        nil,
+	}
+	raw, errMarshal := json.Marshal(chunk)
+	if errMarshal != nil {
+		t.Fatalf("marshal chunk: %v", errMarshal)
+	}
+	if _, errHook := interceptStreamChunk(raw); errHook != nil {
+		t.Fatalf("interceptStreamChunk: %v", errHook)
+	}
+
+	loaded, errLoad := loadStore(dir, wallClock(), testTTL, 292)
+	if errLoad != nil {
+		t.Fatalf("loadStore: %v", errLoad)
+	}
+	if _, ok := loaded[bucketKey(auth, model)]; !ok {
+		t.Fatalf("the 292 was not attributed back to %s; store holds %d template(s)", auth, len(loaded))
+	}
+}
+
+// The correlation is consumed exactly once. One request yields one response, so
+// a second response reusing the id must not inherit the first one's account --
+// left in place, a recycled id would file someone else's 292 in this bucket.
+func TestInBandHarvestForgetsAfterUse(t *testing.T) {
+	rememberRequestAuth("req-once", "codex-alpha.json")
+	if got := recallRequestAuth("req-once"); got != "codex-alpha.json" {
+		t.Fatalf("first recall = %q, want the recorded account", got)
+	}
+	if got := recallRequestAuth("req-once"); got != "" {
+		t.Fatalf("second recall = %q, want empty: the entry must be consumed", got)
+	}
+}
+
 // Attribution is never guessed on the business path. The sole-enabled-account
 // inference stays probe-only, so a response CPA did not attribute is dropped
 // rather than assigned to whichever account happens to be the only one enabled

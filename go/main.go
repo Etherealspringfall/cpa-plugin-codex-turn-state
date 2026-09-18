@@ -1017,6 +1017,19 @@ func interceptAfterAuth(raw []byte) ([]byte, error) {
 	value := headerValue(req.Headers, turnStateHeader)
 	attribution := attributionObserved
 
+	// Hand the account across to the response hook, which cannot see it: CPA
+	// gives the two hooks different metadata maps, so this is the only point in
+	// the request where the in-band harvest can learn whose 292 it is about to
+	// receive. Recorded before any of the decisions below, and deliberately even
+	// for a request this plugin is going to leave completely alone -- that is
+	// precisely the request whose response carries a fresh turn-state worth
+	// harvesting, because nothing was injected into it.
+	//
+	// Only the observed name is relayed. An inferred one is a guess that belongs
+	// to this request's own decision, not something to hand to another hook that
+	// would then record it as fact.
+	rememberRequestAuth(req.RequestID, authID)
+
 	// The same metadata gap the collection side has, mirrored here. A minimal
 	// request carries no metadata, so selected_auth_id is absent
 	// (publishSelectedAuthMetadata early-returns on an empty map,
@@ -1120,7 +1133,7 @@ func interceptResponse(raw []byte) ([]byte, error) {
 	cfg := state.config
 	state.mu.Unlock()
 
-	harvestFromResponse(cfg, req.ResponseHeaders, req.Metadata, pickModel(req.Model, req.RequestedModel))
+	harvestFromResponse(cfg, req.ResponseHeaders, req.Metadata, pickModel(req.Model, req.RequestedModel), req.RequestID)
 	return okEnvelope(pluginapi.ResponseInterceptResponse{})
 }
 
@@ -1145,7 +1158,7 @@ func interceptStreamChunk(raw []byte) ([]byte, error) {
 	cfg := state.config
 	state.mu.Unlock()
 
-	harvestFromResponse(cfg, req.ResponseHeaders, req.Metadata, pickModel(req.Model, req.RequestedModel))
+	harvestFromResponse(cfg, req.ResponseHeaders, req.Metadata, pickModel(req.Model, req.RequestedModel), req.RequestID)
 	return okEnvelope(pluginapi.StreamChunkInterceptResponse{})
 }
 
@@ -1169,16 +1182,94 @@ func observeWebSocketEvent(raw []byte) ([]byte, error) {
 	return okEnvelope(struct{}{})
 }
 
+// pendingAuth correlates the two halves of one request.
+//
+// The request hook knows which credential CPA selected; the response hook does
+// not, and the reason is not that the name is unavailable but that CPA hands the
+// two hooks DIFFERENT maps. handlers_interceptors.go:565 passes the executor's
+// req.Metadata -- the map publishSelectedAuthMetadata writes into -- while :595
+// passes the handler's opts.Metadata, which it never touches. Both are called
+// "Metadata", which is why the older comment here claimed they were the same
+// object; measured on 2026-09-18, the response side is always auth=-.
+//
+// Both hooks do carry the same RequestID (:556 and :584), so that is the join
+// key. This is not an inference: the value relayed is the account CPA itself
+// selected, merely carried across a hook boundary that drops it.
+type pendingAuthEntry struct {
+	authID string
+	seenAt time.Time
+}
+
+var pendingAuth = struct {
+	mu   sync.Mutex
+	byID map[string]pendingAuthEntry
+}{byID: make(map[string]pendingAuthEntry)}
+
+const (
+	// pendingAuthTTL bounds how long a request may take between its two hooks.
+	// A streamed Codex turn can run for minutes, so this is generous; it exists
+	// to stop a request that never produced a response from leaking an entry.
+	pendingAuthTTL = 15 * time.Minute
+	// pendingAuthMax triggers a sweep. Entries are small and short-lived, so this
+	// only matters if responses stop arriving entirely.
+	pendingAuthMax = 4096
+)
+
+// rememberRequestAuth records the credential the request hook saw.
+func rememberRequestAuth(requestID, authID string) {
+	if requestID == "" || authID == "" {
+		return
+	}
+	now := time.Now()
+	pendingAuth.mu.Lock()
+	defer pendingAuth.mu.Unlock()
+	if len(pendingAuth.byID) >= pendingAuthMax {
+		for key, entry := range pendingAuth.byID {
+			if now.Sub(entry.seenAt) > pendingAuthTTL {
+				delete(pendingAuth.byID, key)
+			}
+		}
+	}
+	pendingAuth.byID[requestID] = pendingAuthEntry{authID: authID, seenAt: now}
+}
+
+// recallRequestAuth returns the credential recorded for this request and forgets
+// it: one request yields one response, so holding the entry afterwards is pure
+// leak. An entry older than pendingAuthTTL is treated as absent.
+func recallRequestAuth(requestID string) string {
+	if requestID == "" {
+		return ""
+	}
+	pendingAuth.mu.Lock()
+	defer pendingAuth.mu.Unlock()
+	entry, ok := pendingAuth.byID[requestID]
+	if !ok {
+		return ""
+	}
+	delete(pendingAuth.byID, requestID)
+	if time.Since(entry.seenAt) > pendingAuthTTL {
+		return ""
+	}
+	return entry.authID
+}
+
 // harvestFromResponse is the one place a template enters the store. Everything
 // it rejects, it rejects loudly enough to show up in the decision log, because
 // "the probe ran and the bucket stayed empty" is the failure mode that costs a
 // whole probing window.
-func harvestFromResponse(cfg pluginConfig, headers http.Header, metadata map[string]any, model string) {
+func harvestFromResponse(cfg pluginConfig, headers http.Header, metadata map[string]any, model, requestID string) {
 	value := headerValue(headers, turnStateHeader)
 	if value == "" {
 		return
 	}
 	authID := metadataString(metadata, selectedAuthMetadataKey)
+	if authID == "" {
+		// Expected on this hook, not exceptional: the response side is handed a
+		// different metadata map than the request side, so the name is never
+		// there. Recover it by RequestID from what the request hook recorded --
+		// see pendingAuth. Still the account CPA selected, not a guess.
+		authID = recallRequestAuth(requestID)
+	}
 	attribution := attributionObserved
 
 	// The host only publishes selected_auth_id when the request carried some
