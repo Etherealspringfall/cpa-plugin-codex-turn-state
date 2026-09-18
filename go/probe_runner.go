@@ -92,11 +92,19 @@ const (
 	probeFireTimeout = 60 * time.Second
 	probeMgmtTimeout = 30 * time.Second
 
-	// probeMaxInFlight bounds how many upstream requests are open at once across
-	// the whole run. Attribution no longer needs serialising -- each call carries
-	// its own token -- so this is politeness, not correctness: a scope of four
-	// accounts and several models should not open twenty sockets at once.
-	probeMaxInFlight = 4
+	// probeMaxAccountsInFlight bounds how many CREDENTIALS are worked at once, not
+	// how many requests are open. Each account is driven by a single goroutine
+	// that walks its buckets one at a time, so this is also the ceiling on
+	// simultaneous upstream requests -- and, more importantly, it guarantees one
+	// account never has two requests in flight.
+	//
+	// That distinction is the whole point. The rate limit upstream enforces is
+	// per account: on 2026-09-18 a run fired six buckets x ten exits with no
+	// pacing, 60 requests in four seconds, ~7.5/s against each of two accounts,
+	// and the upstream answered 21 of them with 429 -- a rate limit this probe
+	// inflicted on itself, on credentials that had been answering normally a
+	// moment earlier.
+	probeMaxAccountsInFlight = 4
 
 	// probeMaxBodyBytes caps what is read from a response. Only headers matter, so
 	// this is just a small polite drain that lets a socket be reused without
@@ -123,6 +131,25 @@ var (
 	// i.e. at T+55m. A 60-minute cooldown would block that refresh and let the card
 	// lapse for five minutes on every cycle; 55 lines the two up exactly.
 	probeExitCooldown = 55 * time.Minute
+
+	// probeExitPause spaces the exits of one bucket apart. Without it a ten-entry
+	// pool is ten back-to-back requests on one credential in about a second,
+	// which is exactly how the 2026-09-18 run earned its 429s -- and the bigger
+	// the pool the worse it gets, so the pool the operator added to improve
+	// coverage was making the burst sharper instead.
+	//
+	// Two seconds costs nothing that matters: a triple is retried at most once
+	// per probeExitCooldown, so a pass that takes a minute instead of four
+	// seconds is invisible, while the burst it removes is not.
+	probeExitPause = 2 * time.Second
+
+	// probeAccountBackoff is how long a credential is left alone after the
+	// upstream signals an account-level refusal (429, or a rejected token).
+	// Distinct from probeExitCooldown because the signal is distinct: a 312 says
+	// "this exit's IP is throttled for this bucket", which the next exit may not
+	// be, but a 429 says "you are asking too often" -- and answering that by
+	// dialing a different IP is the one response guaranteed to make it worse.
+	probeAccountBackoff = 10 * time.Minute
 )
 
 // probeRunState is the snapshot the dashboard polls. It carries progress and
@@ -384,34 +411,55 @@ func probeAccountIndex(accounts []string) map[string]int {
 // it; a renewal tick does not, having no fixed Total). It is the shared fan-out
 // for both callers so the concurrency rule lives in one place.
 func probeFireBatch(ctx context.Context, cfg pluginConfig, pool *probeClientPool, creds map[string]probeCredential, targets []probeTarget, idxOf map[string]int, proxies []string, countDone bool) int {
-	var cooling atomic.Int64
-	sem := make(chan struct{}, probeMaxInFlight)
-	var wg sync.WaitGroup
+	// Grouped by credential, and each credential gets ONE goroutine that walks its
+	// buckets in turn. Fanning out over targets instead let several buckets of the
+	// same account fire at once, which is how one credential saw ~7.5 requests a
+	// second and answered with 429. One goroutine per account means one request
+	// per account at a time, and probeExitPause spaces even those apart.
+	byAccount := make(map[string][]probeTarget, len(creds))
+	var order []string
 	for _, target := range targets {
-		if ctx.Err() != nil {
-			break
+		if _, seen := byAccount[target.account]; !seen {
+			order = append(order, target.account)
 		}
-		cred, ok := creds[target.account]
+		byAccount[target.account] = append(byAccount[target.account], target)
+	}
+
+	var cooling atomic.Int64
+	sem := make(chan struct{}, probeMaxAccountsInFlight)
+	var wg sync.WaitGroup
+	for _, account := range order {
+		cred, ok := creds[account]
 		if !ok {
-			// Its credential was unreadable or expired and already logged; count it
-			// done so the progress bar reaches Total rather than hanging one short.
+			// Its credential was unreadable or expired and already logged; count
+			// its buckets done so the progress bar reaches Total rather than
+			// hanging short.
 			if countDone {
-				probeRunUpdate(func(run *probeRunState) { run.Done++ })
+				missing := len(byAccount[account])
+				probeRunUpdate(func(run *probeRunState) { run.Done += missing })
 			}
 			continue
 		}
+		if ctx.Err() != nil {
+			break
+		}
 		wg.Add(1)
 		sem <- struct{}{}
-		go func(target probeTarget, cred probeCredential) {
+		go func(list []probeTarget, cred probeCredential, accountIdx int) {
 			defer wg.Done()
 			defer func() { <-sem }()
-			if !probeHarvestBucket(ctx, cfg, pool, cred, target.model, proxies, idxOf[target.account]) {
-				cooling.Add(1)
+			for _, target := range list {
+				if ctx.Err() != nil {
+					return
+				}
+				if !probeHarvestBucket(ctx, cfg, pool, cred, target.model, proxies, accountIdx) {
+					cooling.Add(1)
+				}
+				if countDone {
+					probeRunUpdate(func(run *probeRunState) { run.Done++ })
+				}
 			}
-			if countDone {
-				probeRunUpdate(func(run *probeRunState) { run.Done++ })
-			}
-		}(target, cred)
+		}(byAccount[account], cred, idxOf[account])
 	}
 	wg.Wait()
 	return int(cooling.Load())
@@ -436,9 +484,20 @@ func probeHarvestBucket(ctx context.Context, cfg pluginConfig, pool *probeClient
 	defer probeRelease(key)
 
 	short := probeShortAuth(cred.name)
+	if !probeAccountReady(cred.name, time.Now()) {
+		// The upstream asked for this credential to be left alone. Silent: the
+		// renewal loop would otherwise say so once a minute per bucket.
+		return false
+	}
+
 	fired := false
 	for _, exit := range probeExits(proxies, accountIdx) {
 		if ctx.Err() != nil {
+			return fired
+		}
+		// Space the exits apart. Only after a real attempt -- skipping a cooling
+		// exit costs nothing and should not be paced.
+		if fired && !probeSleep(ctx, probeExitPause) {
 			return fired
 		}
 		now := time.Now()
@@ -467,10 +526,16 @@ func probeHarvestBucket(ctx context.Context, cfg pluginConfig, pool *probeClient
 			probeRunLog("%s %s: exit %s failed at transport, trying next: %s", short, model, probeShowProxy(exit), probeRedact(errFire.Error()))
 			continue
 		}
-		if probeConsume(cfg, cred.name, short, model, status, value, exit) {
+		switch probeConsume(cfg, cred.name, short, model, status, value, exit) {
+		case probeOutcomeStored:
 			return true
+		case probeOutcomeAccountLimited:
+			// Account-level refusal: every remaining exit carries the same
+			// credential, so walking on would only deepen it.
+			probeAccountSetBackoff(cred.name, time.Now())
+			return fired
 		}
-		// Not stored -- a 312, or a rejection. That is THIS EXIT's IP being
+		// Not stored -- a 312. That is THIS EXIT's IP being
 		// throttled for this account and model, not the bucket being unfillable,
 		// so the next exit is a different IP and gets its turn. This is the fix
 		// for the defect where a 312 ended the attempt outright and the rest of
@@ -485,19 +550,33 @@ func probeHarvestBucket(ctx context.Context, cfg pluginConfig, pool *probeClient
 // It reports whether a template was stored, which is what tells the caller to
 // stop walking the pool: anything else means this exit did not work out and the
 // next one deserves a turn.
-func probeConsume(cfg pluginConfig, name, short, model string, status int, value, exit string) bool {
+func probeConsume(cfg pluginConfig, name, short, model string, status int, value, exit string) probeOutcome {
+	switch status {
+	case http.StatusTooManyRequests:
+		// The credential is being told to slow down. Every remaining exit would
+		// carry the same credential, so the walk stops here and the account
+		// rests; continuing is what escalated a 312 into a wall of 429s.
+		probeRunLog("%s %s: http=429 — upstream is rate limiting this credential, not this exit; stopping the walk and resting the account for %s",
+			short, model, probeAccountBackoff)
+		return probeOutcomeAccountLimited
+	case http.StatusUnauthorized, http.StatusForbidden:
+		// A rejected token is equally not the exit's fault.
+		probeRunLog("%s %s: http=%d — the credential was refused, no exit can change that; resting the account for %s",
+			short, model, status, probeAccountBackoff)
+		return probeOutcomeAccountLimited
+	}
 	if status != http.StatusOK {
-		probeRunLog("%s %s: http=%d via %s, no template (token rejected or upstream error)", short, model, status, probeShowProxy(exit))
-		return false
+		probeRunLog("%s %s: http=%d via %s, no template", short, model, status, probeShowProxy(exit))
+		return probeOutcomeTryNext
 	}
 	switch {
 	case len(value) == cfg.TemplateLength:
 		if errStore := probeStore(cfg, name, model, value); errStore != nil {
 			probeRunLog("%s %s: harvested len=%d but store failed: %s", short, model, len(value), probeRedact(errStore.Error()))
-			return false
+			return probeOutcomeTryNext
 		}
 		probeRunLog("%s %s: harvested len=%d via %s, fresh template stored", short, model, len(value), probeShowProxy(exit))
-		return true
+		return probeOutcomeStored
 	case len(value) == cfg.ReplaceLength:
 		probeRunLog("%s %s: degraded len=%d via %s (this exit's IP is throttled for this bucket), trying next exit", short, model, len(value), probeShowProxy(exit))
 	case value == "":
@@ -505,7 +584,7 @@ func probeConsume(cfg pluginConfig, name, short, model string, status int, value
 	default:
 		probeRunLog("%s %s: unexpected turn-state len=%d via %s, not stored", short, model, len(value), probeShowProxy(exit))
 	}
-	return false
+	return probeOutcomeTryNext
 }
 
 // probeStore writes one harvested template to the same store the business role
@@ -609,6 +688,11 @@ func probeRenewLoop(ctx context.Context, pool *probeClientPool) {
 		var due []probeTarget
 		involved := make(map[string]bool)
 		for _, account := range accounts {
+			// A credential the upstream told us to leave alone is skipped whole:
+			// no bucket of it is due, so nothing downloads its token either.
+			if !probeAccountReady(account, now) {
+				continue
+			}
 			for _, model := range models {
 				remaining, live := probeBucketRemaining(cfg, account, model, now)
 				if live && remaining >= probeRenewThreshold {
@@ -772,6 +856,42 @@ func probeCooldownMark(exit, account, model string, now time.Time) {
 	defer probeCooldown.mu.Unlock()
 	probeCooldown.last[probeCooldownKey(exit, account, model)] = now
 }
+
+// probeAccountRest holds credentials the upstream has told us to leave alone.
+// Keyed by account only: a 429 is about the credential, not about the exit it
+// happened to arrive through, so every bucket and every exit of that account
+// waits together.
+var probeAccountRest = struct {
+	mu    sync.Mutex
+	until map[string]time.Time
+}{until: make(map[string]time.Time)}
+
+func probeAccountReady(account string, now time.Time) bool {
+	probeAccountRest.mu.Lock()
+	defer probeAccountRest.mu.Unlock()
+	until, seen := probeAccountRest.until[account]
+	return !seen || now.After(until)
+}
+
+func probeAccountSetBackoff(account string, now time.Time) {
+	probeAccountRest.mu.Lock()
+	defer probeAccountRest.mu.Unlock()
+	probeAccountRest.until[account] = now.Add(probeAccountBackoff)
+}
+
+// probeOutcome is what one upstream answer means for the rest of the walk.
+type probeOutcome int
+
+const (
+	// probeOutcomeStored: a template landed, this bucket is done.
+	probeOutcomeStored probeOutcome = iota
+	// probeOutcomeTryNext: this exit did not work out, but another might.
+	probeOutcomeTryNext
+	// probeOutcomeAccountLimited: the credential itself was refused. Stop the
+	// walk and rest the account -- trying more exits is what turned a handful of
+	// 312s into 21 429s.
+	probeOutcomeAccountLimited
+)
 
 // probeBucketHasEligibleExit reports whether any exit is allowed to fire for this
 // bucket. The renewal loop checks this before queueing anything: without it, a

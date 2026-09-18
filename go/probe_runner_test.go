@@ -171,6 +171,18 @@ type fakeUpstream struct {
 	tsLen  int
 	// tsLenSeq, when set, overrides tsLen per call index (last entry repeats).
 	tsLenSeq []int
+	// hold keeps each request open, so overlap between concurrent callers is
+	// observable at all: without it a request can finish before the next starts
+	// and peak would read 1 even when the calls really were simultaneous.
+	hold     time.Duration
+	inFlight int
+	peak     int
+}
+
+func (u *fakeUpstream) peakInFlight() int {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	return u.peak
 }
 
 func newFakeUpstream(t *testing.T) *fakeUpstream {
@@ -186,6 +198,22 @@ func (u *fakeUpstream) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		Model string `json:"model"`
 	}
 	_ = json.NewDecoder(r.Body).Decode(&body)
+	u.mu.Lock()
+	u.inFlight++
+	if u.inFlight > u.peak {
+		u.peak = u.inFlight
+	}
+	hold := u.hold
+	u.mu.Unlock()
+	if hold > 0 {
+		time.Sleep(hold)
+	}
+	defer func() {
+		u.mu.Lock()
+		u.inFlight--
+		u.mu.Unlock()
+	}()
+
 	u.mu.Lock()
 	index := len(u.calls)
 	u.calls = append(u.calls, upstreamCall{
@@ -313,6 +341,11 @@ func resetProbeRunner(t *testing.T) {
 		probeCooldown.mu.Lock()
 		probeCooldown.last = make(map[string]time.Time)
 		probeCooldown.mu.Unlock()
+		// Same reasoning for the account rest table: one case's 429 would
+		// otherwise silence every later case that touches that account.
+		probeAccountRest.mu.Lock()
+		probeAccountRest.until = make(map[string]time.Time)
+		probeAccountRest.mu.Unlock()
 		state.mu.Lock()
 		state.buckets = make(map[string]templateEntry)
 		state.store = nil
@@ -678,6 +711,11 @@ func harvestTestConfig(t *testing.T) (pluginConfig, probeCredential, *probeClien
 	cred := probeCredential{name: probeTestAccount, accessToken: "token-a", accountID: "acct-a"}
 	pool := newProbeClientPool()
 	t.Cleanup(pool.closeIdle)
+	// Production spaces exits two seconds apart, which would put the whole suite
+	// to sleep; the pacing itself is asserted by its own case.
+	previous := probeExitPause
+	probeExitPause = time.Millisecond
+	t.Cleanup(func() { probeExitPause = previous })
 	return cfg, cred, pool
 }
 
@@ -775,6 +813,67 @@ func TestProbeNewExitIsEligibleImmediately(t *testing.T) {
 	}
 	if hitsC.Load() != 1 {
 		t.Fatalf("the new exit was dialed %d times, want 1", hitsC.Load())
+	}
+}
+
+// A 429 is not an exit problem, and answering it by dialing the next exit is
+// what turned a handful of 312s into 21 429s on 2026-09-18: every remaining exit
+// carries the same credential the upstream just asked to slow down.
+func TestProbe429StopsTheWalkAndRestsTheAccount(t *testing.T) {
+	resetProbeRunner(t)
+	upstream := newFakeUpstream(t)
+	upstream.status = http.StatusTooManyRequests
+	setUpstream(t, upstream.server.URL)
+
+	var hitsA, hitsB, hitsC atomic.Int64
+	exits := []string{
+		newFakeProxy(t, &hitsA),
+		newFakeProxy(t, &hitsB),
+		newFakeProxy(t, &hitsC),
+	}
+	cfg, cred, pool := harvestTestConfig(t)
+
+	probeHarvestBucket(context.Background(), cfg, pool, cred, probeTestModel, exits, 0)
+
+	if got := upstream.count(); got != 1 {
+		t.Fatalf("upstream calls = %d, want 1: a 429 must end the walk, not advance to the next exit", got)
+	}
+	if probeAccountReady(cred.name, time.Now()) {
+		t.Fatal("the account was not rested after a 429, so the next bucket will hit it again immediately")
+	}
+
+	// And nothing of that account fires again while it is resting.
+	probeHarvestBucket(context.Background(), cfg, pool, cred, "another-model", exits, 0)
+	if got := upstream.count(); got != 1 {
+		t.Fatalf("upstream calls grew to %d while the account was resting", got)
+	}
+}
+
+// One credential is worked by one goroutine, so two of its buckets never have
+// requests in flight at the same time. Fanning out over targets instead is how a
+// single account saw ~7.5 requests a second.
+func TestProbeSerialisesOneAccountsBuckets(t *testing.T) {
+	resetProbeRunner(t)
+	upstream := newFakeUpstream(t)
+	upstream.hold = 40 * time.Millisecond
+	setUpstream(t, upstream.server.URL)
+
+	cfg, cred, pool := harvestTestConfig(t)
+	creds := map[string]probeCredential{cred.name: cred}
+	targets := []probeTarget{
+		{account: cred.name, model: "m-1"},
+		{account: cred.name, model: "m-2"},
+		{account: cred.name, model: "m-3"},
+	}
+
+	probeFireBatch(context.Background(), cfg, pool, creds, targets,
+		map[string]int{cred.name: 0}, nil, false)
+
+	if got := upstream.count(); got != 3 {
+		t.Fatalf("upstream calls = %d, want 3 (one per bucket)", got)
+	}
+	if peak := upstream.peakInFlight(); peak != 1 {
+		t.Fatalf("peak concurrent requests against ONE credential = %d, want 1", peak)
 	}
 }
 
