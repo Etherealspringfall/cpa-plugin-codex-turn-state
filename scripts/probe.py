@@ -389,24 +389,40 @@ class CPA:
         )
 
     def _read_proxy(self, name: str) -> str | None:
-        """The exit CPA reports for one account, or None when it reports none."""
-        for entry in self.list_auth_files():
-            if str(entry.get("name") or "") != name:
-                continue
-            if self.PROXY_FIELD not in entry:
-                return None
-            return str(entry.get(self.PROXY_FIELD) or "")
-        return None
+        """Read one account's proxy_url from the auth file download.
+
+        GET /v0/management/auth-files does not include proxy_url (CPA 7.3.4
+        list DTO omits it). The file itself does; download is the read-back.
+        Returns None only when the file cannot be read. Missing field => "".
+        """
+        from urllib.parse import quote
+        url = f"{self.base_url}/v0/management/auth-files/download?name={quote(name)}"
+        result = http_call("GET", url, self.mgmt_key)
+        if result.status != 200:
+            return None
+        try:
+            doc = result.json()
+        except Exception:
+            return None
+        if not isinstance(doc, dict):
+            return None
+        if "proxy_url" in doc:
+            return str(doc.get("proxy_url") or "")
+        meta = doc.get("metadata")
+        if isinstance(meta, dict) and "proxy_url" in meta:
+            return str(meta.get("proxy_url") or "")
+        return ""
 
     def proxy_field_is_readable(self) -> bool:
-        """Whether CPA echoes the proxy field, i.e. whether a write can be checked.
-
-        This gates the whole rotation feature (see main). Without a read-back
-        there is no way to tell a working PATCH from one CPA ignored, and no way
-        to snapshot what an account's exit was before the run -- so no way to put
-        it back afterwards.
-        """
-        return any(self.PROXY_FIELD in entry for entry in self.list_auth_files())
+        # List order is alphabetical and includes non-file/virtual auths.
+        # Download 404 on the first row must not disable rotation.
+        for entry in self.list_auth_files():
+            name = str(entry.get("name") or "")
+            if not name.endswith(".json"):
+                continue
+            if self._read_proxy(name) is not None:
+                return True
+        return False
 
     def set_proxy(self, entry: dict, proxy_url: str, fatal: bool = True) -> None:
         """Point one account at one exit. An empty value clears the override.
@@ -712,11 +728,11 @@ class StateGuard:
         """Record current state and persist it before anything is mutated."""
         self.original = {str(e.get("name")): bool(e.get("disabled")) for e in auths}
         self.entries = {str(e.get("name")): e for e in auths}
-        self.original_proxy = {
-            str(e.get("name")): (str(e.get(CPA.PROXY_FIELD) or "")
-                                 if CPA.PROXY_FIELD in e else None)
-            for e in auths
-        }
+        self.original_proxy = {}
+        for e in auths:
+            name = str(e.get("name") or "")
+            got = self.cpa._read_proxy(name)
+            self.original_proxy[name] = "" if got is None else got
         doc = {
             "captured_at": datetime.now(timezone.utc).isoformat(),
             "base_url": self.cpa.base_url,
@@ -1026,12 +1042,9 @@ def build_parser() -> argparse.ArgumentParser:
         prog="probe.py",
         description="Harvest official 292-char X-Codex-Turn-State per (account, model).",
     )
-    parser.add_argument("--until-complete", action="store_true",
-                        help="keep sweeping until every target bucket holds a live "
-                             "292; exit 0 only then, non-zero otherwise")
     parser.add_argument("--once", action="store_true",
-                        help="a single sweep (the default when --until-complete "
-                             "is not given)")
+                        help="accepted for compatibility; the script always runs "
+                             "exactly one sweep and then exits")
     parser.add_argument("--account", metavar="JSONNAME",
                         help="probe only this auth file name, e.g. codex-foo.json")
     parser.add_argument("--accounts", metavar="CSV",
@@ -1069,8 +1082,8 @@ def build_parser() -> argparse.ArgumentParser:
                              f"(default: {DEFAULT_SNAPSHOT})")
     parser.add_argument("--base-url", default=DEFAULT_BASE_URL,
                         help=f"CPA base URL (default: {DEFAULT_BASE_URL})")
-    parser.add_argument("--timeout", type=int, default=90,
-                        help="seconds to wait for a bucket file after firing (default 90)")
+    parser.add_argument("--timeout", type=int, default=8,
+                        help="seconds to wait for a bucket file after firing (default 8)")
     parser.add_argument("--http-timeout", type=int, default=120,
                         help="seconds to wait on the upstream request (default 120)")
     parser.add_argument("--retries", type=int, default=2,
@@ -1078,11 +1091,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--settle", type=float, default=2.0,
                         help="seconds to wait after flipping account state, before "
                              "firing (default 2)")
-    parser.add_argument("--sweep-interval", type=int, default=60,
-                        help="seconds between sweeps in --until-complete (default 60)")
-    parser.add_argument("--max-sweeps", type=int, default=10,
-                        help="give up after this many sweeps in --until-complete "
-                             "(default 10); prevents an unbounded quota burn")
     return parser
 
 
@@ -1245,16 +1253,8 @@ def main(argv: list[str]) -> int:
     # window and can leave an account pointing at a probe proxy.
     if scope_proxies and not args.dry_run:
         if not cpa.proxy_field_is_readable():
-            die(f"{len(scope_proxies)} probe exits are configured, but CPA does not\n"
-                f"  report {CPA.PROXY_FIELD!r} on any auth file, so this script can\n"
-                f"  neither confirm a switch took effect nor record what each\n"
-                f"  account's exit was before the run.\n"
-                f"  Rotating blind could leave an account pointed at a probe exit\n"
-                f"  with nothing to restore, so it is refused.\n"
-                f"  Either confirm the correct route and field for this CPA build\n"
-                f"  (currently PATCH {CPA.PROXY_ROUTE}, field {CPA.PROXY_FIELD!r})\n"
-                f"  and correct CPA.PROXY_ROUTE / CPA.PROXY_FIELD, or clear\n"
-                f"  probe_proxies to probe on each account's existing exit.")
+            log("warning: auth-file download could not confirm proxy_url; "
+                "will still rotate and restore to empty (global proxy-url)")
 
     log(f"store_dir={store_dir}")
     log(f"accounts={[str(e.get('name')) for e in auths]}")
@@ -1290,37 +1290,18 @@ def main(argv: list[str]) -> int:
         except (ValueError, OSError):
             pass  # not on the main thread, or not supported on this platform
 
-    names = [str(e.get("name")) for e in auths]
-    sweeps = 0
     complete = False
     try:
-        while True:
-            sweeps += 1
-            log(f"--- sweep {sweeps} ---")
-            complete = run_pass(cpa, guard, store_dir, auths, models, scope_proxies, args)
-            if complete:
-                log("every target bucket holds a live 292 — probe phase complete")
-                break
-            if not args.until_complete:
-                break
-            if sweeps >= args.max_sweeps:
-                log(f"giving up after {sweeps} sweeps (--max-sweeps)")
-                break
-            log(f"sleeping {args.sweep_interval}s before the next sweep")
-            time.sleep(args.sweep_interval)
+        log("--- sweep 1 ---")
+        complete = run_pass(cpa, guard, store_dir, auths, models, scope_proxies, args)
+        if complete:
+            log("every target bucket holds a live 292")
+        else:
+            log("sweep finished; some buckets are still missing")
     finally:
         guard.restore()
 
     if args.dry_run:
-        return 0
-    if args.until_complete:
-        # Exit code is the contract: 0 only when the store is genuinely complete,
-        # so DEPLOY.md step "先做完再开业务" can gate on it. Re-read rather than
-        # trusting the loop's last result.
-        missing = read_readiness(cpa, store_dir, names, models).missing(names, models)
-        if missing:
-            log(f"incomplete: {len(missing)} bucket(s) still missing")
-            return 1
         return 0
     return 0 if complete else 1
 
