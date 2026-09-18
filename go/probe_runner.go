@@ -1057,6 +1057,16 @@ func (p *probeClientPool) get(proxyURL string) (*http.Client, error) {
 		if errParse != nil {
 			return nil, fmt.Errorf("exit is not a valid URL: %w", errParse)
 		}
+		// net/http understands the "socks5" scheme but not the "socks5h" spelling,
+		// and an unrecognised scheme is dialed as an HTTP proxy -- which a SOCKS
+		// server answers with a protocol error, so the exit would look permanently
+		// dead. The two differ only in where the target hostname is resolved, and
+		// Go's socks5 dialer already hands the hostname to the proxy (what socks5h
+		// asks for), so normalising is exact rather than approximate. The operator's
+		// pool contains both spellings.
+		if strings.EqualFold(parsed.Scheme, "socks5h") {
+			parsed.Scheme = "socks5"
+		}
 		transport.Proxy = http.ProxyURL(parsed)
 	}
 	client := &http.Client{Transport: transport}
