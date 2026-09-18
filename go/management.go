@@ -31,6 +31,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
@@ -174,8 +175,13 @@ type statusBucket struct {
 	// When accounts_source is "store" this is not authoritative -- the credential
 	// list was unavailable, so it is reported true rather than inventing a
 	// disabled state nobody observed.
-	Enabled     bool  `json:"enabled"`
-	SecondsLeft int64 `json:"seconds_left"`
+	Enabled bool `json:"enabled"`
+	// Attribution is "observed" when the host named the account, "inferred" when
+	// it was deduced from a sole enabled account during probing, and empty for
+	// a bucket written before the field existed. Surfaced so an operator can
+	// audit which buckets rest on a deduction rather than on what CPA reported.
+	Attribution string `json:"attribution"`
+	SecondsLeft int64  `json:"seconds_left"`
 }
 
 type statusResponse struct {
@@ -359,6 +365,38 @@ func statusAccounts(records []storeRecord) ([]statusAccount, string, error) {
 	return fallback, "store", errList
 }
 
+// The credential list is cached for the harvest path, which would otherwise ask
+// the host once per upstream response. The window is deliberately tiny: the one
+// thing that changes during a probe run is exactly which account is enabled, and
+// attributing a template to an account that was switched off two seconds ago is
+// the failure this cache must not cause.
+//
+// handleStatus deliberately does not use it. The dashboard is read by a person
+// deciding what to do next, it is requested rarely, and it should show the
+// credential states as they are rather than as they were.
+const authListCacheTTL = 2 * time.Second
+
+var (
+	authListMu      sync.Mutex
+	authListCache   []statusAccount
+	authListErr     error
+	authListFetched time.Time
+)
+
+// cachedCodexAuths is listCodexAuths behind a short cache. The host call happens
+// under the mutex so a burst of concurrent responses produces one lookup rather
+// than one each.
+func cachedCodexAuths() ([]statusAccount, error) {
+	authListMu.Lock()
+	defer authListMu.Unlock()
+	if !authListFetched.IsZero() && time.Since(authListFetched) < authListCacheTTL {
+		return authListCache, authListErr
+	}
+	authListCache, authListErr = listCodexAuths()
+	authListFetched = time.Now()
+	return authListCache, authListErr
+}
+
 // listCodexAuths returns every Codex credential the host knows about, sorted by
 // name, with the enabled state it reports.
 func listCodexAuths() ([]statusAccount, error) {
@@ -409,6 +447,7 @@ func bucketStatus(onDisk map[string]storeRecord, auth, model string, now time.Ti
 	// Set before the parse check: a record with an unreadable issued_at still
 	// tells the operator what length was harvested, which is the whole point.
 	cell.Len = rec.Len
+	cell.Attribution = rec.Attribution
 	issued, okIssued := recordIssuedAt(rec)
 	if !okIssued {
 		return cell

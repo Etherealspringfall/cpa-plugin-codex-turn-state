@@ -805,6 +805,44 @@ func harvestFromResponse(cfg pluginConfig, headers http.Header, metadata map[str
 		return
 	}
 	authID := metadataString(metadata, selectedAuthMetadataKey)
+	attribution := attributionObserved
+
+	// The host only publishes selected_auth_id when the request carried some
+	// metadata of its own: publishSelectedAuthMetadata returns early on an empty
+	// map (sdk/cliproxy/auth/conductor_execution.go:1726). A real Codex client
+	// sends session metadata so the name is there, but the probe's minimal
+	// request does not, and the account name is simply absent. Relating it back
+	// through the request hook does not help either -- the response interceptor
+	// is handed the same opts.Metadata (handlers_interceptors.go:590).
+	//
+	// So fall back to the invariant the spec already imposes: probing enables
+	// exactly one Codex account at a time (spec §7 step 2), which makes the
+	// account a property of the setup rather than something to read off the
+	// request. All four conditions must hold, and every one of them is load
+	// bearing -- with two accounts enabled this would be a coin toss between
+	// them, and a wrong guess feeds one account's token to another.
+	//
+	// The role check is belt-and-braces: response hooks are only registered for
+	// the probe and in-band harvest is forced off for business, so this path is
+	// already unreachable there. It is written out anyway so the rule reads
+	// completely here instead of resting on a registration elsewhere.
+	if authID == "" && model != "" && len(value) == cfg.TemplateLength && cfg.isProbe() {
+		sole, enabledCount, errSole := soleEnabledCodexAuth()
+		switch {
+		case errSole != nil:
+			logDecision("skip", "", model, len(value),
+				"incomplete bucket key; cannot infer: credential list unavailable: "+errSole.Error())
+			return
+		case sole == "":
+			logDecision("skip", "", model, len(value),
+				fmt.Sprintf("incomplete bucket key; refusing to infer: %d enabled Codex accounts, need exactly 1", enabledCount))
+			return
+		default:
+			authID = sole
+			attribution = attributionInferred
+		}
+	}
+
 	if authID == "" || model == "" {
 		logDecision("skip", authID, model, len(value), "incomplete bucket key")
 		return
@@ -841,6 +879,7 @@ func harvestFromResponse(cfg pluginConfig, headers http.Header, metadata map[str
 		Value:       value,
 		IssuedAt:    issued.UTC().Format(time.RFC3339),
 		HarvestedAt: now.UTC().Format(time.RFC3339),
+		Attribution: attribution,
 	}
 	if errWrite := writeStoreRecord(cfg.StoreDir, record, cfg.TemplateLength); errWrite != nil {
 		logDecision("skip", authID, model, len(value), "store write failed: "+errWrite.Error())
@@ -857,7 +896,39 @@ func harvestFromResponse(cfg pluginConfig, headers http.Header, metadata map[str
 	state.buckets[key] = templateEntry{value: value, issuedAt: issued}
 	state.mu.Unlock()
 
+	// Inferred attributions are logged differently on purpose. "This bucket
+	// belongs to account X" and "this bucket belongs to the only account that
+	// was switched on" are different claims, and an operator reading the log
+	// afterwards has to be able to tell which one was made.
+	if attribution == attributionInferred {
+		logDecision("harvest", authID, model, len(value), "template stored (inferred: sole enabled Codex account)")
+		return
+	}
 	logDecision("harvest", authID, model, len(value), "template stored")
+}
+
+// soleEnabledCodexAuth returns the name of the only enabled Codex credential.
+// It reports the enabled count alongside so a refusal can say why, and returns
+// an empty name whenever the count is anything but one -- the caller must not
+// guess, so "none" and "several" are the same answer here.
+func soleEnabledCodexAuth() (string, int, error) {
+	accounts, errList := cachedCodexAuths()
+	if errList != nil {
+		return "", 0, errList
+	}
+	name := ""
+	count := 0
+	for _, account := range accounts {
+		if !account.Enabled {
+			continue
+		}
+		count++
+		name = account.AuthID
+	}
+	if count != 1 {
+		return "", count, nil
+	}
+	return name, 1, nil
 }
 
 // decideHeader chooses the outgoing X-Codex-Turn-State given the value the
@@ -942,7 +1013,19 @@ type storeRecord struct {
 	Value       string `json:"value"`
 	IssuedAt    string `json:"issued_at"`
 	HarvestedAt string `json:"harvested_at"`
+	// Attribution records how auth_id was determined: "observed" when the host
+	// told us, "inferred" when it was deduced from a sole enabled account. A
+	// wrong attribution hands one account's token to another, which is the first
+	// thing the spec prohibits, so which buckets rest on a deduction has to stay
+	// auditable after the fact. Absent on records written before this existed.
+	Attribution string `json:"attribution,omitempty"`
 }
+
+// How a bucket's account was determined.
+const (
+	attributionObserved = "observed"
+	attributionInferred = "inferred"
+)
 
 // indexEntry summarises one bucket without its value, so index.json can be read
 // by anything that needs to know whether probing is complete.
