@@ -825,8 +825,8 @@ func pluginRegistration() registration {
 		Metadata: pluginapi.Metadata{
 			Name:             "codex-turn-state",
 			Version:          "0.1.0",
-			Author:           "ncdeng",
-			GitHubRepository: "https://github.com/ncdeng/cpa-plugin-codex-turn-state",
+			Author:           "arden-aaai",
+			GitHubRepository: "https://github.com/arden-aaai/cpa-plugin-codex-turn-state",
 			ConfigFields: []pluginapi.ConfigField{
 				{
 					Name:        "role",
