@@ -419,7 +419,15 @@ func TestExpiredTemplateNeverSubstituted(t *testing.T) {
 	}
 }
 
-// --- §8.6 business traffic never feeds the store -------------------------
+// --- §8.6 a business REQUEST never feeds the store -----------------------
+//
+// Scoped to the request path, and the distinction is load bearing now that the
+// business role does harvest from responses (see
+// TestBusinessRoleHarvestsFromLiveResponse). The two sources are not the same
+// thing: a 292 on an incoming request is of unknown provenance -- a replay, or
+// another session's state the client happened to send -- while a 292 on the
+// upstream's response is one the upstream just minted for this exact account and
+// model. The first stays forbidden; the second is the free harvest.
 
 func TestBusinessRoleNeverWritesStore(t *testing.T) {
 	dir := t.TempDir()
@@ -582,6 +590,101 @@ log_decisions: false
 }
 
 // --- §8.11 config: inband alias and business force-off -------------------
+
+// businessHarvestConfig is a business-role config with somewhere to write, which
+// is what in-band harvesting needs and what probeRoleConfig does not give.
+func businessHarvestConfig(dir string) string {
+	return fmt.Sprintf(`role: business
+store_dir: %q
+template_length: 292
+replace_length: 312
+ttl_seconds: 3600
+harvest_inband: false
+inject_mode: always
+dry_run: false
+log_decisions: false
+`, dir)
+}
+
+// The capability declaration is the gate that actually mattered: the response
+// hooks used to be advertised only under role probe, so a business process was
+// never offered them and the in-function check was moot. If this regresses,
+// nothing errors -- the plugin simply stops being handed responses, and buckets
+// the probe cannot fill silently stay empty forever.
+func TestBusinessRoleDeclaresResponseHooks(t *testing.T) {
+	mustConfigure(t, businessHarvestConfig(t.TempDir()))
+
+	caps := pluginRegistration().Capabilities
+	if !caps.ResponseInterceptor {
+		t.Error("business role does not advertise the response interceptor, so it is never handed a response to harvest")
+	}
+	if !caps.StreamChunkInterceptor {
+		t.Error("business role does not advertise the stream-chunk interceptor, which is the path real Codex SSE traffic takes")
+	}
+	if !caps.RequestInterceptor {
+		t.Error("business role stopped advertising the request interceptor, so it cannot substitute at all")
+	}
+}
+
+// The payoff: a 292 that the upstream minted for ordinary business traffic is
+// harvested for free. This drives the SSE header-init chunk because that is the
+// path real Codex traffic takes, and it supplies metadata the way CPA does, so
+// the account comes from CPA's own selection rather than an inference.
+func TestBusinessRoleHarvestsFromLiveResponse(t *testing.T) {
+	dir := t.TempDir()
+	mustConfigure(t, businessHarvestConfig(dir))
+	resetHarvestState(t)
+
+	chunk := pluginapi.StreamChunkInterceptRequest{
+		Model:           "gpt-5.5",
+		ChunkIndex:      pluginapi.StreamChunkHeaderInitIndex,
+		ResponseHeaders: harvestResponseHeaders(fakeToken(292, wallClock().Add(-time.Minute))),
+		Metadata:        map[string]any{testAuthKey: "codex-alpha.json"},
+	}
+	raw, errMarshal := json.Marshal(chunk)
+	if errMarshal != nil {
+		t.Fatalf("marshal chunk: %v", errMarshal)
+	}
+	if _, errHook := interceptStreamChunk(raw); errHook != nil {
+		t.Fatalf("interceptStreamChunk: %v", errHook)
+	}
+
+	loaded, errLoad := loadStore(dir, wallClock(), testTTL, 292)
+	if errLoad != nil {
+		t.Fatalf("loadStore: %v", errLoad)
+	}
+	if _, ok := loaded[bucketKey("codex-alpha.json", "gpt-5.5")]; !ok {
+		t.Fatalf("a 292 on live business traffic was not harvested; store holds %d template(s)", len(loaded))
+	}
+}
+
+// Attribution is never guessed on the business path. The sole-enabled-account
+// inference stays probe-only, so a response CPA did not attribute is dropped
+// rather than assigned to whichever account happens to be the only one enabled
+// -- with several accounts live that guess would be a cross-account leak.
+func TestBusinessHarvestSkipsUnattributedResponse(t *testing.T) {
+	dir := t.TempDir()
+	mustConfigure(t, businessHarvestConfig(dir))
+	resetHarvestState(t)
+
+	chunk := pluginapi.StreamChunkInterceptRequest{
+		Model:           "gpt-5.5",
+		ChunkIndex:      pluginapi.StreamChunkHeaderInitIndex,
+		ResponseHeaders: harvestResponseHeaders(fakeToken(292, wallClock().Add(-time.Minute))),
+		Metadata:        nil,
+	}
+	raw, errMarshal := json.Marshal(chunk)
+	if errMarshal != nil {
+		t.Fatalf("marshal chunk: %v", errMarshal)
+	}
+	if _, errHook := interceptStreamChunk(raw); errHook != nil {
+		t.Fatalf("interceptStreamChunk: %v", errHook)
+	}
+
+	if files := regularFiles(t, dir); len(files) != 0 {
+		t.Fatalf("an unattributed 292 was stored: %v", files)
+	}
+}
 
 func TestConfigureHarvestInbandAliasAndBusinessForceOff(t *testing.T) {
 	tests := []struct {

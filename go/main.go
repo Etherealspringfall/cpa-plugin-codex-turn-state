@@ -871,21 +871,34 @@ func swapConfigLocked(cfg pluginConfig) (cleared, roleChanged bool) {
 }
 
 func pluginRegistration() registration {
-	state.mu.Lock()
-	probe := state.config.isProbe()
-	state.mu.Unlock()
-
-	// The probe advertises the response-side hooks and still advertises the
-	// request hook, where it deliberately does nothing: declaring it keeps the
-	// two roles on one code path and makes "probe rewrote a request" a thing the
-	// logs can rule out rather than a thing the host never offered.
-	// The management routes are declared in both roles: the status page is how an
-	// operator checks a role switch actually took, so it must survive the switch.
-	capabilities := registrationCapability{RequestInterceptor: true, ManagementAPI: true}
-	if probe {
-		capabilities.ResponseInterceptor = true
-		capabilities.StreamChunkInterceptor = true
-		capabilities.WebSocketResponseObserver = true
+	// Every hook is advertised in both roles, and the response side is the part
+	// that changed.
+	//
+	// It used to be probe-only, back when harvesting meant reading CPA's own
+	// responses and substituting would have destroyed the very state being
+	// collected. The harvester is offline now -- it calls the upstream directly
+	// and never touches these hooks -- so that exclusion protects nothing and
+	// costs something real: a bucket the probe cannot fill (every exit throttled)
+	// stays empty, its requests therefore go upstream untouched, and the upstream
+	// mints a turn-state on each one that nobody was listening for.
+	//
+	// Reading it is free -- the request was happening anyway, no quota is spent --
+	// and it is self-limiting: once a bucket holds a template the request hook
+	// injects it, the upstream stops minting, and this side goes quiet for that
+	// bucket until the template lapses. See harvestFromResponse.
+	//
+	// The request hook stays declared in both roles too: it deliberately does
+	// nothing under probe, and declaring it keeps the roles on one code path so
+	// "probe rewrote a request" is something the logs can rule out rather than
+	// something the host never offered. The management routes are declared in
+	// both roles because the status page is how an operator checks a role switch
+	// actually took.
+	capabilities := registrationCapability{
+		RequestInterceptor:        true,
+		ManagementAPI:             true,
+		ResponseInterceptor:       true,
+		StreamChunkInterceptor:    true,
+		WebSocketResponseObserver: true,
 	}
 
 	return registration{
@@ -1090,9 +1103,14 @@ func interceptAfterAuth(raw []byte) ([]byte, error) {
 	})
 }
 
-// interceptResponse is the probe's harvest point for non-streaming responses.
+// interceptResponse is the in-band harvest point for non-streaming responses.
 // It never modifies the response: an empty ResponseInterceptResponse leaves
 // every header and the body exactly as the upstream sent them.
+//
+// Runs in both roles. CPA hands this hook the RAW upstream headers -- the
+// stripping in downstreamHeadersAfterInterceptors happens afterwards and only
+// affects what the client sees -- so the turn-state is visible here even though
+// the client never receives it.
 func interceptResponse(raw []byte) ([]byte, error) {
 	var req pluginapi.ResponseInterceptRequest
 	if errUnmarshal := json.Unmarshal(raw, &req); errUnmarshal != nil {
@@ -1102,15 +1120,19 @@ func interceptResponse(raw []byte) ([]byte, error) {
 	cfg := state.config
 	state.mu.Unlock()
 
-	if cfg.isProbe() {
-		harvestFromResponse(cfg, req.ResponseHeaders, req.Metadata, pickModel(req.Model, req.RequestedModel))
-	}
+	harvestFromResponse(cfg, req.ResponseHeaders, req.Metadata, pickModel(req.Model, req.RequestedModel))
 	return okEnvelope(pluginapi.ResponseInterceptResponse{})
 }
 
-// interceptStreamChunk is the probe's harvest point for SSE responses. Response
-// headers are only populated on the header-init call, so every payload chunk is
-// returned untouched without even looking at it.
+// interceptStreamChunk is the in-band harvest point for SSE responses, which is
+// the path real Codex traffic actually takes. Response headers are only
+// populated on the header-init call, so every payload chunk is returned
+// untouched without even looking at it -- this must stay cheap, it runs on every
+// chunk of every stream.
+//
+// Runs in both roles, and on the header-init chunk CPA supplies the raw upstream
+// headers alongside the same metadata the request hook saw, so the harvest is
+// attributed to the account CPA actually selected rather than inferred.
 func interceptStreamChunk(raw []byte) ([]byte, error) {
 	var req pluginapi.StreamChunkInterceptRequest
 	if errUnmarshal := json.Unmarshal(raw, &req); errUnmarshal != nil {
@@ -1123,9 +1145,7 @@ func interceptStreamChunk(raw []byte) ([]byte, error) {
 	cfg := state.config
 	state.mu.Unlock()
 
-	if cfg.isProbe() {
-		harvestFromResponse(cfg, req.ResponseHeaders, req.Metadata, pickModel(req.Model, req.RequestedModel))
-	}
+	harvestFromResponse(cfg, req.ResponseHeaders, req.Metadata, pickModel(req.Model, req.RequestedModel))
 	return okEnvelope(pluginapi.StreamChunkInterceptResponse{})
 }
 
