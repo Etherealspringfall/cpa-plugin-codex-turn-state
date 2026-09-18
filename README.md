@@ -128,12 +128,18 @@ CLIProxyAPI（CPA）原生插件。在单个 `(账号, 模型)` 桶内复用官�
 **全程免密钥**。CPAMP 菜单里叫 `Codex Turn-State`，路径 `/dashboard`。
 
 勾账号、勾模型、填代理池 → 保存 → 点「探测」。改了范围不用重点，续期循环每 60 秒
-重读一次。
+重读一次。代理那一栏的「追加」只往清单末尾加（顺序 = 探测顺序），不会动已有的行。
+
+**「测试连通性」**逐条测代理能不能到 OpenAI，**不花额度**：请求不带任何凭据，
+上游回 `401` 就说明这条出口是通的。`403` = 出口被拒、`429` = 被限速、连不上 =
+`不通`，三者分开报，因为去处完全不同。顺带显示每条的出口地址/国家/CF 机房——
+**出口地址数少于代理条数，就说明好几条其实共用一个出口**，这是页面上唯一能看出
+这件事的地方。测的是**已保存**的池子，改完先保存。
 
 免密钥路由（`/v0/resource/plugins/codex-turn-state/` 前缀，**GET-only**）：
 `/dashboard` `/status` `/ops/choices`（只读免 confirm）、
 `/ops/probe/start|cancel` `/ops/dry-run` `/ops/role` `/ops/clear` `/ops/selftest`
-`/ops/scope`（需 `confirm=1`）。唯一还带密钥的是
+`/ops/scope` `/ops/proxy-check`（需 `confirm=1`）。唯一还带密钥的是
 `GET /v0/management/codex-turn-state/config`。
 
 探测范围存插件自己的 `probe-scope.json`（在 `store_dir`，**覆盖 config.yaml**），

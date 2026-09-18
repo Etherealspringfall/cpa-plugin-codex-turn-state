@@ -223,18 +223,45 @@ td.acct.outscope, th.model.outscope, em.outscope { font-style: italic; color: va
 .check.isoff span { color: var(--muted); }
 .checks .empty { color: var(--faint); font-size: 12.5px; padding: 3px 0; }
 .addrow { margin-top: 7px; }
-#scopeModelAdd, #scopeProxies {
+#scopeModelAdd, #scopeProxyAdd, #scopeProxies {
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   font-size: 12.5px; padding: 6px 9px; border-radius: 6px;
   border: 1px solid var(--border); background: var(--raised); color: var(--fg);
 }
 #scopeModelAdd { flex: 1 1 140px; min-width: 110px; }
+#scopeProxyAdd { flex: 1 1 200px; min-width: 140px; }
 #scopeProxies { width: 100%; min-height: 96px; resize: vertical; line-height: 1.45; }
-#scopeModelAdd:focus, #scopeProxies:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+#scopeModelAdd:focus, #scopeProxyAdd:focus, #scopeProxies:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
 #scopeProxies[readonly] { background: var(--card); color: var(--muted); }
 #scopeErrors { margin-top: 12px; }
 #scopeErrors .notice { margin-bottom: 8px; }
 #scopeErrors .mono { font-size: 12px; word-break: break-all; }
+
+/* ---------- 代理连通性测试结果 ----------
+   一行一条出口，顺序就是 probe_proxies 的顺序，也就是探测的尝试顺序。#N 是唯一
+   可靠的身份：整池代理常常共用一个网关、只有用户名不同，掩码之后二十条长得一模
+   一样，位置才分得开它们。 */
+#proxyCheck:empty { display: none; }
+#proxyCheck { margin-top: 10px; }
+.pcsum { font-size: 12.5px; color: var(--muted); margin-bottom: 6px; }
+.pcsum b { color: var(--fg); font-weight: 650; }
+.pcsum .warntext { font-weight: 650; }
+.pclist { border: 1px solid var(--border); border-radius: 6px;
+          background: var(--raised); overflow: hidden; }
+.pcrow { padding: 5px 9px; border-top: 1px solid var(--border); }
+.pcrow:first-child { border-top: 0; }
+.pcline { display: flex; gap: 10px; align-items: baseline; font-size: 12px;
+          font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+.pcline .idx { flex: 0 0 2.6em; color: var(--faint); }
+.pcline .vd { flex: 0 0 3.2em; font-weight: 650; }
+.pcline .meta { flex: 1 1 auto; min-width: 0; color: var(--muted);
+                overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pcrow .why { margin-top: 2px; font-size: 11.5px; color: var(--faint); }
+.pcrow.v-ok   .vd { color: var(--ok); }
+.pcrow.v-warn .vd { color: var(--warn); }
+.pcrow.v-bad  .vd { color: var(--bad); }
+.pcrow.v-bad  { background: var(--bad-bg); }
+.pcrow.v-warn { background: var(--warn-bg); }
 
 /* ---------- 计数 ---------- */
 .counters { display: flex; gap: 10px; flex-wrap: wrap; }
@@ -385,11 +412,20 @@ select {
           <div class="scopehead">
             <span class="sublabel">代理（一行一个）</span>
             <span class="hint" id="scopeProxyNote"></span>
+            <span class="spacer"></span>
+            <button class="btn ghost" id="btnProxyCheck" type="button">测试连通性</button>
           </div>
           <textarea id="scopeProxies" rows="5" spellcheck="false" autocomplete="off"
                     placeholder="一行一个 URL，空行忽略；顺序就是探测的尝试顺序"
                     aria-label="探测代理清单，一行一个 URL"></textarea>
+          <div class="row addrow">
+            <input id="scopeProxyAdd" type="text" spellcheck="false" autocomplete="off"
+                   placeholder="贴一条或多条，追加到上面（空格/逗号/换行分隔）"
+                   aria-label="追加代理到清单">
+            <button class="btn ghost" id="btnAddProxy" type="button">追加</button>
+          </div>
           <div class="hint" id="scopeProxyHint"></div>
+          <div id="proxyCheck"></div>
         </div>
       </div>
 
@@ -1397,6 +1433,86 @@ function renderScopeProxies() {
   }
 }
 
+/* ---------------- 代理连通性 ----------------
+   结果不属于 status，所以自己存一份：轮询不会覆盖它，测完之后一直留在页面上，
+   直到下一次测试。 */
+var proxyCheck = { data: null, running: false };
+
+var PC_LABEL = { ok: "通", blocked: "被拒", ratelimited: "限速", unexpected: "异常", dead: "不通" };
+var PC_CLASS = { ok: "v-ok", blocked: "v-bad", ratelimited: "v-warn", unexpected: "v-warn", dead: "v-bad" };
+
+function syncProxyCheckBtn() {
+  var btn = $("btnProxyCheck");
+  if (!btn) { return; }
+  btn.disabled = proxyCheck.running;
+  btn.textContent = proxyCheck.running ? "测试中…" : "测试连通性";
+}
+
+function renderProxyCheck() {
+  var box = $("proxyCheck");
+  if (!box) { return; }
+  clear(box);
+
+  if (proxyCheck.running) {
+    box.appendChild(el("div", { cls: "pcsum",
+      text: "正在逐条测……请求不带任何凭据，所以不消耗额度。" }));
+    return;
+  }
+  var d = proxyCheck.data;
+  if (!d) { return; }
+
+  var bits = [];
+  bits.push(d.direct ? "本机直连" : ("共 " + d.checked + " 条"));
+  bits.push(d.ok + " 通");
+  if (d.blocked) { bits.push(d.blocked + " 被拒/限速"); }
+  if (d.dead) { bits.push(d.dead + " 不通"); }
+  if (d.other) { bits.push(d.other + " 异常"); }
+  if (d.distinct_ips) { bits.push("出口地址 " + d.distinct_ips + " 个"); }
+  bits.push((Number(d.ms) / 1000).toFixed(1) + "s");
+
+  var sum = el("div", { cls: "pcsum" });
+  sum.appendChild(el("b", { text: bits.shift() }));
+  sum.appendChild(el("span", { text: " · " + bits.join(" · ") }));
+  box.appendChild(sum);
+
+  if (d.note) { box.appendChild(el("div", { cls: "pcsum", text: d.note })); }
+  if (d.timed_out) {
+    box.appendChild(el("div", { cls: "pcsum warntext",
+      text: "整批跑到时间上限了 —— 下面若有没跑完的，那是没测到，不是不通。" }));
+  }
+  // 池子条数多、出口地址少 = 好几条代理其实共用一个出口。探测把它们当成不同出口
+  // 轮着试，实际上是同一个地址被连着打 —— 花了钱却没换到出口的典型形态，而这是
+  // 页面上唯一能看出来的地方。
+  if (!d.direct && d.distinct_ips > 0 && d.distinct_ips < d.checked) {
+    box.appendChild(el("div", { cls: "pcsum warntext",
+      text: "注意：" + d.checked + " 条代理只落在 " + d.distinct_ips +
+            " 个出口地址上。地址相同的几条，对上游来说是同一个出口。" }));
+  }
+
+  var list = el("div", { cls: "pclist" });
+  (d.results || []).forEach(function (r) {
+    var row = el("div", { cls: "pcrow " + (PC_CLASS[r.verdict] || "v-warn") });
+    var line = el("div", { cls: "pcline" });
+    line.appendChild(el("span", { cls: "idx", text: "#" + r.index }));
+    line.appendChild(el("span", { cls: "vd", text: PC_LABEL[r.verdict] || r.verdict }));
+    var meta = [];
+    if (r.status_code) { meta.push(String(r.status_code)); }
+    meta.push((Number(r.ms) / 1000).toFixed(1) + "s");
+    if (r.exit_ip) { meta.push(r.exit_ip); }
+    if (r.country) { meta.push(r.country); }
+    if (r.colo) { meta.push(r.colo); }
+    if (r.proxy) { meta.push(r.proxy); }
+    line.appendChild(el("span", { cls: "meta", text: meta.join("  ") }));
+    row.appendChild(line);
+    // 通的那些不再多解释一句：十八行「一切正常」会把真正出问题的两行淹掉。
+    if (r.verdict !== "ok" && r.detail) {
+      row.appendChild(el("div", { cls: "why", text: r.detail }));
+    }
+    list.appendChild(row);
+  });
+  box.appendChild(list);
+}
+
 function renderScopeMeta(d) {
   d = d || {};
   var selA = selectedAccounts();
@@ -1987,6 +2103,72 @@ function doProbeCancel() {
   });
 }
 
+// 刻意【不】走 withBusy：整批最多要跑 45 秒，把整页按钮锁这么久没道理 —— 这个
+// 操作不改任何状态、不花额度（请求不带凭据），和别的操作并行没有风险。
+//
+// 测的是【插件里已保存的】代理池，不是文本框里的内容。代理 URL 带密码，而这是
+// 免鉴权的 GET 路由，把清单当查询参数传会把密码写进宿主访问日志和浏览器历史。
+function doProxyCheck() {
+  if (proxyCheck.running) { return; }
+  if (scope.dirty) {
+    notify("warn", "代理框改过还没保存 —— 测的是插件里已存的那一份。想测刚填的，先点「保存范围」。");
+  }
+  proxyCheck.running = true;
+  proxyCheck.data = null;
+  syncProxyCheckBtn();
+  renderProxyCheck();
+
+  resAction("/ops/proxy-check", {}).then(function (d) {
+    proxyCheck.data = d;
+    if (d.checked && d.ok === d.checked) {
+      notify("ok", "全部 " + d.checked + " 条都连得到 OpenAI。");
+    } else {
+      notify("warn", d.ok + " / " + d.checked + " 条连得到 OpenAI，逐条结果在代理那一栏。");
+    }
+  }).catch(function (err) {
+    var m = (err && err.message) ? err.message : String(err);
+    if (/404|no such/i.test(m)) {
+      m = "当前 .so 没有这个路由 —— 换上新版 .so 并重启 CPA 之后才有「测试连通性」。";
+    }
+    notify("err", m);
+  }).then(function () {
+    proxyCheck.running = false;
+    syncProxyCheckBtn();
+    renderProxyCheck();
+  });
+}
+
+// 追加而不是整段替换：池子有二十条的时候，加一条不该逼人滚到文本框末尾找位置。
+// 分隔符取空白和逗号 —— 这三种字符在代理 URL 里都必须转义成 %XX，所以按它们切
+// 分不会劈开一条合法的代理。重复的行直接跳过，顺序保持不变（顺序就是探测顺序）。
+function doAddProxy() {
+  var input = $("scopeProxyAdd");
+  if (!input) { return; }
+  var candidates = String(input.value || "").split(/[\s,]+/)
+    .map(function (s) { return s.trim(); })
+    .filter(function (s) { return s; });
+  if (!candidates.length) { notify("warn", "输入框是空的。"); return; }
+
+  var lines = parseLines(scope.proxyText);
+  var seen = Object.create(null);
+  lines.forEach(function (l) { seen[l] = true; });
+  var added = 0;
+  candidates.forEach(function (c) {
+    if (seen[c]) { return; }
+    seen[c] = true;
+    lines.push(c);
+    added++;
+  });
+  if (!added) { notify("warn", "这几条清单里已经有了。"); return; }
+
+  scope.proxyText = lines.join("\n");
+  scope.dirty = true;
+  input.value = "";
+  renderScopeProxies();
+  renderScopeMeta(state.data || {});
+  notify("ok", "追加了 " + added + " 条，还没生效 —— 记得点「保存范围」。");
+}
+
 // 自检的结果有两个独立维度，UI 上必须分开呈现：
 //   reached      —— 请求有没有打到上游并拿到响应（链路/协议层面）
 //   status_code  —— 上游回的真实状态码（账号/配额层面）
@@ -2085,6 +2267,11 @@ $("btnScopeReset").addEventListener("click", doResetScope);
 $("btnAddModel").addEventListener("click", addModelFromInput);
 $("scopeModelAdd").addEventListener("keydown", function (e) {
   if (e.key === "Enter") { e.preventDefault(); addModelFromInput(); }
+});
+$("btnProxyCheck").addEventListener("click", doProxyCheck);
+$("btnAddProxy").addEventListener("click", doAddProxy);
+$("scopeProxyAdd").addEventListener("keydown", function (e) {
+  if (e.key === "Enter") { e.preventDefault(); doAddProxy(); }
 });
 $("scopeProxies").addEventListener("input", function () {
   scope.proxyText = $("scopeProxies").value;

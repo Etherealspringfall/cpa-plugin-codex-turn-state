@@ -123,6 +123,18 @@ const (
 	routeOpsProbeStart  = "/ops/probe/start"
 	routeOpsProbeCancel = "/ops/probe/cancel"
 
+	// routeOpsProxyCheck tests every configured exit against the upstream and
+	// reports one row each (proxy_check.go). It spends no account quota -- the
+	// request it sends carries no credential -- but it does open real connections
+	// through every exit in the pool, so it is an action rather than a read and
+	// goes through handleOpsResource with the rest.
+	//
+	// It reads the pool the plugin already holds rather than accepting one. A
+	// proxy URL carries a password, and this is a keyless GET, so taking the list
+	// as query parameters would put the pool's credentials into the host's access
+	// log and the operator's browser history.
+	routeOpsProxyCheck = "/ops/proxy-check"
+
 	// routeOpsChoices lists what there is to choose from: the Codex credentials
 	// CPA actually holds, and the model ids worth offering. It exists so the scope
 	// editor can be checkboxes instead of three hand-typed lists -- a mistyped
@@ -210,6 +222,9 @@ func managementRegister(raw []byte) ([]byte, error) {
 			// so the operator never supplies one.
 			{Path: routeOpsProbeStart, Description: "启动探测运行（无需鉴权，需 confirm=1，烧额度）"},
 			{Path: routeOpsProbeCancel, Description: "取消探测运行（无需鉴权，需 confirm=1）"},
+			// Not quota-spending -- it sends no credential -- but it does dial every
+			// exit, so it is confirm=1 guarded like the other actions.
+			{Path: routeOpsProxyCheck, Description: "批量测代理到 OpenAI 的连通性（无需鉴权，需 confirm=1，不烧额度）"},
 			// The scope editor's menu. Read-only, so it is the one /ops route with
 			// no confirm=1 in its description: the page fetches it bare on load,
 			// before the operator has clicked anything, and a confirm requirement
@@ -286,7 +301,8 @@ func managementHandle(raw []byte) ([]byte, error) {
 		hasRouteSuffix(path, routeOpsSelftest),
 		hasRouteSuffix(path, routeOpsScope),
 		hasRouteSuffix(path, routeOpsProbeStart),
-		hasRouteSuffix(path, routeOpsProbeCancel):
+		hasRouteSuffix(path, routeOpsProbeCancel),
+		hasRouteSuffix(path, routeOpsProxyCheck):
 		// The keyless actions. Reached only through the resource prefix (they are
 		// registered as resources, not management routes), so they arrive with a
 		// query and no body and no key; handleOpsResource enforces GET and
@@ -370,6 +386,8 @@ func handleOpsResource(path, method string, q url.Values) pluginapi.ManagementRe
 		return handleProbeStartResource()
 	case hasRouteSuffix(path, routeOpsProbeCancel):
 		return handleProbeCancelResource()
+	case hasRouteSuffix(path, routeOpsProxyCheck):
+		return runProxyCheck()
 	default:
 		return managementError(http.StatusNotFound, "no such keyless action route")
 	}
