@@ -1,566 +1,245 @@
-# 部署与执行清单
+# 部署与运维
 
-CPA Turn-State：探测 / 业务分离。
+本文是**已上线系统**的运维手册：发新版、回滚、日常操作、排障。
 
-口径已经定死：**只换 312（`replace-only`）**；业务端不采头；探测先齐再开业务。
-
-本文按规格第 9 节的步骤序编排。**第 0 步必须先做完，再动业务逻辑。**
-
----
-
-## 当前进度（截至 2026-09-18）
-
-**已在 OVH 上实测通过**（部署 `5db76ef`）：
-
-- 编译 + `ldd` glibc 兼容性检查
-- `.so` 部署、CPA 重启、插件加载（`configured role=probe …`）
-- 看板外壳可达、三条数据接口鉴权正确（含**无密钥 401** 这条关键回归）
-- `PATCH` 配置热生效、无需重启
-
-**尚未执行**——下面这些步骤里写的仍然是预期行为，不是实测结果：
-
-- 第 8 步 停业务窗口
-- 第 9 步 `probe --until-complete` 采集
-- 第 10 步 store 桶核对
-- 第 11~13 步 切 `role: business`、`dry_run` 翻转、上线验证
-
-**不要把本文当成「整个流程已经验证过」。** 只有上面第一组是实测的，各步骤里凡
-标注「实测」「2026-09-18」的才是跑过的，其余一律按待执行对待。
+> **旧版本的这份文档是「首次上线剧本」**，里面有一条现在会造成实际损失：
+> 第 8 步「停对外业务，或停用全部 Codex 账号 ⚠️ 停服窗口」。
+> **探测早已不需要停服、也不需要停任何账号**——它直连上游、自己握着 token，
+> 归属天然精确。照旧文档操作会白停一次业务。整篇已按现状重写。
 
 ---
 
-## 开工前必读的三条
+## 当前线上状态
 
-### ⚠️ 1. 第 8 步「停对外业务」是真实停服窗口，要提前挑时段
-
-这不是一句形式化的提醒。已知的实测数据：
-
-| 事项 | 实测 |
+| 项 | 值 |
 |---|---|
-| CPA 容器本身重启 | 约 **2 秒** |
-| sub2api 因此给账号 3 的冷却 | 约 **10 分钟** |
-| 业务实际降级时长 | 约 **4 分钟** |
+| CPA 容器 | `cli-proxy-api`（**以 root 跑**） |
+| 插件路径 | `/home/dnc/cpamp-deploy/cpa-plugins/linux/amd64/codex-turn-state-v0.1.0.so` |
+| store | 容器内 `/data/turn-state-store`，宿主 `/home/dnc/cpamp-deploy/cpa-data/turn-state-store` |
+| config | `/home/dnc/cpamp-deploy/cpa-data/config.yaml` |
+| 角色 | `role=business`、`inject_mode=always`、`dry_run=false` |
+| 看板 | CPAMP 菜单 `Codex Turn-State`，**全程免密钥** |
 
-**再叠加探测本身的时间**：5 个账号 × 5 个模型 = **25 个桶**，每个桶至少要一次
-成功的上游请求，还要算上账号切换和失败重试。
-
-整个窗口 = 重启影响 + 25 桶探测。**开始之前先和用户确认时段**，不要自行开始。
-
-### ⚠️ 2. `role` 缺失时默认 `business`
-
-这是刻意的安全侧取值，也是为了解决步骤序里的一个矛盾：第 6 步先部署 `.so` 并
-重启 CPA，第 7 步才把 `role: probe` 写进 config。如果把「`role` 缺失」也判为
-非法而拒绝启动，第 6 步和第 7 步之间插件会注册失败。
-
-所以：
-
-- `role` **缺失** → 按 `business` 处理。此时若 `store_dir` 也没配，插件是纯
-  no-op：不写盘、不采集、不改任何请求。
-- `role` **非空但非法**（既不是 `probe` 也不是 `business`）→ 拒绝启动。
-
-### ⚠️ 3. 插件目录必须是挂载出来的，不要退回容器可写层
-
-插件如果装在容器可写层，**CPA 升级会把它冲掉**。本部署已经把 `./cpa-plugins`
-挂载出来修掉了这个问题。后续任何调整都不要退回去。
+三条路径同时在跑：离线探测（主动）、业务顺带采集（免费）、业务替换。
+架构说明见 [README.md](README.md)。
 
 ---
 
-## 第 0 步：先做这五件，再写业务逻辑
+## 日常运维：全在看板上点
 
-### 0.1 备份 `.so` 和 `config.yaml`
+**不需要开终端，不需要输任何密钥。**
 
-```bash
-TS=$(date +%Y%m%d-%H%M)
-cp /home/dnc/cpamp-deploy/cpa-plugins/linux/amd64/codex-turn-state-v0.1.0.so \
-   /home/dnc/cpamp-deploy/cpa-plugins/linux/amd64/codex-turn-state-v0.1.0.so.bak-$TS
-cp /home/dnc/cpamp-deploy/cpa-data/config.yaml \
-   /home/dnc/cpamp-deploy/cpa-data/config.yaml.bak-$TS
-ls -la /home/dnc/cpamp-deploy/cpa-plugins/linux/amd64/
+1. 打开 CPAMP 菜单里的 `Codex Turn-State`
+2. **探测范围**：勾账号、勾模型（复选框，账号名里的客户邮箱已打码成 `620f5a42…pro`）
+3. **代理池**：一行一个，明文显示、不用每次重填
+4. 保存 → 点 **「探测」** 启动
+
+### 代理格式
+
+```
+socks5://用户:密码@主机:端口
+socks5h://…        ← 自动按 socks5 处理
+http://…  https://…
 ```
 
-### 0.2 建 store 目录，权限对
+**必须带 `scheme://`**（只写 `1.2.3.4:1080` 会被判非法）。密码里有 `@ : / #`
+要转义（`%40` `%3A` `%2F` `%23`）。填错不会让插件挂掉，会被丢进 `config_errors`。
 
-宿主侧路径 `/home/dnc/cpamp-deploy/cpa-data/turn-state-store/`，
-容器内是 `/data/turn-state-store/`（`cpa-data` 已挂到容器 `/data`）。
+### 改了范围要不要重新点探测
 
-```bash
-mkdir -p /home/dnc/cpamp-deploy/cpa-data/turn-state-store
-chmod 0700 /home/dnc/cpamp-deploy/cpa-data/turn-state-store
-ls -ld /home/dnc/cpamp-deploy/cpa-data/turn-state-store
-```
+不用。续期循环每 60 秒重读一次范围，新范围下一拍自动生效。
+**新加的代理没有冷却记录，会被立刻尝试**，不用等 55 分钟。
 
-要求：目录 `0700`、文件 `0600`，**属主必须让 CPA 进程读写得到**。
+想立刻全量重填就「取消」再「探测」。
 
-```bash
-docker exec cli-proxy-api id
-docker exec cli-proxy-api ls -ld /data/turn-state-store
-docker exec cli-proxy-api touch /data/turn-state-store/.wtest \
-  && docker exec cli-proxy-api rm /data/turn-state-store/.wtest \
-  && echo "CPA 可写 OK"
-```
+### 「停止探测」会停掉什么
 
-最后一条要真的通过再往下走。写不进去的话，后面探测会静默采不到东西。
-
-#### ⚠️ 属主不对等：CPA 是 root，你不是
-
-实测结果：
-
-| | 值 |
+| | 停止后 |
 |---|---|
-| CPA 容器里的进程 | `uid=0(root)`（`docker exec cli-proxy-api id`） |
-| 宿主上 `cpa-data` 的属主 | `dnc:dnc` |
+| 主动探测 + 续期 | **停** |
+| 被动采集（业务流量顺带采） | **不停**，照常工作 |
+| 业务替换 | **不停**，继续用库存卡 |
 
-所以**插件写出来的桶文件是 `root:root 0600`**——宿主上以普通用户身份跑的脚本
-**读不了**它们。
+代价是**没人续期**：卡到期后会过期 → 桶变空 → 被动采集重新接管（自愈，但有空窗）。
 
-这正是 `scripts/probe.py` 改成**走 `status` 接口拿就绪度、不再直接读文件**的
-原因：探测脚本以普通用户跑，读不到 root 写的桶文件，只能问插件自己。这个设计不
-是绕远路，是属主决定的。
+**CPA 重启会杀掉探测 goroutine**，重启后要去看板重新点一次「探测」。被动采集和
+业务替换不受影响（它们是钩子，不是 goroutine）。
 
-需要在宿主上直接看文件时（降级手段），加 `sudo`：
+---
 
-```bash
-sudo find /home/dnc/cpamp-deploy/cpa-data/turn-state-store -name '*.json' | sort
-sudo cat /home/dnc/cpamp-deploy/cpa-data/turn-state-store/index.json
-```
+## 发新版 `.so`
 
-同源问题还有一处：`auths/` 下也有 root 属主的账号文件，普通用户清点会**静默漏
-号**。见 0.4。**凡是清点 CPA 自己管理的状态，优先走接口。**
+### ⚠️ 服务器上那个 repo 是脏的，不要在它上面 git 操作
 
-### 0.3 确认能编、产物能被容器加载
+`/home/dnc/cpa-plugin-codex-turn-state` 停在旧提交、带一堆未提交改动和旧的
+untracked 文件。**从 GitHub 新克隆到 `/tmp` 编译**，别碰它。
+
+### 完整流程
 
 ```bash
-cd /home/dnc/cpa-plugin-codex-turn-state
-gofmt -l go/                 # 无输出 = 格式化过了
-bash scripts/build.sh        # -> build/linux/amd64/codex-turn-state.so
-ls -la build/linux/amd64/
+set -e
+BUILD=/tmp/cts-$(date +%H%M%S)
+git clone -q https://github.com/arden-aaai/cpa-plugin-codex-turn-state.git $BUILD
+cd $BUILD && git log -1 --format="HEAD: %h %s"
+bash scripts/build.sh                      # -> build/linux/amd64/codex-turn-state.so
+
+DIR=/home/dnc/cpamp-deploy/cpa-plugins/linux/amd64
+LIVE=$DIR/codex-turn-state-v0.1.0.so
+
+# 滚动备份：只留一个回滚点，否则这里会堆到上百 MB
+rm -f $DIR/codex-turn-state-v0.1.0.so.bak-*
+cp -p "$LIVE" "$LIVE.bak-$(date +%Y%m%d-%H%M)"
+
+# 原子换：先 cp 到临时名，再 mv 覆盖
+cp $BUILD/build/linux/amd64/codex-turn-state.so "$DIR/.cts.new"
+mv -f "$DIR/.cts.new" "$LIVE"
+
+docker restart cli-proxy-api && sleep 10
+curl -s -o /dev/null -w "healthz: %{http_code}\n" http://127.0.0.1:8317/healthz
+
+set +e                                     # ← 见下，清理失败不能中断部署
+chmod -R u+rwX $BUILD 2>/dev/null; rm -rf $BUILD 2>/dev/null
 ```
 
-**宿主不需要装 Go。** `scripts/build.sh` 在一次性 `golang:1.26` 容器里编，宿主
-只要有 Docker。实测编译耗时约 **2.5 秒**（模块缓存已暖）。
+#### 为什么用 `mv` 不用 `cp` 覆盖
 
-必须对上的是 `pluginabi.ABIVersion`（1）和 `pluginabi.SchemaVersion`（6），
-来自 `go/go.mod` 里钉住的 `CLIProxyAPI/v7 v7.3.4`——和 CPA 镜像
-`eceasy/cli-proxy-api:latest` 的版本要一致。
+同文件系统的 `mv` 是 rename，运行中的 CPA 继续持有旧 inode。直接 `cp` 盖一个
+**正在被 mmap 的 `.so`** 有 SIGBUS 风险。
 
-#### glibc 兼容性检查（每次都要做）
+#### ⚠️ `set -e` + 清理 `/tmp` 会中断部署
 
-这是 cgo `c-shared` 产物，动态链接 glibc。编译镜像和运行镜像的 glibc 版本不是
-一回事：
+Go 模块缓存是 **0444/0555 只读**的，`rm -rf` 会 `Permission denied`。在 `set -e`
+下这会让脚本**直接退出**——踩过一次：第一条 `rm -rf` 失败，后面的编译和换文件
+**一步都没执行**，而输出全是 rm 报错，看起来像只是清理失败。
+
+两条防线：**用带时间戳的新目录**（不复用旧路径），**清理前 `set +e`**。
+
+#### glibc 兼容性检查（每次都做）
+
+这是 cgo `c-shared` 产物，动态链接 glibc。编译镜像和运行镜像不是一回事：
 
 | | 发行版 | glibc |
 |---|---|---|
-| 编译用 `golang:1.26` | Debian 13 (trixie) | 2.41 |
-| 运行用 CPA 容器 | Debian 12 (bookworm) | 2.36 |
+| `golang:1.26` | Debian 13 trixie | 2.41 |
+| CPA 容器 | Debian 12 bookworm | 2.36 |
 
-**高版本 glibc 编出来的东西，在低版本上可能跑不起来。** 当前这一组合已经验证过
-依赖解析干净、无 `version not found`，但**将来 Go 镜像基底再往上跳时这个前提会
-失效**。
-
-所以每次编完，都要**在和 CPA 完全相同的镜像里**验一次：
+**高版本编出来的在低版本上可能跑不起来。** 当前组合已验证干净，但 Go 镜像基底
+再往上跳时这个前提会失效。
 
 ```bash
-docker run --rm \
-  -v /home/dnc/cpa-plugin-codex-turn-state/build/linux/amd64:/chk:ro \
-  --entrypoint ldd \
-  eceasy/cli-proxy-api:latest /chk/codex-turn-state.so
+docker run --rm -v $BUILD/build/linux/amd64:/chk:ro \
+  --entrypoint ldd eceasy/cli-proxy-api:latest /chk/codex-turn-state.so
 ```
 
-输出里每一行都要解析到具体路径。出现 `not found` 或
-`version 'GLIBC_2.xx' not found` 就是不兼容，**不要部署**——换低版本 Go 镜像
-重编（`GO_IMAGE=golang:1.25-bookworm scripts/build.sh`）。
+出现 `not found` 或 `version 'GLIBC_2.xx' not found` 就**不要部署**，换
+`GO_IMAGE=golang:1.25-bookworm` 重编。这是唯一能在部署前发现这类问题的手段——
+真部署上去才发现的话，业务已经重启过了。
 
-这是唯一能在部署前发现这类问题的手段。真部署上去才发现的话，表现是 CPA 启动时
-插件加载失败，而那时业务已经重启过了。
+### 重启的代价
 
-### 0.4 记下 5 个账号文件名
-
-**用管理 API 查，不要 `ls` 读文件：**
-
-```bash
-curl -s -H "Authorization: Bearer $KEY" \
-  http://127.0.0.1:8317/v0/management/auth-files
-```
-
-#### ⚠️ 为什么不能读文件
-
-实测发现：`cpa-data/auths/` 下**有账号文件是 root 属主**——CPA 以 root 身份刷新
-token 时把属主改掉了。宿主上以普通用户去读会 `PermissionError`。
-
-坏就坏在它的**失败方式**：清点会少一个号，而且**不报错**，只是那一行读不出来。
-很容易被当成「文件损坏」去查，实际上文件好好的，只是你没权限。
-
-管理 API 不受属主影响，是**权威来源**。
-
-这和 0.2 里 store 目录那个 root 属主问题**同源**：CPA 是 root，你不是。凡是要
-清点 CPA 自己管理的状态，优先走接口，不要在宿主上读文件。
-
-实在要读文件时加 `sudo`：
-
-```bash
-sudo ls /home/dnc/cpamp-deploy/cpa-data/auths/codex-*.json | grep -v '\.bak'
-```
-
-把查到的 5 个文件名填进下表。**只填文件名，不要写 token、不要贴文件内容。**
-
-| # | 账号 JSON 文件名 | 探测完成 |
-|---|---|---|
-| 1 | `<部署时填入>` | ☐ |
-| 2 | `<部署时填入>` | ☐ |
-| 3 | `<部署时填入>` | ☐ |
-| 4 | `<部署时填入>` | ☐ |
-| 5 | `<部署时填入>` | ☐ |
-
-这 5 个是 `auths/` 下现有的全部 Codex 账号。**实际这次要探几个号，见第 8 步
-之前的确认要求**——不要默认就是 5 个。
-
-### 0.5 验证看板页面可达
-
-> **执行时机：第 6 步部署完新 `.so` 并重启 CPA 之后。** 页面是新 `.so` 带来
-> 的，部署前它还不存在。列在第 0 步是为了不漏掉这项验收。
->
-> **本步已于 2026-09-18 在 OVH 上实测通过**（部署 `5db76ef`），下面给的是实测
-> 值不是预期值。重新部署后仍应复跑一遍对照。
-
-插件注册了一个看板页面和三条数据接口，详见 [README.md](README.md) 的
-「管理 API 与看板页面」。
-
-**先用命令行确认接口活着**（`X-Management-Key` 或 `Authorization: Bearer`，
-没有 cookie、不接受 query 参数）：
-
-```bash
-# 外壳页面：不鉴权，返回 HTML
-curl -s -o /dev/null -w '%{http_code} %{content_type} %{size_download}\n' \
-  http://127.0.0.1:8317/v0/resource/plugins/codex-turn-state/dashboard
-
-# status：鉴权，不带密钥应 401
-curl -s -o /dev/null -w '%{http_code}\n' \
-  http://127.0.0.1:8317/v0/management/codex-turn-state/status
-
-# status：带密钥应 200 + JSON
-curl -s -H 'X-Management-Key: <管理密钥>' \
-  http://127.0.0.1:8317/v0/management/codex-turn-state/status
-```
-
-2026-09-18 实测结果：
-
-| 检查 | 实测 |
+| 事项 | 实测 |
 |---|---|
-| 看板外壳 | `200` `text/html; charset=utf-8` 37642 bytes |
-| status 带密钥 | `200` |
-| status 无密钥 | `401` |
+| CPA 容器重启 | 约 **2 秒** |
+| sub2api 给账号的冷却 | 约 **10 分钟** |
+| 业务实际降级 | 约 **4 分钟** |
 
-**第二条必须是 401。** 如果不带密钥也能拿到数据，说明数据路由被降级成公开的
-了，参见 README「两个路由注册脚枪」的第一条，立即停下来查路由注册。
+`.so` **必须重启才生效**；配置键值是热加载的，不用重启。
 
-**注意外壳路径是 `/dashboard`，不是插件根。** 少写这一截实测就是 404——原因是
-`ResourceRoute.Path` 注册成 `"/"` 会被静默丢弃，见 README 同一节的第二条。
+### 重启后的两个正常现象
 
-插件加载成功时的日志长这样（2026-09-18 实测）：
+1. **探测不会自动启动**——要去看板点。
+2. **短暂的 `auth=-`**：归属靠请求钩子记下的 `RequestID → 账号` 内存表，重启时
+   清空，所以「请求在重启前、响应在重启后」的那批采集对不上账号。几秒后自愈，
+   不用管。
 
-```
-[codex-turn-state] configured role=probe store_dir="/data/turn-state-store"
-  template_length=292 replace_length=312 ttl_seconds=3600 dry_run=true
-  inject_mode=replace-only harvest_inband=false models=5
-```
-
-顺带实测确认的一条：**用管理密钥 `PATCH` 插件配置返回 200，插件热加载生效、
-不需要重启**。换 `.so` 仍然必须重启（见第 6 步）。
-
-**再用浏览器确认页面**：
-
-CPA 只监听 `127.0.0.1:8317`，浏览器要访问得先开隧道：
+### 部署后验证
 
 ```bash
-ssh -N -L 8317:127.0.0.1:8317 ovh
+RES=http://127.0.0.1:8317/v0/resource/plugins/codex-turn-state
+curl -s -o /dev/null -w "healthz: %{http_code}\n" http://127.0.0.1:8317/healthz
+curl -s "$RES/status"        | head -c 300      # 角色/配置是否保住
+curl -s "$RES/ops/choices"   | head -c 300      # 新路由是否在（旧 .so 会 404）
+curl -s "$RES/dashboard" | grep -c "fetchChoices"   # 看板是不是新版
 ```
 
-然后在 CPAMP 菜单里找到 **`Codex Turn-State`**，点开，粘管理密钥，确认能拉到
-status 数据（桶数、`role`、`dry_run` 当前值）。密钥只存 `sessionStorage`，
-关标签页就没了，每次打开都要重新粘。
+看日志确认插件加载：
 
-> ⚠️ 页面上的「连通性自检」按钮**能打通上游、会消耗额度，但永远不产生桶**——
-> 宿主的防递归设计让插件自己发的请求不经过自己的响应钩子。它只能证明账号和
-> 协议通不通。**真正的采集只有第 9 步的 `scripts/probe.py` 一条路**，不要点着
-> 自检等桶出现。详见 README。
+```bash
+docker logs cli-proxy-api --since 2m 2>&1 | grep -i "codex-turn-state.*configured"
+```
 
 ---
 
-## 第 5~14 步
-
-### 5. 改 `main.go` + 写测试，本地/容器里测过
-
-规格第 8 节要求的 9 个测试，全部不连上游，用假的 292/312 字符串
-（任意合法长度即可，**不要用生产日志里的真值**）：
-
-1. 不同 `auth_id` 的 292 不能被另一号 substitute。
-2. 同号 `gpt-5.6-sol` 的 292 不能套到 `gpt-6-astra`。
-3. 分桶键不含 IP；两套不同 IP 元数据不影响命中。
-4. `issued_at` 超过 3600s 的文件不加载、不替换。
-5. 312 响应不得写入 store。
-6. 业务请求自带 292 **不得**覆盖 store。
-7. `replace-only`：无头或长度 ≠ 312 不改请求。
-8. `dry_run: true` 时响应里 Headers 仍为空 / noop。
-9. 写 store 后业务加载能读到同一桶。
+## 回滚
 
 ```bash
-cd /home/dnc/cpa-plugin-codex-turn-state
-gofmt -l go/
-cd go && go test ./... && cd ..
-```
-
-`gofmt` 和 `go test` 必须通过。**不要说「没跑编译」。**
-
-### 6. 编 `.so`，备份旧文件，部署，重启/重载 CPA ⚠️ 影响线上
-
-```bash
-cd /home/dnc/cpa-plugin-codex-turn-state
-bash scripts/build.sh
-
-TS=$(date +%Y%m%d-%H%M)
-cp /home/dnc/cpamp-deploy/cpa-plugins/linux/amd64/codex-turn-state-v0.1.0.so \
-   /home/dnc/cpamp-deploy/cpa-plugins/linux/amd64/codex-turn-state-v0.1.0.so.bak-$TS
-
-cp build/linux/amd64/codex-turn-state.so \
-   /home/dnc/cpamp-deploy/cpa-plugins/linux/amd64/codex-turn-state-v0.1.0.so
-
+DIR=/home/dnc/cpamp-deploy/cpa-plugins/linux/amd64
+LIVE=$DIR/codex-turn-state-v0.1.0.so
+BAK=$(ls -1t $DIR/codex-turn-state-v0.1.0.so.bak-* | head -1)
+cp "$BAK" "$DIR/.cts.rollback" && mv -f "$DIR/.cts.rollback" "$LIVE"
 docker restart cli-proxy-api
-docker logs cli-proxy-api --since 2m 2>&1 | grep -i codex-turn-state
 ```
 
-**覆盖前一定先拷 `.bak-<时间戳>`。**
+只保留一个回滚点。任何历史版本都能从 git 在 30 秒内重编出来，不需要囤 `.bak`。
 
-**CPA 不热加载新的 `.so`，进程必须重启。** 这一条不因为配置能热改而改变。
+**更快的回滚**：如果问题出在行为而不是崩溃，先把 `dry_run` 翻成 `true`
+（热生效、不用重启），插件立刻停止改写任何请求。
 
-日志里应当出现 `plugin loaded plugin_id=codex-turn-state`，以及一行
-`configured …`。2026-09-18 实测到的那行长这样：
+---
 
-```
-[codex-turn-state] configured role=probe store_dir="/data/turn-state-store"
-  template_length=292 replace_length=312 ttl_seconds=3600 dry_run=true
-  inject_mode=replace-only harvest_inband=false models=5
-```
+## 排障速查
 
-逐字段核对一遍，尤其是 `inject_mode=replace-only` 和 `harvest_inband=false`。
+| 症状 | 多半是 |
+|---|---|
+| 日志里 `auth=-`，采集不落盘 | 刚重启，`RequestID` 内存表空。等几秒自愈 |
+| 探测点了没反应、转录只有一行 | 全部三元组在 55 分钟冷却里。加个新代理即可立刻重试 |
+| 上游大量 `http=429` | 请求太密。检查是否退回了「无间隔连打整个代理池」 |
+| 所有桶都是 312 | 上游账号级窗口关着。换 IP 无效，等窗口或换号 |
+| `/ops/choices` 404 | 跑的还是旧 `.so`，没重启或没换成功 |
+| 看板能开但账号列表空 | `probe_management_key` 没配，或 CPA 401 |
+| 日志打 `inject` 但上游收到的仍是 312 | CPA 升级动了请求头链路，见 README「升级 CPA 后必须回归这条链路」 |
+| 宿主上 `ls` 桶文件 `PermissionError` | CPA 是 root、你不是。加 `sudo`，或走 status 接口 |
 
-如果 config 里还没有 `role`，按第 2 条须知会落到 `business`，且 `store_dir`
-未配 → 纯 no-op。这也是正常的中间状态。
+### 清点 CPA 的状态一律走接口，不要读文件
 
-**部署完这里就去做第 0.5 步**（验证看板页面可达 + 三条接口鉴权正确）。页面是
-这个新 `.so` 带来的，到这一步才存在。
-
-### 7. yaml 设 `role: probe`
-
-改 `/home/dnc/cpamp-deploy/cpa-data/config.yaml` 的
-`plugins.configs.codex-turn-state`，照
-[`config.example.yaml`](config.example.yaml) 填。探测时段：
-
-```yaml
-      role: probe
-      store_dir: /data/turn-state-store
-      inject_mode: replace-only
-      harvest_inband: false
-```
-
-`dry_run` 探测时段随意——探测端不做替换。
-
-CPA 热重载配置，这步**不需要重启**——2026-09-18 实测确认（`PATCH` 配置返回
-200，插件当场重新加载）。改 `config.yaml` 和走 `PATCH` 接口是同一套热重载。
-
-确认日志里 `configured` 那行的 `role` 已经变成 `probe`：
+`auths/` 和 store 下都有 **root 属主**的文件。宿主上以普通用户读会
+`PermissionError`，而且失败方式很坏：**清点会少一个号且不报错**，很容易当成
+「文件损坏」去查。
 
 ```bash
-docker logs cli-proxy-api --since 2m 2>&1 | grep -i "codex-turn-state.*configured"
-```
+# 权威来源
+curl -s -H "Authorization: Bearer $KEY" http://127.0.0.1:8317/v0/management/auth-files
 
-> 如果热重载后 `role` 没变、或响应钩子没被调用，重启一次 `cli-proxy-api`
-> 再看。能力声明是在注册时上报的。
-
-### 8. 停对外业务，或停用全部 Codex 账号 ⚠️ 停服窗口
-
-**开始前要和用户确认两件事，缺一不可：**
-
-1. **时段**——参见开头第 1 条须知的时长估算。
-2. **这次实际探几个号**。文档里的 25 个桶是按 5 号 × 5 模型的满配算的，
-   但探测耗额度、也占停服窗口。**不要看到 25 这个数字就自行开跑。**
-   确认下来只探 3 个号，那验收标准就是 15 个桶，并且第 10 步必须点名写清
-   哪几个号没探、为什么。
-
-两种做法二选一：停掉对外入口，或者在 CPA 里把全部 Codex 账号停用（探测脚本会
-按账号逐个启用）。
-
-理由：探测要精确知道每个 292 属于哪个账号。CPA 的调度只会在**已启用**的账号里
-选，不要假定能在请求层面指定账号。
-
-> **「自检不是能指定 `auth_id` 吗，为什么探测还要停号？」**
->
-> 因为两条路不一样：自检走插件的 host 调用，有 `AuthID` 字段能锁定凭据，但那条
-> 路的响应**会被宿主跳过本插件的拦截器**，所以采不到、不落桶。`probe.py` 必须
-> 走公开代理接口才能让响应经过插件钩子，而那条路径**没有**指定账号的字段。
->
-> **能定向的采不到，能采到的不能定向。** 详见 [README.md](README.md) 的
-> 「⚠️ 不对称」一节。所以这一步的停号**不能省**。
-
-### 9. 跑 `probe --until-complete`
-
-```bash
-cd /home/dnc/cpa-plugin-codex-turn-state
-python3 scripts/probe.py --until-complete
-```
-
-行为要点：
-
-- 外层按账号：每次只启用一个 Codex 账号。
-- 内层按模型：对该号的 5 个模型各发一个最小官方请求，`model` 用清单里的官方
-  id（带横线）。请求**不要**带旧的 `X-Codex-Turn-State`。
-- 成功标准是「store 里出现该桶未过期的 292」，**不是 HTTP 200**。
-- 该号 5 个模型齐了再换下一号。
-- 全部目标桶都有未过期 292 才退出 0，否则非 0。
-
-**探测会耗额度**：每个 `(账号, 模型)` 成功一次即可，不要和业务混打。
-
-`gpt-5.6-luna` 在历史收割里可能没有，但清单里**仍必须探测**，缺了不准宣称
-complete。
-
-可选参数：`--account <json名>` 只探一个号，`--model <id>` 只探一个模型。
-
-### 10. 人工检查 store：5×5
-
-**首选走 `status` 接口**——桶文件是 `root:root 0600`，普通用户读不了（见
-0.2）：
-
-```bash
-curl -s -H 'X-Management-Key: <管理密钥>' \
-  http://127.0.0.1:8317/v0/management/codex-turn-state/status
-```
-
-或者直接在看板页面上看（第 0.5 步开的隧道）。
-
-需要落到文件层面核对时，加 `sudo`：
-
-```bash
+# 真要读文件
 sudo find /home/dnc/cpamp-deploy/cpa-data/turn-state-store -name '*.json' | sort
-sudo cat /home/dnc/cpamp-deploy/cpa-data/turn-state-store/index.json
 ```
 
-要确认：
-
-- 25 个桶文件都在，按 `<账号>/<模型>.json` 分目录。
-- `index.json` 里每个桶 `ready: true`，`expires_at` 都还没到。
-- **没有任何 312 文件**。
-
-**缺桶不要开业务。** 如果确实只启用了部分账号，把实际启用了哪些号、缺了谁写
-进交付文档，不要含糊带过。
-
-### 11. yaml 切 `role: business`，重载
-
-```yaml
-      role: business
-      store_dir: /data/turn-state-store
-      inject_mode: replace-only   # 已拍板，不要改成 always
-      harvest_inband: false       # 业务必须 false
-      dry_run: true               # 先 true
-```
-
-重载后看日志确认**装入了多少条**模板：
-
-```bash
-docker logs cli-proxy-api --since 2m 2>&1 | grep -i "codex-turn-state.*configured"
-```
-
-角色从 `probe` 切到 `business` 会清空探测期的内存态，只从 store 重新加载。
-装入条数应该和第 10 步数出来的桶数对得上。
-
-### 12. 启用业务账号，放下游，看 `substitute`
-
-`dry_run: true` 状态下放真实流量进来。日志里应当出现 `substitute` 行，并且：
-
-- `auth` 和 `model` 与请求实际使用的一致；
-- 出发到上游的头**仍然是 312**（因为 dry-run 不真改）。
-
-抓包或看请求日志确认第二点。这一步是在证明「逻辑对了但还没动手」。
-
-### 13. 确认无跨号 / 跨模型后，`dry_run: false`
-
-确认第 12 步的 `substitute` 行没有任何一条把 A 号的模板用到 B 号、或把甲模型的
-模板用到乙模型之后：
-
-```yaml
-      dry_run: false
-```
-
-热重载，无需重启。从这一刻起插件真的开始改写线上请求。
-
-**回滚**：把 `dry_run` 改回 `true` 即可，同样热重载生效。
-
-### 14.（可选）cron 在过期前补采
-
-模板 1 小时过期。过期桶业务会自动停止替换，直到新的 292 进盘——不会用旧值去
-撞上游的 `could not be decrypted`。
-
-如果要持续保温，让 cron 在过期前再跑一轮探测补采。注意这仍然会耗额度，并且
-探测和业务不要同时打。
-
-> **不要**改 `harvest.sh` 去写 store。`/home/dnc/turn-state-harvest/` 下的日志
-> 扫描 tsv 可以留作**对照**，但**禁止当业务输入**。
-
----
-
-## 验收清单
-
-做完必须交证据，`value` 可以打码。
-
-- [ ] `go test` / `gofmt` 通过，`.so` 时间戳已更新，CPA 日志
-      `plugin loaded plugin_id=codex-turn-state`
-- [ ] store 按 `(账号, 模型)` 分目录，无 312 文件
-- [ ] 探测日志：只启用一个号时写入的 `auth_id` 就是该号
-- [ ] 业务 `dry_run: true` 时有 `substitute`，抓包/请求日志出发头仍是 312
-- [ ] `dry_run: false` 后同号同模型 312 变成 292
-- [ ] 换模型不套用上一模型；换账号不套用上一号
-- [ ] 过期文件不再替换
-- [ ] 业务请求带 292 时 store 内容不变
-- [ ] 无头请求不被强灌 292
-
-以上 9 项是规格第 10 节的原文。以下是管理 API / 看板页面带来的补充项
-（规格写定之后才加的功能）：
-
-- [x] `ldd` 在 CPA 同款镜像里检查 `.so`，依赖全部解析干净、无 `version not found`
-      —— 2026-09-18 实测通过
-- [x] CPAMP 菜单里出现 `Codex Turn-State`，粘密钥后能拉到 status
-      —— 2026-09-18 实测通过（外壳 `200` `text/html` 37642 bytes）
-- [x] **不带密钥请求 `/v0/management/codex-turn-state/status` 返回 401**
-      （返回 200 说明数据路由被降级成公开的了，立即停下来查 `Menu` 字段）
-      —— 2026-09-18 实测 `401`
-
-> 上面 3 项已勾的是 2026-09-18 部署 `5db76ef` 时实测的结果。**规格那 9 项一个都
-> 还没勾**——它们依赖第 8~13 步，那些还没跑。重新部署后这 3 项要复跑。
-
-给同事的回执只需要：账号文件名、模型、长度、决定、时间。**不要贴 state。**
-
----
-
-## 做完怎么回
-
-用几行交清楚：
-
-- 改了哪些文件
-- `.so` 路径和时间
-- `role` 当前值
-- `dry_run` 当前值
-- store 里就绪的 `(账号, 模型)` 个数
-- 探测是否 `--until-complete` 成功
-- 验收勾了哪些
-
-缺的桶要**点名**（账号文件名 + 模型），不要贴 `value`。
+管理密钥在 `~/cpamp-deploy/keeper.env`（`CPA_MANAGEMENT_KEY`）。
+**别把密钥明文写进命令行**——会被内容分类器拦，走 env 文件是干净解法。
 
 ---
 
 ## 明确不要动
 
-- 不要改 CPA 官方源码/镜像来「抄近路」，用插件 + 脚本。
-- 不要改另外 4 个请求头。
-- 不要把 A 号日志里的值写入 B 号 store。
-- 不要用 `captures.tsv` 灌业务。
+- 不要改 CPA 官方源码/镜像来「抄近路」，用插件。
+- 不要动另外 4 个 `X-Codex-*` 请求头。
+- 不要把 A 号的值写进 B 号的桶。
+- 不要让**探测**去改 CPA 的任何状态（启用位、账号 `proxy_url`、全局 `proxy-url`）
+  ——那条路径已经整个删掉了，不要重新引入。
+- 不要重新引入「探测期只启用一个号」那套归属推断——离线探测握着 token，归属是
+  确定的。
+- 不要刷新账号 token。过期就跳过，等 CPA 自己刷。
 - 不要把完整 Turn-State、管理密钥、token 写进 git、README、PR、聊天。
-- 不要默认 `inject_mode: always`。
-- 不要跳过第 0 步和编译。
+- 不要把插件装回容器可写层（CPA 升级会冲掉）。`./cpa-plugins` 挂载不能退回去。
+- 不要在服务器那个脏 repo 上做 git 操作。
+
+---
+
+## 交付回执写什么
+
+- `.so` 路径和时间戳、对应的 git 提交
+- `role` / `inject_mode` / `dry_run` 当前值
+- store 里就绪的 `(账号, 模型)` 个数
+- 验证过哪几项
+
+账号只写**文件名**，**不要贴 `value`、不要贴 token、不要贴带密码的代理 URL**。

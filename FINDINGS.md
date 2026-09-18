@@ -78,13 +78,28 @@ difference a reliable, byte-exact indicator rather than a guess.
 
 ## What the plugin does with this
 
-`request.intercept_after` sees the value a genuine Codex client echoes back on a
-follow-up turn. When that value is a 292 the plugin stores it for the bucket;
-when it is a 312 the plugin overwrites it with the bucket's live 292 before the
-request goes upstream. Expiry is computed from the token's embedded Fernet
-timestamp (`fernetIssuedAt` in `go/main.go`), so a template harvested late in
-its life is not mistaken for a fresh one.
+A 292 enters the store from one of two places, and neither of them is the
+incoming request:
 
-The plugin can only **prolong** a state it has already observed on a real
-request for that bucket; it never fabricates a value and never crosses the
-account or model boundary.
+- **The offline probe** calls `chatgpt.com/backend-api/codex/responses` directly
+  as one account, so the upstream mints a state the probe then keeps. CPA is not
+  involved and none of its state is touched.
+- **The response hooks** read the state the upstream mints for ordinary business
+  traffic. This costs nothing, because the request was going out anyway, and it
+  is self-limiting: once a bucket holds a template the request hook injects it,
+  the upstream stops minting for that bucket, and this side goes quiet until the
+  template lapses.
+
+A 292 arriving on an incoming **request** is a different thing and is not
+stored: its provenance is unknown — a replay, or another session's state the
+client happened to send. That path (`harvest_inband`) is forced off for the
+business role.
+
+On the way out, `request.intercept_after` replaces a 312 with the bucket's live
+292 (or, under `inject_mode: always`, adds one to a request that carried none).
+Expiry is computed from the token's embedded Fernet timestamp (`fernetIssuedAt`
+in `go/main.go`), so a template harvested late in its life is not mistaken for a
+fresh one.
+
+The plugin never fabricates a value, and never crosses the account or model
+boundary.
