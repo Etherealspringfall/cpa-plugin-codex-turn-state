@@ -143,6 +143,34 @@ var (
 	// seconds is invisible, while the burst it removes is not.
 	probeExitPause = 2 * time.Second
 
+	// probeRotatingAttempts is how many upstream calls one bucket may spend on the
+	// rotating pool in a single visit, and probeRotatingCooldown is how long that
+	// bucket rests afterwards if none of them produced a 292.
+	//
+	// These exist because a rotating proxy breaks the assumption the static
+	// cooldown is built on. There, one URL is one IP, a 312 means that IP is
+	// throttled, and re-dialing it inside the window is pointless -- so one
+	// attempt per 55 minutes is exactly right. A rotating URL hands out a
+	// different residential address on every connection (measured 2026-09-19:
+	// twenty consecutive requests through one entry, twenty distinct addresses),
+	// so the very retry the static rule forbids is the one thing that can clear a
+	// 312. Applying the static window to a rotating pool throws away all but 1/N
+	// of what it provides.
+	//
+	// The numbers are the operator's: ten attempts, then ten minutes. That is up
+	// to 60 calls per bucket per hour, which is a real cost and is deliberately
+	// chosen -- note it does NOT raise the instantaneous rate, which is what
+	// actually earned the 429s on 2026-09-18: one goroutine per account and
+	// probeExitPause between calls still cap a single credential at roughly one
+	// request every two seconds.
+	//
+	// What is knowingly absent is an escalating backoff. An account throttled at
+	// the account level answers 312 (not 429) indefinitely, and nothing here will
+	// notice or slow down; the only automatic brake is the 429 path. That was the
+	// operator's call.
+	probeRotatingAttempts = 10
+	probeRotatingCooldown = 10 * time.Minute
+
 	// probeAccountBackoff is how long a credential is left alone after the
 	// upstream signals an account-level refusal (429, or a rejected token).
 	// Distinct from probeExitCooldown because the signal is distinct: a 312 says
@@ -203,6 +231,7 @@ func probeRunStart() error {
 	accounts := append([]string(nil), cfg.ProbeAccounts...)
 	models := append([]string(nil), cfg.Models...)
 	proxies := append([]string(nil), cfg.ProbeProxies...)
+	rotating := append([]string(nil), cfg.ProbeProxiesRotating...)
 
 	switch {
 	case len(accounts) == 0:
@@ -230,7 +259,7 @@ func probeRunStart() error {
 		Running:   true,
 		StartedAt: time.Now().UTC().Format(time.RFC3339),
 	}
-	go probeSweep(ctx, cfg, accounts, models, proxies)
+	go probeSweep(ctx, cfg, accounts, models, proxies, rotating)
 	return nil
 }
 
@@ -324,7 +353,7 @@ func probeAppendLine(lines []string, line string) []string {
 
 // probeSweep is the whole run: read credentials, fill every pending bucket once,
 // then stay up renewing them. It is the only goroutine this file starts.
-func probeSweep(ctx context.Context, cfg pluginConfig, accounts, models, proxies []string) {
+func probeSweep(ctx context.Context, cfg pluginConfig, accounts, models, proxies, rotating []string) {
 	// Registered first, so it runs last: the run is not "finished" until the
 	// renewal loop below has returned.
 	defer probeRunFinish()
@@ -369,9 +398,9 @@ func probeSweep(ctx context.Context, cfg pluginConfig, accounts, models, proxies
 	idxOf := probeAccountIndex(accounts)
 	targets := probePendingTargets(cfg, accounts, models)
 	probeRunUpdate(func(run *probeRunState) { run.Total = len(targets) })
-	probeRunLog("offline harvest: %d account(s) x %d model(s) = %d bucket(s) to fill, %d exit(s) in pool", len(accounts), len(models), len(targets), len(proxies))
+	probeRunLog("offline harvest: %d account(s) x %d model(s) = %d bucket(s) to fill, %d static exit(s) + %d rotating entr(ies)", len(accounts), len(models), len(targets), len(proxies), len(rotating))
 	if len(targets) > 0 {
-		if cooling := probeFireBatch(ctx, cfg, pool, creds, targets, idxOf, proxies, true); cooling > 0 {
+		if cooling := probeFireBatch(ctx, cfg, pool, creds, targets, idxOf, proxies, rotating, true); cooling > 0 {
 			// Said once per pass rather than per bucket per tick: the common case
 			// after a recent sweep is that most buckets are still inside the
 			// window, and an operator who just pressed the button needs to be told
@@ -410,7 +439,7 @@ func probeAccountIndex(accounts []string) map[string]int {
 // probeMaxInFlight. countDone advances the progress bar (the initial fill wants
 // it; a renewal tick does not, having no fixed Total). It is the shared fan-out
 // for both callers so the concurrency rule lives in one place.
-func probeFireBatch(ctx context.Context, cfg pluginConfig, pool *probeClientPool, creds map[string]probeCredential, targets []probeTarget, idxOf map[string]int, proxies []string, countDone bool) int {
+func probeFireBatch(ctx context.Context, cfg pluginConfig, pool *probeClientPool, creds map[string]probeCredential, targets []probeTarget, idxOf map[string]int, proxies, rotating []string, countDone bool) int {
 	// Grouped by credential, and each credential gets ONE goroutine that walks its
 	// buckets in turn. Fanning out over targets instead let several buckets of the
 	// same account fire at once, which is how one credential saw ~7.5 requests a
@@ -452,7 +481,7 @@ func probeFireBatch(ctx context.Context, cfg pluginConfig, pool *probeClientPool
 				if ctx.Err() != nil {
 					return
 				}
-				if !probeHarvestBucket(ctx, cfg, pool, cred, target.model, proxies, accountIdx) {
+				if !probeHarvestBucket(ctx, cfg, pool, cred, target.model, proxies, rotating, accountIdx) {
 					cooling.Add(1)
 				}
 				if countDone {
@@ -473,7 +502,7 @@ func probeFireBatch(ctx context.Context, cfg pluginConfig, pool *probeClientPool
 // It reports whether any upstream call was actually made. A bucket whose every
 // exit is still inside probeExitCooldown returns false without a word, which is
 // what keeps the renewal loop from narrating the same skip once a minute.
-func probeHarvestBucket(ctx context.Context, cfg pluginConfig, pool *probeClientPool, cred probeCredential, model string, proxies []string, accountIdx int) bool {
+func probeHarvestBucket(ctx context.Context, cfg pluginConfig, pool *probeClientPool, cred probeCredential, model string, proxies, rotating []string, accountIdx int) bool {
 	key := bucketKey(cred.name, model)
 	if !probeClaim(key) {
 		// Another fire (the other loop, or an overtaking renewal tick) is already
@@ -490,8 +519,23 @@ func probeHarvestBucket(ctx context.Context, cfg pluginConfig, pool *probeClient
 		return false
 	}
 
+	// Static exits first. Each one is a distinct IP with its own once-per-window
+	// budget, and an unspent budget simply expires -- so the perishable resource
+	// goes first and the rotating pool, which can be tapped at any time, picks up
+	// whatever is left.
+	//
+	// The empty pool must NOT become a direct attempt when a rotating pool exists.
+	// An empty probe_proxies has always meant "go out over the box's own egress",
+	// which is right when nothing else is configured and quite wrong once the
+	// operator has moved their whole pool to probe_proxies_rotating: it would send
+	// the harvest out over the server's own address behind their back.
+	staticExits := probeExits(proxies, accountIdx)
+	if len(proxies) == 0 && len(rotating) > 0 {
+		staticExits = nil
+	}
+
 	fired := false
-	for _, exit := range probeExits(proxies, accountIdx) {
+	for _, exit := range staticExits {
 		if ctx.Err() != nil {
 			return fired
 		}
@@ -541,7 +585,77 @@ func probeHarvestBucket(ctx context.Context, cfg pluginConfig, pool *probeClient
 		// for the defect where a 312 ended the attempt outright and the rest of
 		// the pool was never dialed at all.
 	}
+
+	if len(rotating) > 0 {
+		stored, rotFired := probeHarvestRotating(ctx, cfg, pool, cred, short, model, rotating, accountIdx)
+		fired = fired || rotFired
+		if stored {
+			return true
+		}
+	}
 	return fired
+}
+
+// probeHarvestRotating spends up to probeRotatingAttempts calls on the rotating
+// pool for one bucket, cycling through the configured entries.
+//
+// Cycling rather than picking one entry matters when the entries are separate
+// credentials on one gateway, which is the common shape: it spreads the load
+// across them while every individual call still gets a fresh address. The
+// starting offset is the account index so two accounts working at once do not
+// march in lockstep through the same entry.
+//
+// The budget is claimed up front, at the failure window, and only upgraded to
+// the full window once a template is actually stored. Claiming first is the same
+// guarantee the static path makes -- a run that is cancelled or dies midway has
+// still spent these attempts, and must not come back and spend them again.
+func probeHarvestRotating(ctx context.Context, cfg pluginConfig, pool *probeClientPool, cred probeCredential, short, model string, rotating []string, accountIdx int) (stored, fired bool) {
+	now := time.Now()
+	if !probeCooldownReady(probeRotatingExit, cred.name, model, now) {
+		return false, false
+	}
+	probeCooldownSet(probeRotatingExit, cred.name, model, now.Add(probeRotatingCooldown))
+
+	for attempt := 0; attempt < probeRotatingAttempts; attempt++ {
+		if ctx.Err() != nil {
+			return false, fired
+		}
+		if fired && !probeSleep(ctx, probeExitPause) {
+			return false, fired
+		}
+		exit := rotating[(accountIdx+attempt)%len(rotating)]
+		client, errClient := pool.get(exit)
+		if errClient != nil {
+			probeRunLog("%s %s: rotating exit %s unusable, trying next: %s", short, model, probeShowProxy(exit), probeRedact(errClient.Error()))
+			continue
+		}
+		fired = true
+
+		status, value, errFire := probeFireUpstream(ctx, client, cred, model)
+		if errFire != nil {
+			probeRunLog("%s %s: rotating exit %s failed at transport, trying next: %s", short, model, probeShowProxy(exit), probeRedact(errFire.Error()))
+			continue
+		}
+		switch probeConsume(cfg, cred.name, short, model, status, value, exit) {
+		case probeOutcomeStored:
+			probeCooldownSet(probeRotatingExit, cred.name, model, time.Now().Add(probeExitCooldown))
+			return true, fired
+		case probeOutcomeAccountLimited:
+			// A 429 is the credential being told to slow down. No address the
+			// gateway can hand out changes that, so the remaining attempts would
+			// only deepen it.
+			probeAccountSetBackoff(cred.name, time.Now())
+			return false, fired
+		}
+		// A 312: this address is throttled for this bucket. Unlike a static exit,
+		// the next attempt through the very same entry is a different address, so
+		// it is worth making -- that is the entire reason this pool is separate.
+	}
+	if fired {
+		probeRunLog("%s %s: rotating pool gave %d address(es), none of them a %d; resting this bucket for %s",
+			short, model, probeRotatingAttempts, cfg.TemplateLength, probeRotatingCooldown)
+	}
+	return false, fired
 }
 
 // probeConsume decides what one upstream response means. Only a 200 carrying a
@@ -678,6 +792,7 @@ func probeRenewLoop(ctx context.Context, pool *probeClientPool) {
 		accounts := append([]string(nil), cfg.ProbeAccounts...)
 		models := append([]string(nil), cfg.Models...)
 		proxies := append([]string(nil), cfg.ProbeProxies...)
+		rotating := append([]string(nil), cfg.ProbeProxiesRotating...)
 		if len(accounts) == 0 || len(models) == 0 {
 			probeRunUpdate(func(run *probeRunState) { run.Current = "scope is empty; nothing to keep fresh" })
 			continue
@@ -703,7 +818,7 @@ func probeRenewLoop(ctx context.Context, pool *probeClientPool) {
 				// credentials and claim buckets once a minute only to find every
 				// triple still cooling, which is the busy-work half of the defect
 				// probeExitCooldown exists to end.
-				if !probeBucketHasEligibleExit(proxies, idxOf[account], account, model, now) {
+				if !probeBucketHasEligibleExit(proxies, rotating, idxOf[account], account, model, now) {
 					continue
 				}
 				due = append(due, probeTarget{account: account, model: model})
@@ -730,7 +845,7 @@ func probeRenewLoop(ctx context.Context, pool *probeClientPool) {
 		}
 		client := newProbeClient(cfg)
 		creds := probeDownloadCreds(ctx, client, accountList, now)
-		probeFireBatch(ctx, cfg, pool, creds, due, idxOf, proxies, false)
+		probeFireBatch(ctx, cfg, pool, creds, due, idxOf, proxies, rotating, false)
 		client.http.CloseIdleConnections()
 	}
 }
@@ -832,10 +947,27 @@ func probeRelease(key string) {
 // Keying on the exit URL has a second, useful property: correcting a typo in a
 // proxy changes the string, so the fixed exit is a new triple with no cooldown
 // and is retried at once instead of sitting out the window.
+// The table stores the moment a triple becomes eligible again, not the moment it
+// was last fired. Storing the deadline is what lets one table serve two very
+// different windows: a static exit (and any success) rests for
+// probeExitCooldown, while a rotating pool that ran out of attempts without a
+// 292 rests only probeRotatingCooldown -- see probeHarvestRotating for why those
+// are not the same question.
 var probeCooldown = struct {
-	mu   sync.Mutex
-	last map[string]time.Time
-}{last: map[string]time.Time{}}
+	mu    sync.Mutex
+	until map[string]time.Time
+}{until: map[string]time.Time{}}
+
+// probeRotatingExit is the pseudo-exit the rotating pool's cooldown is keyed on.
+// It cannot collide with a real entry: a URL cannot contain a NUL byte, and the
+// key separator is NUL.
+//
+// Keying the rotating pool on (account, model) rather than on each URL is the
+// whole point of the split. A rotating URL is not an exit, it is a gateway to a
+// fresh IP per request, so "this URL was already tried" says nothing useful --
+// the next request through it is a different address. What is genuinely scarce
+// there is the account's tolerance, and that is what this key measures.
+const probeRotatingExit = "\x00rotating"
 
 func probeCooldownKey(exit, account, model string) string {
 	return exit + "\x00" + account + "\x00" + model
@@ -847,14 +979,22 @@ func probeCooldownKey(exit, account, model string) string {
 func probeCooldownReady(exit, account, model string, now time.Time) bool {
 	probeCooldown.mu.Lock()
 	defer probeCooldown.mu.Unlock()
-	last, seen := probeCooldown.last[probeCooldownKey(exit, account, model)]
-	return !seen || now.Sub(last) >= probeExitCooldown
+	until, seen := probeCooldown.until[probeCooldownKey(exit, account, model)]
+	return !seen || !now.Before(until)
 }
 
+// probeCooldownMark rests a triple for the standard window. This is the static
+// path's only marker: one exit, one IP, one attempt per window.
 func probeCooldownMark(exit, account, model string, now time.Time) {
+	probeCooldownSet(exit, account, model, now.Add(probeExitCooldown))
+}
+
+// probeCooldownSet rests a triple until an explicit deadline, which the rotating
+// path needs because its two outcomes deserve different windows.
+func probeCooldownSet(exit, account, model string, until time.Time) {
 	probeCooldown.mu.Lock()
 	defer probeCooldown.mu.Unlock()
-	probeCooldown.last[probeCooldownKey(exit, account, model)] = now
+	probeCooldown.until[probeCooldownKey(exit, account, model)] = until
 }
 
 // probeAccountRest holds credentials the upstream has told us to leave alone.
@@ -897,7 +1037,17 @@ const (
 // bucket. The renewal loop checks this before queueing anything: without it, a
 // scope whose every triple is cooling would still download credentials and claim
 // buckets once a minute just to discover it may do nothing.
-func probeBucketHasEligibleExit(proxies []string, accountIdx int, account, model string, now time.Time) bool {
+func probeBucketHasEligibleExit(proxies, rotating []string, accountIdx int, account, model string, now time.Time) bool {
+	// The rotating pool carries one shared key per (account, model), so it is a
+	// single extra question rather than one per entry.
+	if len(rotating) > 0 && probeCooldownReady(probeRotatingExit, account, model, now) {
+		return true
+	}
+	// Mirrors probeHarvestBucket: with a rotating pool configured, an empty static
+	// list is not an invitation to go out over the box's own address.
+	if len(proxies) == 0 && len(rotating) > 0 {
+		return false
+	}
 	for _, exit := range probeExits(proxies, accountIdx) {
 		if probeCooldownReady(exit, account, model, now) {
 			return true

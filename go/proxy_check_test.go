@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -172,7 +173,7 @@ func TestProxyCheckVerdictsFollowTheUpstreamStatus(t *testing.T) {
 
 			pool := newProbeClientPool()
 			defer pool.closeIdle()
-			got := proxyCheckOne(t.Context(), pool, 1, "", "gpt-5.5")
+			got := proxyCheckOne(t.Context(), pool, proxyPoolStatic, 1, "", "gpt-5.5")
 
 			if got.Verdict != tc.verdict {
 				t.Fatalf("verdict = %q, want %q (status %d, detail %q)",
@@ -202,7 +203,7 @@ func TestProxyCheckSendsNoCredential(t *testing.T) {
 
 	pool := newProbeClientPool()
 	defer pool.closeIdle()
-	proxyCheckOne(t.Context(), pool, 1, "", "gpt-5.5")
+	proxyCheckOne(t.Context(), pool, proxyPoolStatic, 1, "", "gpt-5.5")
 
 	auths := upstream.auths()
 	if len(auths) == 0 {
@@ -225,7 +226,7 @@ func TestProxyCheckSeparatesUnreachableFromRefused(t *testing.T) {
 
 	pool := newProbeClientPool()
 	defer pool.closeIdle()
-	got := proxyCheckOne(t.Context(), pool, 1, "", "gpt-5.5")
+	got := proxyCheckOne(t.Context(), pool, proxyPoolStatic, 1, "", "gpt-5.5")
 
 	if got.Verdict != proxyVerdictDead {
 		t.Fatalf("verdict = %q, want %q for an exit that cannot be reached", got.Verdict, proxyVerdictDead)
@@ -244,7 +245,7 @@ func TestProxyCheckSurvivesATraceOutage(t *testing.T) {
 
 	pool := newProbeClientPool()
 	defer pool.closeIdle()
-	got := proxyCheckOne(t.Context(), pool, 1, "", "gpt-5.5")
+	got := proxyCheckOne(t.Context(), pool, proxyPoolStatic, 1, "", "gpt-5.5")
 
 	if got.Verdict != proxyVerdictOK {
 		t.Fatalf("verdict = %q, want %q; a trace outage must not change the verdict", got.Verdict, proxyVerdictOK)
@@ -376,5 +377,108 @@ func TestProxyCheckIsRegisteredKeylessWithoutAMenu(t *testing.T) {
 		if strings.Contains(route.Path, "proxy-check") {
 			t.Fatal("the proxy-check route is also declared as a management route; one home only")
 		}
+	}
+}
+
+// --- the two pools --------------------------------------------------------
+
+// rotatingTrace serves a different address on every request, which is what a
+// residential gateway actually does.
+type rotatingTrace struct {
+	mu     sync.Mutex
+	n      int
+	server *httptest.Server
+}
+
+func newRotatingTrace(t *testing.T) *rotatingTrace {
+	t.Helper()
+	tr := &rotatingTrace{}
+	tr.server = httptest.NewServer(tr)
+	t.Cleanup(tr.server.Close)
+	return tr
+}
+
+func (f *rotatingTrace) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	f.mu.Lock()
+	f.n++
+	n := f.n
+	f.mu.Unlock()
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte(fmt.Sprintf("ip=203.0.113.%d\nloc=GB\ncolo=LHR\n", n)))
+}
+
+func TestProxyCheckFlagsARotatingEntryDeclaredStatic(t *testing.T) {
+	// Only the provable direction is flagged. Two different addresses from one
+	// entry cannot happen on a fixed exit, so declaring it static is definitely
+	// wrong -- and the cost of getting it wrong is silent: the probe would give
+	// that entry one attempt per 55 minutes instead of ten per ten.
+	upstream := newFakeCheckUpstream(t, http.StatusUnauthorized)
+	setUpstream(t, upstream.server.URL)
+	setTraceURL(t, newRotatingTrace(t).server.URL)
+
+	var hits atomic.Int64
+	exit := newFakeProxy(t, &hits)
+	mustConfigure(t, checkConfig(t, t.TempDir(), exit))
+
+	resp := driveResource(t, opsProxyCheckPath, confirmed(nil))
+	got := decodeProxyCheck(t, resp.Body)
+	if len(got.Results) != 1 {
+		t.Fatalf("results = %d, want 1", len(got.Results))
+	}
+	row := got.Results[0]
+	if !row.Rotated {
+		t.Fatal("two samples returned different addresses but rotated is false")
+	}
+	if row.Mismatch == "" {
+		t.Fatal("a rotating entry sitting in the static pool was not flagged")
+	}
+	if got.Mismatches != 1 {
+		t.Fatalf("mismatches = %d, want 1", got.Mismatches)
+	}
+}
+
+func TestProxyCheckDoesNotFlagASteadyRotatingEntry(t *testing.T) {
+	// The other direction is NOT proof: a small gateway pool repeats an address
+	// by chance. Flagging it would tell the operator to undo a correct setting.
+	upstream := newFakeCheckUpstream(t, http.StatusUnauthorized)
+	trace := newFakeTrace(t) // same address every time
+	setUpstream(t, upstream.server.URL)
+	setTraceURL(t, trace.server.URL)
+
+	var hits atomic.Int64
+	exit := newFakeProxy(t, &hits)
+	mustConfigure(t, checkConfig(t, t.TempDir())+
+		"probe_proxies_rotating:\n  - "+jsonQuote(exit)+"\n")
+
+	resp := driveResource(t, opsProxyCheckPath, confirmed(nil))
+	got := decodeProxyCheck(t, resp.Body)
+	if len(got.Results) != 1 || got.Results[0].Pool != proxyPoolRotating {
+		t.Fatalf("the rotating pool was not checked: %+v", got.Results)
+	}
+	if got.Results[0].Mismatch != "" || got.Mismatches != 0 {
+		t.Fatalf("a rotating entry that happened to repeat an address was flagged: %q", got.Results[0].Mismatch)
+	}
+}
+
+func TestProxyCheckCountsDistinctAddressesForTheStaticPoolOnly(t *testing.T) {
+	// distinct_ips answers "are several static entries secretly one exit". A
+	// rotating entry is supposed to differ every time, so counting it here would
+	// turn the figure into a restatement of how many rotating entries there are.
+	upstream := newFakeCheckUpstream(t, http.StatusUnauthorized)
+	setUpstream(t, upstream.server.URL)
+	setTraceURL(t, newRotatingTrace(t).server.URL)
+
+	var hits atomic.Int64
+	exit := newFakeProxy(t, &hits)
+	mustConfigure(t, checkConfig(t, t.TempDir())+
+		"probe_proxies_rotating:\n  - "+jsonQuote(exit)+"\n")
+
+	resp := driveResource(t, opsProxyCheckPath, confirmed(nil))
+	got := decodeProxyCheck(t, resp.Body)
+	if got.StaticChecked != 0 {
+		t.Fatalf("static_checked = %d, want 0 -- only a rotating entry was configured", got.StaticChecked)
+	}
+	if got.DistinctIPs != 0 {
+		t.Fatalf("distinct_ips = %d, want 0: rotating addresses must not be counted", got.DistinctIPs)
 	}
 }

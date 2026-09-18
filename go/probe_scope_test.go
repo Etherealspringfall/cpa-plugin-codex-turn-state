@@ -86,10 +86,11 @@ func TestMaskProxyURLsKeepsPositions(t *testing.T) {
 // --- validation ----------------------------------------------------------
 
 func TestNormaliseProbeScopeDropsAndReportsBadEntries(t *testing.T) {
-	accounts, models, proxies, problems := normaliseProbeScope(
+	accounts, models, proxies, _, problems := normaliseProbeScope(
 		[]string{"codex-a.json", "  codex-b.json  ", "", "notcodex.json", "codex-../escape.json"},
 		[]string{"gpt-5.6-sol", " gpt-6-astra ", "", "gpt 5.5"},
 		[]string{testProxyWithPW, "", "ftp://exit.invalid:21", "://broken"},
+		nil,
 	)
 
 	wantAccounts := []string{"codex-a.json", "codex-b.json"}
@@ -118,13 +119,16 @@ func TestProbeScopeProblemsNeverContainAPassword(t *testing.T) {
 	// Every rejected proxy produces a complaint, and a complaint is a string
 	// that ends up in the status document and in the log. Neither may carry the
 	// userinfo of the entry that was rejected.
-	_, _, _, problems := normaliseProbeScope(
+	_, _, _, _, problems := normaliseProbeScope(
 		nil, nil,
 		[]string{
 			"ftp://prober:" + testProxySecret + "@exit.invalid:21",
 			"://" + testProxySecret,
 			"gopher://prober:" + testProxySecret + "@exit.invalid:70",
 		},
+		// The rotating list is held to the same rule, and its complaints must be
+		// just as free of userinfo -- it is the same masking path or it is a leak.
+		[]string{"gopher://prober:" + testProxySecret + "@rotate.invalid:70"},
 	)
 	if len(problems) == 0 {
 		t.Fatal("expected complaints about three bad proxies, got none")
@@ -502,4 +506,75 @@ func equalStrings(got, want []string) bool {
 		}
 	}
 	return true
+}
+
+// --- the two pools ---------------------------------------------------------
+
+func TestScopeSaveRoundTripsTheRotatingPool(t *testing.T) {
+	// The rotating pool is persisted, applied live, and -- above all -- kept
+	// SEPARATE from the static one. Merging them would silently hand one pool's
+	// retry rule to the other, which is the whole defect the split fixes.
+	dir := t.TempDir()
+	mustConfigure(t, scopeConfig(t, dir))
+
+	resp := driveResource(t, opsScopePath, confirmed(url.Values{
+		"fields":         {"rotating"},
+		"rotating_proxy": {"socks5://gw:pw@rotate.invalid:1080", "http://gw2.invalid:8080"},
+	}))
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body: %s)", resp.StatusCode, resp.Body)
+	}
+
+	state.mu.Lock()
+	rotating := append([]string(nil), state.config.ProbeProxiesRotating...)
+	static := append([]string(nil), state.config.ProbeProxies...)
+	state.mu.Unlock()
+
+	if len(rotating) != 2 {
+		t.Fatalf("rotating pool = %v, want the two saved entries", len(rotating))
+	}
+	// scopeConfig seeds exactly one static proxy; saving only the rotating field
+	// must not disturb it.
+	if len(static) != 1 {
+		t.Fatalf("static pool = %d entries, want 1 -- saving one pool rewrote the other", len(static))
+	}
+
+	// And it survives a reload, which is what the renewal loop actually reads.
+	mustConfigure(t, scopeConfig(t, dir))
+	state.mu.Lock()
+	reloaded := len(state.config.ProbeProxiesRotating)
+	state.mu.Unlock()
+	if reloaded != 2 {
+		t.Fatalf("rotating pool after reload = %d, want 2; it was not persisted", reloaded)
+	}
+}
+
+func TestScopeSaveRejectsAnUnknownField(t *testing.T) {
+	// "fields" is the guard against an empty query meaning "clear everything", so
+	// a typo in it must fail loudly rather than silently save nothing.
+	dir := t.TempDir()
+	mustConfigure(t, scopeConfig(t, dir))
+
+	resp := driveResource(t, opsScopePath, confirmed(url.Values{"fields": {"rotaing"}}))
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 for a misspelled field", resp.StatusCode)
+	}
+}
+
+func TestRotatingPoolComplaintsAreMaskedToo(t *testing.T) {
+	// Both pools share normaliseProxyList precisely so this cannot drift: a bad
+	// rotating entry must be reported by field and position, never by value.
+	_, _, _, _, problems := normaliseProbeScope(nil, nil, nil,
+		[]string{"gopher://gw:" + testProxySecret + "@rotate.invalid:70"})
+	if len(problems) == 0 {
+		t.Fatal("an unsupported scheme in the rotating pool produced no complaint")
+	}
+	for _, problem := range problems {
+		if strings.Contains(problem, testProxySecret) {
+			t.Fatalf("a rotating-pool complaint carried the password: %s", problem)
+		}
+		if !strings.Contains(problem, "probe_proxies_rotating") {
+			t.Fatalf("complaint does not name which pool it came from: %s", problem)
+		}
+	}
 }

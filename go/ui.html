@@ -223,15 +223,15 @@ td.acct.outscope, th.model.outscope, em.outscope { font-style: italic; color: va
 .check.isoff span { color: var(--muted); }
 .checks .empty { color: var(--faint); font-size: 12.5px; padding: 3px 0; }
 .addrow { margin-top: 7px; }
-#scopeModelAdd, #scopeProxyAdd, #scopeProxies {
+#scopeModelAdd, #scopeProxyAdd, #scopeRotAdd, #scopeProxies, #scopeRotating {
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   font-size: 12.5px; padding: 6px 9px; border-radius: 6px;
   border: 1px solid var(--border); background: var(--raised); color: var(--fg);
 }
 #scopeModelAdd { flex: 1 1 140px; min-width: 110px; }
-#scopeProxyAdd { flex: 1 1 200px; min-width: 140px; }
-#scopeProxies { width: 100%; min-height: 96px; resize: vertical; line-height: 1.45; }
-#scopeModelAdd:focus, #scopeProxyAdd:focus, #scopeProxies:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+#scopeProxyAdd, #scopeRotAdd { flex: 1 1 200px; min-width: 140px; }
+#scopeProxies, #scopeRotating { width: 100%; min-height: 96px; resize: vertical; line-height: 1.45; }
+#scopeModelAdd:focus, #scopeProxyAdd:focus, #scopeRotAdd:focus, #scopeProxies:focus, #scopeRotating:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
 #scopeProxies[readonly] { background: var(--card); color: var(--muted); }
 #scopeErrors { margin-top: 12px; }
 #scopeErrors .notice { margin-bottom: 8px; }
@@ -254,6 +254,8 @@ td.acct.outscope, th.model.outscope, em.outscope { font-style: italic; color: va
           font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
 .pcline .idx { flex: 0 0 2.6em; color: var(--faint); }
 .pcline .vd { flex: 0 0 3.2em; font-weight: 650; }
+.pcline .pool { flex: 0 0 4.4em; color: var(--faint); font-size: 11px; }
+.pcrow .why.bad { color: var(--bad); font-weight: 600; }
 .pcline .meta { flex: 1 1 auto; min-width: 0; color: var(--muted);
                 overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .pcrow .why { margin-top: 2px; font-size: 11.5px; color: var(--faint); }
@@ -425,6 +427,26 @@ select {
             <button class="btn ghost" id="btnAddProxy" type="button">追加</button>
           </div>
           <div class="hint" id="scopeProxyHint"></div>
+
+          <div class="scopehead" style="margin-top:12px">
+            <span class="sublabel">轮换代理（IP 每次都变）</span>
+            <span class="hint" id="scopeRotNote"></span>
+          </div>
+          <textarea id="scopeRotating" rows="4" spellcheck="false" autocomplete="off"
+                    placeholder="住宅轮换网关放这里，一行一个"
+                    aria-label="轮换代理清单，一行一个 URL"></textarea>
+          <div class="row addrow">
+            <input id="scopeRotAdd" type="text" spellcheck="false" autocomplete="off"
+                   placeholder="贴一条或多条轮换代理，追加到上面"
+                   aria-label="追加轮换代理到清单">
+            <button class="btn ghost" id="btnAddRot" type="button">追加</button>
+          </div>
+          <div class="hint">
+            两个池子的区别不是写法，是<b>重试规则</b>：静态池一条 URL 就是一个 IP，
+            312 之后重拨没有意义，所以每个桶 55 分钟只试一次；轮换池每次连接都是
+            新地址，所以同一条会连试 10 次，失败也只歇 10 分钟。
+            <b>放错池子会让探测白白少掉大部分机会</b> —— 点「测试连通性」会当场核对。
+          </div>
           <div id="proxyCheck"></div>
         </div>
       </div>
@@ -1067,6 +1089,8 @@ var scope = {
   hasProxyFields: false,
   // 明文。status 直接回传原值，所以这里就是真值，没动过时 diff 为空。
   proxyText: "",
+  rotText: "",
+  hasRotField: false,
   dirty: false,             // 人动过表单。动过之后轮询就不再覆盖它
   acctSig: "",
   modelSig: "",
@@ -1299,6 +1323,9 @@ function syncScope(d) {
   }
 
   scope.hasProxyFields = hasField(d, "probe_proxies") || hasField(d, "probe_proxy_count");
+  // 旧 .so 不报这个字段。那时轮换栏要禁用，而不是显示成空的 —— 空的会被当成
+  // 「我没填」，然后一保存就把池子清掉。
+  scope.hasRotField = hasField(d, "probe_proxies_rotating");
 
   if (scope.dirty) { return; }
 
@@ -1320,6 +1347,7 @@ function syncScope(d) {
   // —— 操作员明确要求改掉。status 现在直接回传原值，所以框里就是真值：没动过
   // 时 diff 为空，改一行也就只是改一行。
   scope.proxyText = strList(d.probe_proxies).join("\n");
+  scope.rotText = strList(d.probe_proxies_rotating).join("\n");
 }
 
 // 签名覆盖每一个会改变这块 DOM 的东西：清单、显示名、两个状态标、勾选、整体
@@ -1423,6 +1451,7 @@ function onScopeEdited() {
 }
 
 function renderScopeProxies() {
+  renderOneProxyBox("scopeRotating", "rotText", !scope.hasRotField);
   var ta = $("scopeProxies");
   // 明文，始终可写，不做掩码 —— 操作员明确要求过：掩码的代价是改一条代理就得
   // 把整个池子重打一遍。别再「顺手改进」成掩码，那是从头来过。
@@ -1430,6 +1459,16 @@ function renderScopeProxies() {
   // 正在输入时不要动它的值，否则光标会跳。输入事件已经把值同步进 scope 了。
   if (document.activeElement !== ta && ta.value !== scope.proxyText) {
     ta.value = scope.proxyText;
+  }
+}
+
+// 轮换栏走同一套规则：正在输入时不碰它的值，否则光标会跳。
+function renderOneProxyBox(id, field, readOnly) {
+  var ta = $(id);
+  if (!ta) { return; }
+  ta.readOnly = !!readOnly;
+  if (document.activeElement !== ta && ta.value !== scope[field]) {
+    ta.value = scope[field];
   }
 }
 
@@ -1483,9 +1522,17 @@ function renderProxyCheck() {
   // 池子条数多、出口地址少 = 好几条代理其实共用一个出口。探测把它们当成不同出口
   // 轮着试，实际上是同一个地址被连着打 —— 花了钱却没换到出口的典型形态，而这是
   // 页面上唯一能看出来的地方。
-  if (!d.direct && d.distinct_ips > 0 && d.distinct_ips < d.checked) {
+  if (d.mismatches) {
     box.appendChild(el("div", { cls: "pcsum warntext",
-      text: "注意：" + d.checked + " 条代理只落在 " + d.distinct_ips +
+      text: "有 " + d.mismatches + " 条放错了池子（见下面带 ⚠ 的行）。放在静态池里的轮换代理，" +
+            "每个桶 55 分钟只会被试一次，白白浪费掉它每次换 IP 的能力。" }));
+  }
+  // 只对静态池说这句。轮换池本来就该每次都不一样，拿它算「去重后几个出口」
+  // 只是在复述有几条轮换代理，没有信息量。
+  var staticN = Number(d.static_checked) || 0;
+  if (!d.direct && d.distinct_ips > 0 && staticN > 1 && d.distinct_ips < staticN) {
+    box.appendChild(el("div", { cls: "pcsum warntext",
+      text: "注意：静态池里 " + staticN + " 条只落在 " + d.distinct_ips +
             " 个出口地址上。地址相同的几条，对上游来说是同一个出口。" }));
   }
 
@@ -1495,6 +1542,7 @@ function renderProxyCheck() {
     var line = el("div", { cls: "pcline" });
     line.appendChild(el("span", { cls: "idx", text: "#" + r.index }));
     line.appendChild(el("span", { cls: "vd", text: PC_LABEL[r.verdict] || r.verdict }));
+    line.appendChild(el("span", { cls: "pool", text: r.pool === "rotating" ? "轮换" : "静态" }));
     var meta = [];
     if (r.status_code) { meta.push(String(r.status_code)); }
     meta.push((Number(r.ms) / 1000).toFixed(1) + "s");
@@ -1507,6 +1555,10 @@ function renderProxyCheck() {
     // 通的那些不再多解释一句：十八行「一切正常」会把真正出问题的两行淹掉。
     if (r.verdict !== "ok" && r.detail) {
       row.appendChild(el("div", { cls: "why", text: r.detail }));
+    }
+    // 声明错了是独立于连通性的一件事：一条完全「通」的代理照样可能放错池子。
+    if (r.mismatch) {
+      row.appendChild(el("div", { cls: "why bad", text: "⚠ " + r.mismatch }));
     }
     list.appendChild(row);
   });
@@ -1555,6 +1607,17 @@ function renderScopeMeta(d) {
     pText = "当前 .so 的 status 不返回代理信息";
   }
   pNote.appendChild(el("span", { text: pText }));
+
+  var rNote = $("scopeRotNote");
+  if (rNote) {
+    clear(rNote);
+    var rCount = (typeof d.probe_proxy_rotating_count === "number") ? d.probe_proxy_rotating_count : null;
+    rNote.appendChild(el("span", {
+      text: scope.hasRotField
+        ? ("明文显示可直接编辑" + (rCount === null ? "" : ("，插件里共 " + rCount + " 条")))
+        : "当前 .so 不支持轮换池 —— 换新版并重启 CPA 后可用"
+    }));
+  }
 
   var pHint = $("scopeProxyHint");
   clear(pHint);
@@ -1705,6 +1768,15 @@ function scopeDiff(d) {
 
   // 代理现在是明文回填的，所以判据就是最朴素的那个：和插件里的值逐行比。
   // 没动过 diff 就是空的，什么都不提交；动过就整段替换。
+  // 旧 .so 报不出轮换池：那种情况下【不提交】这一栏，否则会把它存成空的。
+  if (scope.hasRotField) {
+    var baseR = strList(d.probe_proxies_rotating);
+    var nextR = parseLines(scope.rotText);
+    if (!sameList(baseR, nextR)) {
+      patch.probe_proxies_rotating = nextR;
+    }
+  }
+
   var baseP = strList(d.probe_proxies);
   var nextP = parseLines(scope.proxyText);
   if (!sameList(baseP, nextP)) {
@@ -1727,7 +1799,7 @@ function doSaveScope() {
 
   // 框里现在是明文，所以带 *** 的行只可能是从旧版页面复制来的掩码。掩码是单向
   // 的，存回去会毁掉那条代理，而且毁得很隐蔽：配置看着还在，探测却连不出去。
-  var masked = parseLines(scope.proxyText).filter(looksMasked);
+  var masked = parseLines(scope.proxyText).concat(parseLines(scope.rotText)).filter(looksMasked);
   if (masked.length) {
     notify("err", "代理里有 " + masked.length + " 行带着 ***。那是旧版页面的掩码，不是真值，" +
       "推不回原值；存回去会把那条代理毁掉，而且毁得很隐蔽：配置看着还在，探测却连不出去。" +
@@ -1776,6 +1848,7 @@ function doSaveScope() {
       if (diff.patch.probe_accounts) { fields.push("accounts"); params.account = diff.patch.probe_accounts; }
       if (diff.patch.models) { fields.push("models"); params.model = diff.patch.models; }
       if (diff.patch.probe_proxies) { fields.push("proxies"); params.proxy = diff.patch.probe_proxies; }
+      if (diff.patch.probe_proxies_rotating) { fields.push("rotating"); params.rotating_proxy = diff.patch.probe_proxies_rotating; }
       params.fields = fields.join(",");
 
       return resAction("/ops/scope", params).then(function (r) {
@@ -2141,15 +2214,18 @@ function doProxyCheck() {
 // 追加而不是整段替换：池子有二十条的时候，加一条不该逼人滚到文本框末尾找位置。
 // 分隔符取空白和逗号 —— 这三种字符在代理 URL 里都必须转义成 %XX，所以按它们切
 // 分不会劈开一条合法的代理。重复的行直接跳过，顺序保持不变（顺序就是探测顺序）。
-function doAddProxy() {
-  var input = $("scopeProxyAdd");
+function doAddRotating() { addProxyLines("scopeRotAdd", "rotText"); }
+function doAddProxy() { addProxyLines("scopeProxyAdd", "proxyText"); }
+
+function addProxyLines(inputID, field) {
+  var input = $(inputID);
   if (!input) { return; }
   var candidates = String(input.value || "").split(/[\s,]+/)
     .map(function (s) { return s.trim(); })
     .filter(function (s) { return s; });
   if (!candidates.length) { notify("warn", "输入框是空的。"); return; }
 
-  var lines = parseLines(scope.proxyText);
+  var lines = parseLines(scope[field]);
   var seen = Object.create(null);
   lines.forEach(function (l) { seen[l] = true; });
   var added = 0;
@@ -2161,7 +2237,7 @@ function doAddProxy() {
   });
   if (!added) { notify("warn", "这几条清单里已经有了。"); return; }
 
-  scope.proxyText = lines.join("\n");
+  scope[field] = lines.join("\n");
   scope.dirty = true;
   input.value = "";
   renderScopeProxies();
@@ -2277,6 +2353,15 @@ $("scopeProxies").addEventListener("input", function () {
   scope.proxyText = $("scopeProxies").value;
   scope.dirty = true;
   renderScopeMeta(state.data || {});
+});
+$("scopeRotating").addEventListener("input", function () {
+  scope.rotText = $("scopeRotating").value;
+  scope.dirty = true;
+  renderScopeMeta(state.data || {});
+});
+$("btnAddRot").addEventListener("click", doAddRotating);
+$("scopeRotAdd").addEventListener("keydown", function (e) {
+  if (e.key === "Enter") { e.preventDefault(); doAddRotating(); }
 });
 
 (function boot() {

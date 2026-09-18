@@ -324,7 +324,7 @@ func resetProbeRunner(t *testing.T) {
 		// case's -- which shows up as "the transcript says nothing happened",
 		// not as an obvious cross-test leak.
 		probeCooldown.mu.Lock()
-		probeCooldown.last = make(map[string]time.Time)
+		probeCooldown.until = make(map[string]time.Time)
 		probeCooldown.mu.Unlock()
 		// Same reasoning for the account rest table: one case's 429 would
 		// otherwise silence every later case that touches that account.
@@ -718,7 +718,7 @@ func TestProbeAdvancesToNextExitOn312(t *testing.T) {
 	exitB := newFakeProxy(t, &hitsB)
 	cfg, cred, pool := harvestTestConfig(t)
 
-	if !probeHarvestBucket(context.Background(), cfg, pool, cred, probeTestModel, []string{exitA, exitB}, 0) {
+	if !probeHarvestBucket(context.Background(), cfg, pool, cred, probeTestModel, []string{exitA, exitB}, nil, 0) {
 		t.Fatal("probeHarvestBucket reported no upstream call at all")
 	}
 
@@ -748,14 +748,14 @@ func TestProbeStopsAfterWalkingThePoolAndCoolsDown(t *testing.T) {
 	exits := []string{exitA, exitB}
 	cfg, cred, pool := harvestTestConfig(t)
 
-	if !probeHarvestBucket(context.Background(), cfg, pool, cred, probeTestModel, exits, 0) {
+	if !probeHarvestBucket(context.Background(), cfg, pool, cred, probeTestModel, exits, nil, 0) {
 		t.Fatal("the first pass made no upstream call")
 	}
 	if got := upstream.count(); got != 2 {
 		t.Fatalf("first pass made %d upstream calls, want 2 (one per exit)", got)
 	}
 
-	if probeHarvestBucket(context.Background(), cfg, pool, cred, probeTestModel, exits, 0) {
+	if probeHarvestBucket(context.Background(), cfg, pool, cred, probeTestModel, exits, nil, 0) {
 		t.Fatal("a second pass inside the cooldown still fired; this is the runaway-retry defect")
 	}
 	if got := upstream.count(); got != 2 {
@@ -777,13 +777,13 @@ func TestProbeNewExitIsEligibleImmediately(t *testing.T) {
 	exitB := newFakeProxy(t, &hitsB)
 	cfg, cred, pool := harvestTestConfig(t)
 
-	probeHarvestBucket(context.Background(), cfg, pool, cred, probeTestModel, []string{exitA, exitB}, 0)
+	probeHarvestBucket(context.Background(), cfg, pool, cred, probeTestModel, []string{exitA, exitB}, nil, 0)
 	if upstream.count() != 2 {
 		t.Fatalf("setup: expected the pool to be walked once, got %d calls", upstream.count())
 	}
 
 	exitC := newFakeProxy(t, &hitsC)
-	if !probeHarvestBucket(context.Background(), cfg, pool, cred, probeTestModel, []string{exitA, exitB, exitC}, 0) {
+	if !probeHarvestBucket(context.Background(), cfg, pool, cred, probeTestModel, []string{exitA, exitB, exitC}, nil, 0) {
 		t.Fatal("adding an exit did not make the bucket fireable again")
 	}
 
@@ -818,7 +818,7 @@ func TestProbe429StopsTheWalkAndRestsTheAccount(t *testing.T) {
 	}
 	cfg, cred, pool := harvestTestConfig(t)
 
-	probeHarvestBucket(context.Background(), cfg, pool, cred, probeTestModel, exits, 0)
+	probeHarvestBucket(context.Background(), cfg, pool, cred, probeTestModel, exits, nil, 0)
 
 	if got := upstream.count(); got != 1 {
 		t.Fatalf("upstream calls = %d, want 1: a 429 must end the walk, not advance to the next exit", got)
@@ -828,7 +828,7 @@ func TestProbe429StopsTheWalkAndRestsTheAccount(t *testing.T) {
 	}
 
 	// And nothing of that account fires again while it is resting.
-	probeHarvestBucket(context.Background(), cfg, pool, cred, "another-model", exits, 0)
+	probeHarvestBucket(context.Background(), cfg, pool, cred, "another-model", exits, nil, 0)
 	if got := upstream.count(); got != 1 {
 		t.Fatalf("upstream calls grew to %d while the account was resting", got)
 	}
@@ -852,7 +852,7 @@ func TestProbeSerialisesOneAccountsBuckets(t *testing.T) {
 	}
 
 	probeFireBatch(context.Background(), cfg, pool, creds, targets,
-		map[string]int{cred.name: 0}, nil, false)
+		map[string]int{cred.name: 0}, nil, nil, false)
 
 	if got := upstream.count(); got != 3 {
 		t.Fatalf("upstream calls = %d, want 3 (one per bucket)", got)
@@ -883,7 +883,7 @@ func TestProbeFallsThroughToNextExitOnTransportFailure(t *testing.T) {
 	defer pool.closeIdle()
 
 	// Exit 0 is a closed port (instant connection refused); exit 1 is direct.
-	probeHarvestBucket(context.Background(), cfg, pool, cred, probeTestModel, []string{"http://127.0.0.1:1", ""}, 0)
+	probeHarvestBucket(context.Background(), cfg, pool, cred, probeTestModel, []string{"http://127.0.0.1:1", ""}, nil, 0)
 
 	if _, ok := storedBucket(probeTestAccount, probeTestModel); !ok {
 		t.Fatal("the bucket was not filled, so the fallback to the second exit did not happen")
@@ -950,3 +950,154 @@ func TestProbeRunNeverLeaksAProxyPassword(t *testing.T) {
 // is a strict superset of the cases this one held -- it additionally covers an
 // email in the final position and a name that is nothing but an email, which
 // are the two shapes that actually leak.
+
+// --- the rotating pool ----------------------------------------------------
+//
+// A rotating entry is not an exit, it is a gateway that hands out a different
+// address on every connection (measured 2026-09-19 against the operator's pool:
+// twenty consecutive requests, twenty distinct UK addresses). Everything below
+// pins the consequence: the retry the static rule forbids is the only thing that
+// can clear a 312 there, so the two pools cannot share one rule.
+
+// shrinkRotating lowers the rotating budget for one test. Production never
+// writes these; a test that spent the real ten attempts would be ten fake round
+// trips slower for nothing.
+func shrinkRotating(t *testing.T, attempts int, cooldown time.Duration) {
+	t.Helper()
+	prevAttempts, prevCooldown := probeRotatingAttempts, probeRotatingCooldown
+	probeRotatingAttempts, probeRotatingCooldown = attempts, cooldown
+	t.Cleanup(func() {
+		probeRotatingAttempts, probeRotatingCooldown = prevAttempts, prevCooldown
+	})
+}
+
+func TestProbeRotatingRetriesOneEntryForAFreshAddress(t *testing.T) {
+	// The defect the split exists to fix. With one entry in the pool the static
+	// rule allows exactly one call per 55 minutes, so a single 312 left the bucket
+	// empty for the rest of the window even though the very next connection
+	// through that same entry would have come from a different address.
+	resetProbeRunner(t)
+	upstream := newFakeUpstream(t)
+	upstream.tsLenSeq = []int{312, 312, 292} // the third address is not throttled
+	setUpstream(t, upstream.server.URL)
+	cfg, cred, pool := harvestTestConfig(t)
+	shrinkRotating(t, 5, time.Minute)
+
+	if !probeHarvestBucket(context.Background(), cfg, pool, cred, probeTestModel, nil, []string{""}, 0) {
+		t.Fatal("probeHarvestBucket reported no upstream call at all")
+	}
+	if _, ok := storedBucket(probeTestAccount, probeTestModel); !ok {
+		t.Fatal("bucket not filled: the rotating pool stopped at the first 312 instead of asking for another address")
+	}
+	if got := upstream.count(); got != 3 {
+		t.Fatalf("upstream calls = %d, want 3 (two throttled addresses, then one that was not)", got)
+	}
+}
+
+func TestProbeRotatingStopsAtItsBudgetAndRestsBriefly(t *testing.T) {
+	// The budget is real -- an account that answers 312 from every address must
+	// not be retried forever -- but the rest afterwards is the SHORT window, not
+	// the static one. Resting a rotating pool for 55 minutes after a failure is
+	// what left the operator's buckets empty for fifty minutes at a stretch.
+	resetProbeRunner(t)
+	upstream := newFakeUpstream(t)
+	upstream.tsLen = 312 // every address throttled
+	setUpstream(t, upstream.server.URL)
+	cfg, cred, pool := harvestTestConfig(t)
+	shrinkRotating(t, 4, time.Hour) // long enough to observe the rest
+
+	if !probeHarvestBucket(context.Background(), cfg, pool, cred, probeTestModel, nil, []string{""}, 0) {
+		t.Fatal("the first pass made no upstream call")
+	}
+	if got := upstream.count(); got != 4 {
+		t.Fatalf("first pass made %d calls, want 4 (the whole budget)", got)
+	}
+	if probeHarvestBucket(context.Background(), cfg, pool, cred, probeTestModel, nil, []string{""}, 0) {
+		t.Fatal("a second pass inside the rest window still fired")
+	}
+	if got := upstream.count(); got != 4 {
+		t.Fatalf("upstream calls = %d after the second pass, want 4 -- the rest window is not holding", got)
+	}
+
+	// And the rest really is the rotating window, not probeExitCooldown: the
+	// bucket must be eligible again once that shorter window passes.
+	shrinkRotating(t, 4, time.Nanosecond)
+	probeCooldownSet(probeRotatingExit, cred.name, probeTestModel, time.Now().Add(-time.Second))
+	if !probeHarvestBucket(context.Background(), cfg, pool, cred, probeTestModel, nil, []string{""}, 0) {
+		t.Fatal("the bucket never became eligible again after its rotating rest expired")
+	}
+}
+
+func TestProbeRotatingStopsOnAccountLimit(t *testing.T) {
+	// 429 is the credential being told to slow down. No address the gateway can
+	// hand out changes that, so the remaining budget must not be spent -- this is
+	// the same distinction between 312 and 429 the static path makes.
+	resetProbeRunner(t)
+	upstream := newFakeUpstream(t)
+	upstream.status = http.StatusTooManyRequests
+	setUpstream(t, upstream.server.URL)
+	cfg, cred, pool := harvestTestConfig(t)
+	shrinkRotating(t, 6, time.Minute)
+
+	probeHarvestBucket(context.Background(), cfg, pool, cred, probeTestModel, nil, []string{""}, 0)
+
+	if got := upstream.count(); got != 1 {
+		t.Fatalf("upstream calls = %d, want 1 -- a 429 must end the rotating attempt, not burn the budget", got)
+	}
+	if probeAccountReady(cred.name, time.Now()) {
+		t.Fatal("the account was not rested after a 429")
+	}
+}
+
+func TestProbeRotatingPoolSuppressesTheImplicitDirectExit(t *testing.T) {
+	// An empty probe_proxies has always meant "go out over the box's own egress".
+	// Once the operator moves their whole pool to the rotating list, that default
+	// would quietly send harvests from the server's own address -- the one thing
+	// they are paying a proxy to avoid. The rotating pool must suppress it.
+	resetProbeRunner(t)
+	upstream := newFakeUpstream(t)
+	upstream.tsLen = 292
+	setUpstream(t, upstream.server.URL)
+	cfg, cred, pool := harvestTestConfig(t)
+	shrinkRotating(t, 1, time.Minute)
+
+	var hits atomic.Int64
+	rotatingExit := newFakeProxy(t, &hits)
+
+	probeHarvestBucket(context.Background(), cfg, pool, cred, probeTestModel, nil, []string{rotatingExit}, 0)
+
+	if got := upstream.count(); got != 1 {
+		t.Fatalf("upstream calls = %d, want exactly 1 -- an extra call means the direct exit fired too", got)
+	}
+	if hits.Load() != 1 {
+		t.Fatalf("the rotating exit carried %d request(s), want 1; the harvest went out direct instead", hits.Load())
+	}
+}
+
+func TestProbeStaticPoolIsTriedBeforeRotating(t *testing.T) {
+	// Static budgets perish -- one call per exit per window, unused or not --
+	// while a rotating entry can be tapped at any time. So the perishable
+	// resource goes first.
+	resetProbeRunner(t)
+	upstream := newFakeUpstream(t)
+	upstream.tsLenSeq = []int{312, 292} // the static exit is throttled, rotating is not
+	setUpstream(t, upstream.server.URL)
+	cfg, cred, pool := harvestTestConfig(t)
+	shrinkRotating(t, 3, time.Minute)
+
+	var staticHits, rotatingHits atomic.Int64
+	staticExit := newFakeProxy(t, &staticHits)
+	rotatingExit := newFakeProxy(t, &rotatingHits)
+
+	if !probeHarvestBucket(context.Background(), cfg, pool, cred, probeTestModel,
+		[]string{staticExit}, []string{rotatingExit}, 0) {
+		t.Fatal("no upstream call was made")
+	}
+	if _, ok := storedBucket(probeTestAccount, probeTestModel); !ok {
+		t.Fatal("bucket not filled although the rotating pool had a good address")
+	}
+	if staticHits.Load() != 1 || rotatingHits.Load() != 1 {
+		t.Fatalf("static=%d rotating=%d, want 1 each -- the static exit must be spent first",
+			staticHits.Load(), rotatingHits.Load())
+	}
+}

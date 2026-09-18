@@ -924,6 +924,9 @@ type statusResponse struct {
 	// ProbeProxies is plaintext, at the operator's explicit instruction. See
 	// above.
 	ProbeProxies []string `json:"probe_proxies"`
+	// Same plaintext rule as ProbeProxies above, for the same reason.
+	ProbeProxyRotatingCount int      `json:"probe_proxy_rotating_count"`
+	ProbeProxiesRotating    []string `json:"probe_proxies_rotating"`
 	// ConfigErrors lists probe-scope entries that were rejected at configure
 	// time. They are not fatal, which is exactly why they need to be visible:
 	// the scope silently covers less than whoever edited it believes.
@@ -977,7 +980,10 @@ func handleStatus() pluginapi.ManagementResponse {
 		// without having to count a list it may be rendering lazily.
 		ProbeProxyCount: len(cfg.ProbeProxies),
 		ProbeProxies:    append([]string(nil), cfg.ProbeProxies...),
-		ConfigErrors:    configErrors,
+
+		ProbeProxyRotatingCount: len(cfg.ProbeProxiesRotating),
+		ProbeProxiesRotating:    append([]string(nil), cfg.ProbeProxiesRotating...),
+		ConfigErrors:            configErrors,
 		// Taken outside state.mu on purpose: the runner keeps its own lock, and
 		// reaching for it while holding this one is how two locks become a
 		// deadlock. Nothing above needs the two views to be consistent with each
@@ -994,6 +1000,9 @@ func handleStatus() pluginapi.ManagementResponse {
 	// null would render as the string "null" in the textarea.
 	if out.ProbeProxies == nil {
 		out.ProbeProxies = []string{}
+	}
+	if out.ProbeProxiesRotating == nil {
+		out.ProbeProxiesRotating = []string{}
 	}
 
 	records, errScan := scanStoreRecords(cfg.StoreDir)
@@ -1190,6 +1199,8 @@ type scopeSaveResponse struct {
 	Models             []string `json:"models"`
 	ProbeProxyCount    int      `json:"probe_proxy_count"`
 	ProbeProxiesMasked []string `json:"probe_proxies_masked"`
+	RotatingCount      int      `json:"probe_proxy_rotating_count"`
+	RotatingMasked     []string `json:"probe_proxies_rotating_masked"`
 	TargetsTotal       int      `json:"targets_total"`
 	ConfigErrors       []string `json:"config_errors,omitempty"`
 	Note               string   `json:"note"`
@@ -1217,15 +1228,15 @@ func handleScopeSave(q url.Values) pluginapi.ManagementResponse {
 	}
 	if len(requested) == 0 {
 		return managementError(http.StatusBadRequest,
-			`"fields" is required: name which lists to replace, e.g. fields=accounts,models,proxies. `+
+			`"fields" is required: name which lists to replace, e.g. fields=accounts,models,proxies,rotating. `+
 				`Without it an empty query would be indistinguishable from "clear everything".`)
 	}
 	for name := range requested {
 		switch name {
-		case "accounts", "models", "proxies":
+		case "accounts", "models", "proxies", "rotating":
 		default:
 			return managementError(http.StatusBadRequest,
-				"unknown field "+name+"; expected accounts, models or proxies")
+				"unknown field "+name+"; expected accounts, models, proxies or rotating")
 		}
 	}
 
@@ -1239,6 +1250,7 @@ func handleScopeSave(q url.Values) pluginapi.ManagementResponse {
 	}
 
 	accounts, models, proxies := cfg.ProbeAccounts, cfg.Models, cfg.ProbeProxies
+	rotating := cfg.ProbeProxiesRotating
 	if requested["accounts"] {
 		accounts = q["account"]
 	}
@@ -1248,13 +1260,17 @@ func handleScopeSave(q url.Values) pluginapi.ManagementResponse {
 	if requested["proxies"] {
 		proxies = q["proxy"]
 	}
+	if requested["rotating"] {
+		rotating = q["rotating_proxy"]
+	}
 
-	accounts, models, proxies, problems := normaliseProbeScope(accounts, models, proxies)
+	accounts, models, proxies, rotating, problems := normaliseProbeScope(accounts, models, proxies, rotating)
 
 	scope := probeScope{
 		Accounts:  accounts,
 		Models:    models,
 		Proxies:   proxies,
+		Rotating:  rotating,
 		UpdatedAt: time.Now().UTC().Format(time.RFC3339),
 	}
 	if errWrite := writeProbeScope(cfg.StoreDir, scope); errWrite != nil {
@@ -1270,11 +1286,12 @@ func handleScopeSave(q url.Values) pluginapi.ManagementResponse {
 	state.config.ProbeAccounts = accounts
 	state.config.Models = models
 	state.config.ProbeProxies = proxies
+	state.config.ProbeProxiesRotating = rotating
 	state.configErrors = problems
 	state.mu.Unlock()
 
-	log.Printf(logPrefix+"probe scope saved: accounts=%d models=%d proxies=%d (fields=%s)",
-		len(accounts), len(models), len(proxies), q.Get("fields"))
+	log.Printf(logPrefix+"probe scope saved: accounts=%d models=%d proxies=%d rotating=%d (fields=%s)",
+		len(accounts), len(models), len(proxies), len(rotating), q.Get("fields"))
 	for _, problem := range problems {
 		log.Printf(logPrefix+"config error (probe scope, not fatal): %s", problem)
 	}
@@ -1286,6 +1303,8 @@ func handleScopeSave(q url.Values) pluginapi.ManagementResponse {
 		Models:             models,
 		ProbeProxyCount:    len(proxies),
 		ProbeProxiesMasked: maskProxyURLs(proxies),
+		RotatingCount:      len(rotating),
+		RotatingMasked:     maskProxyURLs(rotating),
 		TargetsTotal:       len(accounts) * len(models),
 		ConfigErrors:       problems,
 		Note: "已保存到插件自己的 scope 文件，立即生效，覆盖 config.yaml 里的同名项。" +

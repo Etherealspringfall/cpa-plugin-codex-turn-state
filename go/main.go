@@ -313,6 +313,20 @@ type pluginConfig struct {
 	// them goes through maskProxyURL; the status document now reports them in the
 	// clear at the operator's explicit instruction (see statusResponse).
 	ProbeProxies []string `yaml:"probe_proxies"`
+	// ProbeProxiesRotating is the same idea for exits whose address changes on
+	// every connection -- a residential gateway rather than a fixed IP.
+	//
+	// They are a separate list because they are a different resource, not a
+	// different flavour of the same one. A static exit is one IP with one
+	// once-per-window budget, so re-dialing it after a 312 is pointless. A
+	// rotating entry hands out a fresh address per request, so re-dialing it is
+	// the ONLY thing that can clear a 312 -- measured 2026-09-19: twenty
+	// consecutive requests through one entry, twenty distinct UK addresses. Held
+	// in one list, whichever rule is applied is wrong for half the pool.
+	//
+	// Same secrecy rule as ProbeProxies: masked in every log line, served in the
+	// clear on the status document at the operator's instruction.
+	ProbeProxiesRotating []string `yaml:"probe_proxies_rotating"`
 	// The two fields below exist for one reason: so the dashboard can run a probe
 	// without the operator ever typing a key. That was the requirement, not a
 	// convenience -- a run needs a bearer for the management calls, and prompting
@@ -454,7 +468,7 @@ var proxySchemes = map[string]bool{"http": true, "https": true, "socks5": true, 
 // nothing. But the complaint is carried out so the operator learns which entry
 // went and why -- a scope that quietly shrinks is how a probe run "completes"
 // while covering less than the operator believes.
-func normaliseProbeScope(accounts, models, proxies []string) ([]string, []string, []string, []string) {
+func normaliseProbeScope(accounts, models, proxies, rotating []string) ([]string, []string, []string, []string, []string) {
 	var problems []string
 
 	cleanAccounts := make([]string, 0, len(accounts))
@@ -490,7 +504,24 @@ func normaliseProbeScope(accounts, models, proxies []string) ([]string, []string
 		cleanModels = append(cleanModels, name)
 	}
 
-	cleanProxies := make([]string, 0, len(proxies))
+	cleanProxies, proxyProblems := normaliseProxyList(proxies, "probe_proxies")
+	problems = append(problems, proxyProblems...)
+	cleanRotating, rotatingProblems := normaliseProxyList(rotating, "probe_proxies_rotating")
+	problems = append(problems, rotatingProblems...)
+
+	return cleanAccounts, cleanModels, cleanProxies, cleanRotating, problems
+}
+
+// normaliseProxyList validates one pool. Both pools get identical treatment --
+// they differ in how the prober SPENDS them, never in what counts as a valid
+// entry -- so they share this rather than keeping two copies that could drift on
+// which schemes are accepted.
+//
+// field names the list in every complaint, because "unsupported scheme" is
+// useless to an operator looking at two textareas.
+func normaliseProxyList(proxies []string, field string) ([]string, []string) {
+	var problems []string
+	clean := make([]string, 0, len(proxies))
 	for index, raw := range proxies {
 		candidate := strings.TrimSpace(raw)
 		if candidate == "" {
@@ -502,16 +533,15 @@ func normaliseProbeScope(accounts, models, proxies []string) ([]string, []string
 			// Reported by its position in the configured list, never by value:
 			// an entry too malformed to parse is the one most likely to be a
 			// mistyped password, and the index is enough to find it.
-			problems = append(problems, fmt.Sprintf("probe_proxies[%d]: not a valid URL", index))
+			problems = append(problems, fmt.Sprintf("%s[%d]: not a valid URL", field, index))
 			continue
 		case !proxySchemes[strings.ToLower(parsed.Scheme)]:
-			problems = append(problems, fmt.Sprintf("probe_proxies: unsupported scheme %q in %s (want http, https, socks5 or socks5h)", parsed.Scheme, maskProxyURL(candidate)))
+			problems = append(problems, fmt.Sprintf("%s: unsupported scheme %q in %s (want http, https, socks5 or socks5h)", field, parsed.Scheme, maskProxyURL(candidate)))
 			continue
 		}
-		cleanProxies = append(cleanProxies, candidate)
+		clean = append(clean, candidate)
 	}
-
-	return cleanAccounts, cleanModels, cleanProxies, problems
+	return clean, problems
 }
 
 type envelope struct {
@@ -757,8 +787,8 @@ func configure(raw []byte) error {
 	// must not stop the business role from registering. The complaints ride out
 	// on the status page instead.
 	var scopeProblems []string
-	cfg.ProbeAccounts, cfg.Models, cfg.ProbeProxies, scopeProblems =
-		normaliseProbeScope(cfg.ProbeAccounts, cfg.Models, cfg.ProbeProxies)
+	cfg.ProbeAccounts, cfg.Models, cfg.ProbeProxies, cfg.ProbeProxiesRotating, scopeProblems =
+		normaliseProbeScope(cfg.ProbeAccounts, cfg.Models, cfg.ProbeProxies, cfg.ProbeProxiesRotating)
 
 	// A saved scope overrides config.yaml outright. The dashboard is the editing
 	// surface now, so the alternative -- config.yaml quietly winning -- would
@@ -774,8 +804,8 @@ func configure(raw []byte) error {
 			"probe scope file unreadable, falling back to config.yaml: "+errScope.Error())
 	} else if saved != nil {
 		var savedProblems []string
-		cfg.ProbeAccounts, cfg.Models, cfg.ProbeProxies, savedProblems =
-			normaliseProbeScope(saved.Accounts, saved.Models, saved.Proxies)
+		cfg.ProbeAccounts, cfg.Models, cfg.ProbeProxies, cfg.ProbeProxiesRotating, savedProblems =
+			normaliseProbeScope(saved.Accounts, saved.Models, saved.Proxies, saved.Rotating)
 		scopeProblems = append(scopeProblems, savedProblems...)
 		scopeSource = scopeFileName + " (saved " + saved.UpdatedAt + ")"
 	}
@@ -804,9 +834,9 @@ func configure(raw []byte) error {
 	// The probe key gets less than that: set or unset, via secretPresence.
 	// probe_base_url is not a secret and is printed, because "the probe cannot
 	// reach CPA" is diagnosed from exactly that value.
-	log.Printf(logPrefix+"configured role=%s store_dir=%q template_length=%d replace_length=%d ttl_seconds=%d dry_run=%t inject_mode=%s harvest_inband=%t models=%d probe_accounts=%d probe_proxies=%d probe_base_url=%q probe_management_key=%s scope_from=%s (%s)",
+	log.Printf(logPrefix+"configured role=%s store_dir=%q template_length=%d replace_length=%d ttl_seconds=%d dry_run=%t inject_mode=%s harvest_inband=%t models=%d probe_accounts=%d probe_proxies=%d probe_proxies_rotating=%d probe_base_url=%q probe_management_key=%s scope_from=%s (%s)",
 		cfg.Role, cfg.StoreDir, cfg.TemplateLength, cfg.ReplaceLength, cfg.TTLSeconds, cfg.DryRun, cfg.InjectMode, cfg.HarvestInband,
-		len(cfg.Models), len(cfg.ProbeAccounts), len(cfg.ProbeProxies), cfg.ProbeBaseURL,
+		len(cfg.Models), len(cfg.ProbeAccounts), len(cfg.ProbeProxies), len(cfg.ProbeProxiesRotating), cfg.ProbeBaseURL,
 		secretPresence(cfg.ProbeManagementKey), scopeSource, templates)
 	for _, problem := range scopeProblems {
 		// One line each, and loud: a dropped scope entry means the next probe run
@@ -971,6 +1001,11 @@ func pluginRegistration() registration {
 					Name:        "probe_proxies",
 					Type:        pluginapi.ConfigFieldTypeArray,
 					Description: "Ordered exits the probe tries per bucket, applied to the probed account's own proxy_url. PROBE SCOPE ONLY; never read by the business path. May contain credentials, so it is masked in every log line; the status document shows it in the clear at the operator's explicit request.",
+				},
+				{
+					Name:        "probe_proxies_rotating",
+					Type:        pluginapi.ConfigFieldTypeArray,
+					Description: "Exits whose address changes on every connection (a residential gateway). PROBE SCOPE ONLY; never read by the business path. Separate from probe_proxies because a rotating entry is re-dialed on a 312 -- the next request is a different address -- while a static one is not. Masked in every log line.",
 				},
 				{
 					Name:        "probe_management_key",
@@ -1832,9 +1867,12 @@ const scopeFileName = "probe-scope.json"
 // probe run covers and which exits it tries. None of it is read by the business
 // path.
 type probeScope struct {
-	Accounts  []string `json:"probe_accounts"`
-	Models    []string `json:"models"`
-	Proxies   []string `json:"probe_proxies"`
+	Accounts []string `json:"probe_accounts"`
+	Models   []string `json:"models"`
+	Proxies  []string `json:"probe_proxies"`
+	// Absent in files written before the pools were split, which decodes to nil
+	// and is exactly right: everything saved back then was a static exit.
+	Rotating  []string `json:"probe_proxies_rotating,omitempty"`
 	UpdatedAt string   `json:"updated_at"`
 }
 

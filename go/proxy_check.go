@@ -94,6 +94,11 @@ const (
 // the first to the proxy vendor, the second to the exit's reputation -- and
 // collapsing them into "failed" is what makes a pool look mysteriously broken.
 const (
+	// Which list an entry came from. These are the wire values the dashboard
+	// keys its labels on.
+	proxyPoolStatic   = "static"
+	proxyPoolRotating = "rotating"
+
 	proxyVerdictOK          = "ok"
 	proxyVerdictBlocked     = "blocked"
 	proxyVerdictRateLimited = "ratelimited"
@@ -102,12 +107,24 @@ const (
 )
 
 type proxyCheckResult struct {
-	// Index is 1-based and matches the exit's position in probe_proxies, which is
-	// also the order the probe tries them in. It is the only stable handle the
+	// Index is 1-based and matches the exit's position within its own pool, which
+	// is also the order the probe tries them in. It is the only stable handle the
 	// page has: a pool of twenty credentials on one gateway masks to twenty
 	// identical strings, so the position is what tells them apart.
-	Index      int    `json:"index"`
-	Proxy      string `json:"proxy"`
+	Index int    `json:"index"`
+	Pool  string `json:"pool"`
+	Proxy string `json:"proxy"`
+	// Rotated reports that two samples of this entry came back with different
+	// addresses. Mismatch is set only when that DISPROVES the declaration.
+	//
+	// The evidence is deliberately one-directional. Two different addresses prove
+	// an entry declared static is really rotating -- no fixed exit can do that.
+	// Two identical addresses prove nothing about an entry declared rotating: a
+	// small pool repeats by chance, and a gateway may hold an address for a few
+	// seconds. So only the provable direction is ever flagged; the other would be
+	// a false alarm telling the operator to undo a correct configuration.
+	Rotated    bool   `json:"rotated"`
+	Mismatch   string `json:"mismatch,omitempty"`
 	Verdict    string `json:"verdict"`
 	StatusCode int    `json:"status_code,omitempty"`
 	MS         int64  `json:"ms"`
@@ -118,17 +135,24 @@ type proxyCheckResult struct {
 }
 
 type proxyCheckResponse struct {
-	Checked     int                `json:"checked"`
-	OK          int                `json:"ok"`
-	Blocked     int                `json:"blocked"`
-	Dead        int                `json:"dead"`
-	Other       int                `json:"other"`
-	DistinctIPs int                `json:"distinct_ips"`
-	MS          int64              `json:"ms"`
-	TimedOut    bool               `json:"timed_out,omitempty"`
-	Direct      bool               `json:"direct,omitempty"`
-	Note        string             `json:"note,omitempty"`
-	Results     []proxyCheckResult `json:"results"`
+	Checked    int `json:"checked"`
+	OK         int `json:"ok"`
+	Blocked    int `json:"blocked"`
+	Dead       int `json:"dead"`
+	Other      int `json:"other"`
+	Mismatches int `json:"mismatches"`
+	// DistinctIPs counts addresses across the STATIC pool only. Counting rotating
+	// entries here would be meaningless -- they are supposed to differ every time,
+	// so the number would just restate how many rotating entries there are. The
+	// figure exists to answer one question, "are several static entries secretly
+	// the same exit", and that question does not apply to a gateway.
+	StaticChecked int                `json:"static_checked"`
+	DistinctIPs   int                `json:"distinct_ips"`
+	MS            int64              `json:"ms"`
+	TimedOut      bool               `json:"timed_out,omitempty"`
+	Direct        bool               `json:"direct,omitempty"`
+	Note          string             `json:"note,omitempty"`
+	Results       []proxyCheckResult `json:"results"`
 }
 
 // runProxyCheck tests every configured exit and reports one row each.
@@ -143,21 +167,36 @@ func runProxyCheck() pluginapi.ManagementResponse {
 	cfg := state.config
 	state.mu.Unlock()
 
-	proxies := append([]string(nil), cfg.ProbeProxies...)
 	model := proxyCheckFallbackModel
 	if len(cfg.Models) > 0 {
 		model = cfg.Models[0]
 	}
 
+	// One flat list carrying which pool each entry came from, so the whole batch
+	// still runs through a single bounded worker set.
+	type target struct {
+		pool  string
+		index int
+		url   string
+	}
+	var targets []target
+	for i, raw := range cfg.ProbeProxies {
+		targets = append(targets, target{pool: proxyPoolStatic, index: i + 1, url: raw})
+	}
+	for i, raw := range cfg.ProbeProxiesRotating {
+		targets = append(targets, target{pool: proxyPoolRotating, index: i + 1, url: raw})
+	}
+
 	out := proxyCheckResponse{Results: []proxyCheckResult{}}
-	if len(proxies) == 0 {
-		// An empty pool is a real configuration, not an error: probeExits turns it
-		// into a single direct attempt, so that is exactly what gets checked here.
-		// Answering "nothing to check" would be wrong about the thing the probe
-		// will actually do.
-		proxies = []string{""}
+	if len(targets) == 0 {
+		// Both pools empty is a real configuration, not an error: probeHarvestBucket
+		// turns it into a single direct attempt, so that is exactly what gets checked
+		// here. Answering "nothing to check" would be wrong about what the probe will
+		// actually do. Note this is only true when BOTH are empty -- a rotating pool
+		// with no static entries does NOT fall back to direct, and neither does this.
+		targets = append(targets, target{pool: proxyPoolStatic, index: 1, url: ""})
 		out.Direct = true
-		out.Note = "代理池是空的 —— 探测会走本机直连，所以这里测的就是直连出口。"
+		out.Note = "两个代理池都是空的 —— 探测会走本机直连，所以这里测的就是直连出口。"
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), proxyCheckBudget)
@@ -169,20 +208,20 @@ func runProxyCheck() pluginapi.ManagementResponse {
 	pool := newProbeClientPool()
 	defer pool.closeIdle()
 
-	results := make([]proxyCheckResult, len(proxies))
+	results := make([]proxyCheckResult, len(targets))
 	gate := make(chan struct{}, proxyCheckParallel)
 	var wg sync.WaitGroup
 	started := time.Now()
-	for index, raw := range proxies {
+	for slot, tgt := range targets {
 		wg.Add(1)
 		// Each goroutine writes its own element of a slice that is never resized,
 		// so the results need no mutex.
-		go func(slot int, exit string) {
+		go func(slot int, t target) {
 			defer wg.Done()
 			gate <- struct{}{}
 			defer func() { <-gate }()
-			results[slot] = proxyCheckOne(ctx, pool, slot+1, exit, model)
-		}(index, raw)
+			results[slot] = proxyCheckOne(ctx, pool, t.pool, t.index, t.url, model)
+		}(slot, tgt)
 	}
 	wg.Wait()
 
@@ -203,16 +242,22 @@ func runProxyCheck() pluginapi.ManagementResponse {
 		default:
 			out.Other++
 		}
-		if row.ExitIP != "" {
-			seen[row.ExitIP] = true
+		if row.Mismatch != "" {
+			out.Mismatches++
+		}
+		if row.Pool == proxyPoolStatic {
+			out.StaticChecked++
+			if row.ExitIP != "" {
+				seen[row.ExitIP] = true
+			}
 		}
 	}
 	out.DistinctIPs = len(seen)
 
 	// Counts only. The exits themselves are masked in the response and still have
 	// no business in a log line, which gets copied into tickets and chat windows.
-	log.Printf(logPrefix+"proxy check: %d exit(s) -> %d ok, %d refused, %d unreachable, %d other; %d distinct address(es) in %dms",
-		out.Checked, out.OK, out.Blocked, out.Dead, out.Other, out.DistinctIPs, out.MS)
+	log.Printf(logPrefix+"proxy check: %d entr(ies) -> %d ok, %d refused, %d unreachable, %d other; %d misdeclared; %d distinct static address(es) in %dms",
+		out.Checked, out.OK, out.Blocked, out.Dead, out.Other, out.Mismatches, out.DistinctIPs, out.MS)
 
 	return jsonResponse(http.StatusOK, out)
 }
@@ -221,8 +266,8 @@ func runProxyCheck() pluginapi.ManagementResponse {
 // that a dead exit is reported with whatever the trace managed to learn, and so
 // the timing attributed to the exit measures the request that decides the
 // verdict rather than both.
-func proxyCheckOne(ctx context.Context, pool *probeClientPool, index int, raw, model string) proxyCheckResult {
-	out := proxyCheckResult{Index: index, Proxy: probeShowProxy(raw), Verdict: proxyVerdictDead}
+func proxyCheckOne(ctx context.Context, pool *probeClientPool, poolName string, index int, raw, model string) proxyCheckResult {
+	out := proxyCheckResult{Index: index, Pool: poolName, Proxy: probeShowProxy(raw), Verdict: proxyVerdictDead}
 
 	client, errClient := pool.get(raw)
 	if errClient != nil {
@@ -232,8 +277,18 @@ func proxyCheckOne(ctx context.Context, pool *probeClientPool, index int, raw, m
 		return out
 	}
 
+	// Two samples, so the declared pool can be checked against what the entry
+	// actually does. Both are best-effort; a trace outage costs the address and
+	// the verification, never the verdict.
 	if trace := proxyCheckTrace(ctx, client); trace != nil {
 		out.ExitIP, out.Country, out.Colo = trace["ip"], trace["loc"], trace["colo"]
+		if second := proxyCheckTrace(ctx, client); second != nil && second["ip"] != "" && out.ExitIP != "" {
+			out.Rotated = second["ip"] != out.ExitIP
+		}
+	}
+	// Only the direction that is actually proof. See proxyCheckResult.Rotated.
+	if out.Rotated && poolName == proxyPoolStatic && raw != "" {
+		out.Mismatch = "这条在静态池里，但两次采样给了不同地址 —— 它其实是轮换的，应该移到轮换池。"
 	}
 
 	started := time.Now()
