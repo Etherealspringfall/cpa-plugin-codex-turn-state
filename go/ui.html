@@ -1,4 +1,5 @@
 <!DOCTYPE html>
+
 <!--
   codex-turn-state 看板。
 
@@ -42,10 +43,10 @@
 -->
 <html lang="zh-CN">
 <head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<meta name="robots" content="noindex, nofollow">
-<title>codex-turn-state</title>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1" name="viewport"/>
+<meta content="noindex, nofollow" name="robots"/>
+<title>Codex Turn-State · 状态管理控制台</title>
 <style>
 :root {
   --bg: #ffffff;
@@ -362,189 +363,800 @@ select {
 #modal .acts { display: flex; gap: 8px; justify-content: flex-end; margin-top: 16px; }
 [hidden] { display: none !important; }
 </style>
-</head>
+<style>/* Dashboard presentation. Original state/error classes remain supported. */
+:root {
+  --bg:#fff;
+  --fg:#28302a;
+  --muted:#707a70;
+  --faint:#899285;
+  --border:#e3e7e1;
+  --card:#f7f8f5;
+  --raised:#fff;
+  --ok:#3e654d;
+  --ok-bg:#edf4ee;
+  --warn:#947536;
+  --warn-bg:#faf4e7;
+  --bad:#b35449;
+  --bad-bg:#fcf0ee;
+  --accent:#3b523a;
+  --accent-bg:#edf2e9
+}
+body {
+  padding:32px 44px;
+  font-size:14px;
+  line-height:1.6
+}
+.wrap {
+  max-width:1320px
+}
+h1 {
+  font-size:28px;
+  line-height:1.3;
+  letter-spacing:-.5px;
+  font-weight:650
+}
+h2 {
+  font-size:15px;
+  color:var(--fg);
+  margin:0;
+  letter-spacing:0;
+  text-transform:none
+}
+h3 {
+  font-size:13px;
+  margin:0;
+  font-weight:600
+}
+.dashboard-header {
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  gap:24px
+}
+.eyebrow {
+  font-size:10px;
+  font-weight:650;
+  letter-spacing:1.6px;
+  color:var(--muted);
+  margin-bottom:8px
+}
+.subtitle {
+  font-size:12px;
+  color:var(--muted);
+  margin:8px 0 0
+}
+.header-status,#headerRefresh {
+  display:flex;
+  align-items:center;
+  gap:16px
+}
+.header-status {
+  min-width:0
+}
+.freshness {
+  max-width:320px;
+  overflow-wrap:anywhere;
+  font-size:11px
+}
+.status-pill {
+  display:inline-block;
+  border-radius:4px;
+  padding:4px 9px;
+  background:var(--card);
+  font-size:11px;
+  white-space:nowrap
+}
+.status-pill.is-ok {
+  color:var(--ok);
+  background:var(--ok-bg)
+}
+.dashboard-tabs {
+  display:flex;
+  gap:30px;
+  border-bottom:1px solid var(--border);
+  margin:30px 0 24px
+}
+.tab {
+  display:flex;
+  gap:8px;
+  align-items:center;
+  background:none;
+  border:0;
+  border-bottom:2px solid transparent;
+  color:var(--muted);
+  padding:13px 0;
+  font:inherit;
+  font-size:13px;
+  cursor:pointer
+}
+.tab[aria-selected=true] {
+  color:var(--fg);
+  border-bottom-color:var(--accent);
+  font-weight:600
+}
+.tab:hover {
+  color:var(--fg)
+}
+.tab svg {
+  width:16px;
+  height:16px;
+  fill:none;
+  stroke:currentColor;
+  stroke-width:1.5
+}
+button:focus-visible,input:focus-visible,textarea:focus-visible,select:focus-visible,summary:focus-visible {
+  outline:2px solid var(--accent);
+  outline-offset:3px
+}
+.overview-stats {
+  display:grid;
+  grid-template-columns:repeat(4,minmax(0,1fr));
+  border:1px solid var(--border);
+  border-radius:10px;
+  padding:23px 0;
+  margin-bottom:24px
+}
+.overview-stat {
+  padding:0 24px;
+  border-right:1px solid var(--border)
+}
+.overview-stat:last-child {
+  border:0
+}
+.stat-label {
+  color:var(--muted);
+  font-size:12px;
+  margin-bottom:7px
+}
+.stat-value {
+  font-size:28px;
+  font-weight:620;
+  line-height:1.3;
+  letter-spacing:-.6px
+}
+.stat-value.text {
+  font-size:21px
+}
+.stat-note {
+  font-size:11px;
+  color:var(--muted);
+  margin-top:7px;
+  overflow-wrap:anywhere
+}
+.panel-card {
+  border:1px solid var(--border);
+  border-radius:10px;
+  margin-bottom:22px;
+  overflow:hidden;
+  background:var(--raised)
+}
+.panel-head {
+  padding:22px 24px;
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  gap:20px
+}
+.panel-title {
+  display:flex;
+  align-items:center;
+  gap:12px
+}
+.title-rule {
+  width:60px;
+  height:1px;
+  background:var(--border)
+}
+.panel-head .hint {
+  margin:0
+}
+.panel-content {
+  padding:0 24px 24px
+}
+.summary {
+  padding:0 24px 14px;
+  margin:0;
+  font-size:11px;
+  line-height:1.9
+}
+.summary b {
+  font-size:12px
+}
+table {
+  font-size:12px
+}
+th,td {
+  border:0;
+  border-bottom:1px solid var(--border);
+  padding:18px 22px
+}
+th {
+  background:var(--card);
+  border-top:1px solid var(--border);
+  font-weight:500;
+  color:var(--muted);
+  padding:12px 22px
+}
+th.model {
+  text-align:left;
+  font-family:inherit;
+  font-size:12px
+}
+tbody tr:last-child td {
+  border-bottom:0
+}
+td.acct {
+  max-width:270px;
+  font-size:12px;
+  color:var(--fg)
+}
+td.cell {
+  text-align:left;
+  min-width:154px;
+  padding:0 22px;
+  height:83px
+}
+td.cell>button:not(.cellprobe) {
+  height:auto;
+  min-height:63px;
+  padding:12px 0;
+  text-align:left;
+  font-family:inherit;
+  font-size:12px;
+  background:transparent
+}
+td.cell .st-ok {
+  color:var(--ok)
+}
+td.cell .st-warn {
+  color:var(--warn)
+}
+td.cell .st-miss {
+  color:var(--faint)
+}
+td.cell button:hover {
+  outline:0;
+  text-decoration:underline
+}
+td.cell button:focus-visible {
+  outline:2px solid var(--accent)
+}
+.ttl-track {
+  display:block;
+  width:116px;
+  max-width:100%;
+  height:3px;
+  background:var(--border);
+  margin-top:9px;
+  border-radius:2px;
+  overflow:hidden
+}
+.ttl-track i {
+  display:block;
+  height:100%;
+  background:var(--ok);
+  border-radius:2px
+}
+.st-warn .ttl-track i {
+  background:var(--warn)
+}
+td.cell button.cellprobe {
+  width:auto;
+  min-height:0;
+  height:auto;
+  top:5px;
+  right:5px;
+  padding:3px 5px;
+  font-size:10px;
+  border:1px solid var(--border);
+  border-radius:4px;
+  background:var(--raised)
+}
+.legend {
+  border-top:1px solid var(--border);
+  background:var(--card);
+  padding:12px 24px;
+  margin:0;
+  font-size:11px;
+  gap:14px
+}
+.legend span {
+  line-height:1.7
+}
+.counters {
+  display:grid;
+  grid-template-columns:repeat(4,minmax(0,1fr));
+  gap:14px
+}
+.counter {
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  flex-direction:row-reverse;
+  padding:16px 20px;
+  border-radius:8px;
+  gap:10px
+}
+.counter .n {
+  font-size:22px;
+  line-height:1.3;
+  font-family:inherit
+}
+.counter .l {
+  font-size:11px;
+  letter-spacing:0
+}
+.since {
+  font-size:11px;
+  margin:8px 0 22px
+}
+#probeProgress {
+  margin:0 24px 14px;
+  overflow-wrap:anywhere
+}
+#probeLines {
+  border:0;
+  border-top:1px solid var(--border);
+  border-radius:0;
+  margin:0;
+  padding:8px 24px 16px;
+  max-height:260px
+}
+#probeLines p {
+  padding:10px 0;
+  border-bottom:1px solid var(--border);
+  margin:0;
+  font-size:11px
+}
+#probeLines p:last-child {
+  border:0
+}
+.help-details {
+  font-size:12px;
+  color:var(--muted);
+  margin:8px 0 20px
+}
+.help-details summary {
+  cursor:pointer;
+  padding:8px 0
+}
+.help-details p {
+  margin:6px 0 0;
+  line-height:1.9
+}
+.editor-columns {
+  display:grid;
+  grid-template-columns:minmax(0,1fr) minmax(0,1fr);
+  gap:28px;
+  padding:24px;
+  border-top:1px solid var(--border)
+}
+.scopecol {
+  min-width:0
+}
+.scopehead {
+  margin:0 0 14px;
+  flex-wrap:wrap;
+  gap:8px
+}
+.scopehead .hint {
+  margin:0
+}
+.sublabel {
+  color:var(--fg);
+  font-size:13px;
+  letter-spacing:0;
+  text-transform:none
+}
+.checks {
+  border:0;
+  background:var(--raised);
+  padding:0;
+  max-height:360px
+}
+.checks label {
+  padding:12px 0;
+  border-bottom:1px solid var(--border);
+  font-size:12px
+}
+.checks label:last-child {
+  border:0
+}
+input[type=checkbox] {
+  accent-color:var(--accent)
+}
+#scopeProxies,#scopeRotating {
+  min-height:170px;
+  line-height:1.9;
+  padding:12px;
+  font-size:12px
+}
+.addrow {
+  margin-top:16px
+}
+#staticEditor,#rotatingEditor {
+  min-width:0
+}
+#rotatingEditor .scopehead {
+  margin-top:0!important
+}
+#proxyCheck {
+  margin-bottom:22px
+}
+.pcline {
+  flex-wrap:wrap;
+  gap:8px
+}
+.pcrow {
+  padding:12px 16px
+}
+.pcrow .why {
+  overflow-wrap:anywhere
+}
+.scope-savebar {
+  padding:18px 24px;
+  border:1px solid var(--border);
+  border-radius:8px;
+  background:var(--raised);
+  display:flex;
+  flex-wrap:wrap;
+  align-items:center;
+  justify-content:space-between;
+  gap:8px 18px;
+  margin:16px 0 24px
+}
+.scope-savebar>p {
+  flex-basis:100%;
+  margin:0
+}
+.scope-savebar .hint {
+  margin:0
+}
+#scopeErrors:empty {
+  display:none
+}
+.settings-row {
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  gap:20px;
+  padding:20px 24px;
+  border-top:1px solid var(--border)
+}
+.settings-row p {
+  font-size:12px;
+  color:var(--muted);
+  margin:5px 0 0
+}
+#settingsBadges {
+  padding:0 24px 22px
+}
+.badges {
+  margin:0;
+  gap:10px
+}
+.badge {
+  background:var(--card);
+  border-color:var(--border);
+  padding:6px 10px;
+  overflow-wrap:anywhere;
+  min-width:0
+}
+.badge b {
+  overflow-wrap:anywhere;
+  min-width:0
+}
+.badge.dry-off {
+  border-color:var(--border);
+  background:var(--bad-bg)
+}
+.badge.role-business {
+  border-color:var(--border)
+}
+#diagnosticActions select {
+  max-width:100%;
+  min-width:0
+}
+button.btn {
+  font-size:12px;
+  padding:8px 13px
+}
+button.btn.danger {
+  border-color:var(--border);
+  background:var(--raised)
+}
+.dashboard-footer {
+  display:flex;
+  justify-content:space-between;
+  gap:12px;
+  flex-wrap:wrap;
+  margin-top:26px;
+  font-size:10px;
+  color:var(--muted)
+}
+#modal .box {
+  border-radius:12px;
+  padding:26px
+}
+#modal .lines {
+  max-height:55vh;
+  overflow-y:auto
+}
+.notice {
+  overflow-wrap:anywhere
+}
+.counter .n {
+  font-size:22px;
+  font-weight:600
+}
+@media(prefers-color-scheme:dark) {
+  :root {
+    --bg:#171c18;
+    --fg:#e1e7df;
+    --muted:#a4afa0;
+    --faint:#86927f;
+    --border:#343e32;
+    --card:#20281f;
+    --raised:#1b231b;
+    --ok:#9bc6a3;
+    --ok-bg:#223c29;
+    --warn:#d3b56b;
+    --warn-bg:#3b321e;
+    --bad:#e2998f;
+    --bad-bg:#3b2623;
+    --accent:#749875;
+    --accent-bg:#243b27
+  }
+  button.btn.primary {
+    background:#486449;
+    border-color:#486449;
+    color:#fff
+  }
+}
+@media(max-width:1000px) {
+  body {
+    padding:24px
+  }
+  .overview-stat {
+    padding:0 18px
+  }
+  .title-rule {
+    display:none
+  }
+  .counter {
+    padding:14px
+  }
+  .header-status {
+    gap:10px
+  }
+  td,th {
+    padding-left:16px;
+    padding-right:16px
+  }
+}
+@media(max-width:700px) {
+  body {
+    padding:20px 16px
+  }
+  .dashboard-header {
+    flex-direction:column;
+    align-items:flex-start;
+    gap:16px
+  }
+  .header-status {
+    width:100%;
+    justify-content:space-between;
+    align-items:flex-start
+  }
+  #headerRefresh {
+    gap:8px;
+    flex-wrap:wrap;
+    justify-content:flex-end
+  }
+  .freshness {
+    max-width:190px
+  }
+  .dashboard-tabs {
+    gap:0;
+    justify-content:space-between;
+    margin-top:22px
+  }
+  .tab {
+    font-size:12px;
+    gap:6px
+  }
+  .overview-stats {
+    grid-template-columns:repeat(2,minmax(0,1fr));
+    padding:0
+  }
+  .overview-stat {
+    padding:18px;
+    border-bottom:1px solid var(--border)
+  }
+  .overview-stat:nth-child(2) {
+    border-right:0
+  }
+  .overview-stat:nth-child(3),.overview-stat:nth-child(4) {
+    border-bottom:0
+  }
+  .stat-value {
+    font-size:24px
+  }
+  .stat-value.text {
+    font-size:18px
+  }
+  .panel-head {
+    padding:18px;
+    flex-wrap:wrap
+  }
+  .counters {
+    grid-template-columns:repeat(2,minmax(0,1fr))
+  }
+  .editor-columns {
+    grid-template-columns:minmax(0,1fr);
+    padding:18px;
+    gap:24px
+  }
+  .summary {
+    padding:0 18px 12px
+  }
+  .legend {
+    padding:12px 18px
+  }
+  .settings-row {
+    padding:18px;
+    flex-wrap:wrap
+  }
+  .panel-content {
+    padding:0 18px 18px
+  }
+  #settingsBadges {
+    padding:0 18px 18px
+  }
+  .scope-savebar {
+    padding:18px
+  }
+  .help-details {
+    line-height:1.9
+  }
+  #probeLines {
+    padding:8px 18px
+  }
+  #probeProgress {
+    margin-left:18px;
+    margin-right:18px
+  }
+  .badge {
+    max-width:100%
+  }
+  .badge b {
+    font-size:11px
+  }
+  .scope-savebar .row {
+    flex-wrap:wrap
+  }
+}
+@media(hover:none) {
+  td.cell button.cellprobe {
+    opacity:1;
+    position:static;
+    margin:0 0 9px;
+    min-height:28px
+  }
+  td.cell>button:not(.cellprobe) {
+    min-height:48px
+  }
+  .checks label {
+    min-height:44px
+  }
+}
+</style></head>
 <body>
-
-<div id="app" class="wrap">
-  <header class="bar">
-    <div class="row">
-      <h1>codex-turn-state</h1>
-      <div class="spacer"></div>
-      <div class="freshness" id="freshness"></div>
-      <button class="btn" id="btnPause" type="button">暂停刷新</button>
-    </div>
-    <div class="badges" id="badges"></div>
-  </header>
-
-  <div id="notices"></div>
-
-  <section>
-    <h2>探测范围</h2>
-    <div class="card">
-      <div class="lead">
-        这三项只决定下一轮探测去采哪些桶 —— <b>不影响业务端替不替换</b>：业务只看
-        store 里有没有对应的桶。把某个账号从名单里去掉，不等于业务不给它替换，
-        只等于没人再给它采；桶过期之后它就自然停了。
-      </div>
-      <div class="scopegrid">
-        <div class="scopecol">
-          <div class="scopehead">
-            <span class="sublabel">账号</span>
-            <span class="hint" id="scopeAcctNote"></span>
-          </div>
-          <div class="checks" id="scopeAccounts"></div>
-        </div>
-        <div class="scopecol">
-          <div class="scopehead">
-            <span class="sublabel">模型</span>
-            <span class="hint" id="scopeModelNote"></span>
-          </div>
-          <div class="checks" id="scopeModels"></div>
-          <div class="row addrow">
-            <input id="scopeModelAdd" type="text" spellcheck="false" autocomplete="off"
-                   placeholder="补一个模型 id" aria-label="补充一个模型 id">
-            <button class="btn ghost" id="btnAddModel" type="button">加进清单</button>
-          </div>
-          <div class="hint">
+<div class="wrap" id="app">
+<header class="dashboard-header">
+<div><div class="eyebrow">CPA / CODEX TURN-STATE</div><h1>状态管理控制台</h1><p class="subtitle">查看模板健康状态，管理探测范围与代理出口。</p></div>
+<div class="header-status"><span class="status-pill" id="headerRole">等待状态</span><div id="headerRefresh"><div class="freshness" id="freshness"></div><button class="btn" id="btnPause" type="button">暂停刷新</button></div></div>
+</header>
+<nav aria-label="控制台导航" class="dashboard-tabs" role="tablist">
+<button aria-controls="panel-overview" aria-selected="true" class="tab" data-panel="overview" id="tab-overview" role="tab" type="button"><svg aria-hidden="true" viewbox="0 0 20 20"><path d="M3 11h4V3H3zm0 6h4v-3H3zm7 0h7V9h-7zm0-11h7V3h-7z"></path></svg> <span>概览</span></button>
+<button aria-controls="panel-scope" aria-selected="false" class="tab" data-panel="scope" id="tab-scope" role="tab" tabindex="-1" type="button"><svg aria-hidden="true" viewbox="0 0 20 20"><path d="M3 5h14M3 10h14M3 15h14M7 3v4m6 1v4m-5 1v4"></path></svg> <span>探测范围</span></button>
+<button aria-controls="panel-proxies" aria-selected="false" class="tab" data-panel="proxies" id="tab-proxies" role="tab" tabindex="-1" type="button"><svg aria-hidden="true" viewbox="0 0 20 20"><path d="M7 2h6v5H7zM2 13h6v5H2zm10 0h6v5h-6zM10 7v3M5 13v-3h10v3"></path></svg> <span>代理池</span></button>
+<button aria-controls="panel-settings" aria-selected="false" class="tab" data-panel="settings" id="tab-settings" role="tab" tabindex="-1" type="button"><svg aria-hidden="true" viewbox="0 0 20 20"><circle cx="10" cy="10" r="3"></circle><path d="m8 2 4 0 1 3 3 1 2 4-2 4-3 1-1 3H8l-1-3-3-1-2-4 2-4 3-1z"></path></svg> <span>运行设置</span></button>
+</nav>
+<div id="globalNotices"><div id="notices"></div></div>
+<section aria-labelledby="tab-overview" id="panel-overview" role="tabpanel">
+<div class="overview-stats">
+<div class="overview-stat"><div class="stat-label">模板就绪</div><div class="stat-value" id="overviewReady">—</div><div class="stat-note" id="overviewScope">等待状态数据</div></div>
+<div class="overview-stat"><div class="stat-label">探测状态</div><div class="stat-value text" id="overviewProbe">等待状态</div><div class="stat-note" id="overviewProbeNote">—</div></div>
+<div class="overview-stat"><div class="stat-label">注入策略</div><div class="stat-value text" id="overviewMode">—</div><div class="stat-note" id="overviewModeNote">—</div></div>
+<div class="overview-stat"><div class="stat-label">探测出口</div><div class="stat-value" id="overviewExits">—</div><div class="stat-note" id="overviewExitNote">等待代理配置</div></div>
+</div>
+<div class="panel-card" id="matrixCard"><div class="panel-head"><div class="panel-title"><h2>账号与模型模板</h2><span class="title-rule"></span></div><div class="row" id="probeActions"><button class="btn primary" id="btnProbeStart" type="button">开始探测</button><button class="btn danger" id="btnProbeCancel" type="button">停止探测</button></div></div><div class="summary" id="summary"></div><div class="tablewrap"><table id="matrix"></table></div><div class="legend">
+<span><i class="swatch st-ok"></i>就绪（显示剩余时长）</span>
+<span><i class="swatch st-warn"></i>剩余不足 10 分钟</span>
+<span><i class="swatch st-miss"></i>缺失或已过期</span>
+<span><em class="outscope">斜体灰</em> 的行 / 列在探测范围之外：store 里有它的桶，下一轮不会去采</span>
+<span>点格子可清空该桶</span>
+</div></div>
+<div id="counterSection"><div class="counters" id="counters"></div><div class="since" id="since"></div></div>
+<div class="panel-card" id="activityCard"><div class="panel-head"><div class="panel-title"><h2>探测活动</h2><span class="title-rule"></span></div><span class="hint">保留原始探测日志</span></div><span class="hint" id="probeProgress"></span><div id="probeLines"></div></div>
+<details class="help-details"><summary>探测与业务处理说明</summary><p>主动探测直接请求上游，不修改 CPA 账号启用状态或代理配置，可与业务并行。首次采集后进入续期检查。探测会消耗账号额度；停止探测会停止主动续期，不影响已有模板的使用。</p></details>
+</section>
+<section aria-labelledby="tab-scope" hidden="" id="panel-scope" role="tabpanel">
+<div class="panel-card"><div class="panel-head"><div><h2>探测范围</h2><p class="subtitle">选择主动采集的账号与模型。范围变更不会清除已有模板。</p></div></div><div class="editor-columns" id="scopeColumns"><div class="scopecol">
+<div class="scopehead">
+<span class="sublabel">账号</span>
+<span class="hint" id="scopeAcctNote"></span>
+</div>
+<div class="checks" id="scopeAccounts"></div>
+</div><div class="scopecol">
+<div class="scopehead">
+<span class="sublabel">模型</span>
+<span class="hint" id="scopeModelNote"></span>
+</div>
+<div class="checks" id="scopeModels"></div>
+<div class="row addrow">
+<input aria-label="补充一个模型 id" autocomplete="off" id="scopeModelAdd" placeholder="输入其他模型 ID" spellcheck="false" type="text"/>
+<button class="btn ghost" id="btnAddModel" type="button">添加模型</button>
+</div>
+<div class="hint">
             原样提交：不改大小写、不动横线。<code>gpt-5.6-sol</code> 里的横线是 id
             的一部分，写成 <code>gpt5.6sol</code> 是另一个（不存在的）模型。
           </div>
-        </div>
-        <div class="scopecol wide">
-          <div class="scopehead">
-            <span class="sublabel">代理（一行一个）</span>
-            <span class="hint" id="scopeProxyNote"></span>
-            <span class="spacer"></span>
-            <button class="btn ghost" id="btnProxyCheck" type="button">测试连通性</button>
-          </div>
-          <textarea id="scopeProxies" rows="5" spellcheck="false" autocomplete="off"
-                    placeholder="一行一个 URL，空行忽略；顺序就是探测的尝试顺序"
-                    aria-label="探测代理清单，一行一个 URL"></textarea>
-          <div class="row addrow">
-            <input id="scopeProxyAdd" type="text" spellcheck="false" autocomplete="off"
-                   placeholder="贴一条或多条，追加到上面（空格/逗号/换行分隔）"
-                   aria-label="追加代理到清单">
-            <button class="btn ghost" id="btnAddProxy" type="button">追加</button>
-          </div>
-          <div class="hint" id="scopeProxyHint"></div>
+</div></div></div>
+<details class="help-details"><summary>范围与业务注入的关系</summary><p>范围只决定主动探测的目标。业务请求按账号与模型查询有效模板；移出范围不会立即停止已有模板的使用。模型 ID 按原值提交，请保留大小写与横线。</p></details>
+</section>
+<section aria-labelledby="tab-proxies" hidden="" id="panel-proxies" role="tabpanel">
+<div class="panel-card"><div class="panel-head"><div><h2>代理池</h2><p class="subtitle">静态与轮换入口分别管理。连通性检查使用已保存的配置。</p></div><div id="proxyAction"><button class="btn ghost" id="btnProxyCheck" type="button">测试连通性</button></div></div><div class="editor-columns"><div id="staticEditor">
+<div class="scopehead">
+<span class="sublabel">代理（一行一个）</span>
+<span class="hint" id="scopeProxyNote"></span>
+<span class="spacer"></span>
 
-          <div class="scopehead" style="margin-top:12px">
-            <span class="sublabel">轮换代理（IP 每次都变）</span>
-            <span class="hint" id="scopeRotNote"></span>
-          </div>
-          <textarea id="scopeRotating" rows="4" spellcheck="false" autocomplete="off"
-                    placeholder="住宅轮换网关放这里，一行一个"
-                    aria-label="轮换代理清单，一行一个 URL"></textarea>
-          <div class="row addrow">
-            <input id="scopeRotAdd" type="text" spellcheck="false" autocomplete="off"
-                   placeholder="贴一条或多条轮换代理，追加到上面"
-                   aria-label="追加轮换代理到清单">
-            <button class="btn ghost" id="btnAddRot" type="button">追加</button>
-          </div>
-          <div class="hint">
-            两个池子的区别不是写法，是<b>重试规则</b>：静态池一条 URL 就是一个 IP，
-            312 之后重拨没有意义，所以每个桶 55 分钟只试一次；轮换池每次连接都是
-            新地址，所以同一条会连试 10 次，失败也只歇 10 分钟。
-            <b>放错池子会让探测白白少掉大部分机会</b> —— 点「测试连通性」会当场核对。
-          </div>
-          <div id="proxyCheck"></div>
-        </div>
-      </div>
-
-      <div id="scopeErrors"></div>
-
-      <div class="subtle">
-        <div class="row">
-          <button class="btn primary" id="btnScopeSave" type="button">保存探测范围</button>
-          <button class="btn" id="btnScopeReset" type="button">放弃改动</button>
-          <span class="spacer"></span>
-          <span class="hint" id="scopeDirty"></span>
-        </div>
-        <div class="hint">
-          保存范围只是改配置，不会开始采集。要采就用下面<b>「操作」</b>里的
-          <b>开始探测</b> —— 不需要开终端，也不需要任何密钥。
-        </div>
-      </div>
-    </div>
-  </section>
-
-  <section>
-    <h2>桶就绪度</h2>
-    <div class="summary" id="summary"></div>
-    <div class="tablewrap"><table id="matrix"></table></div>
-    <div class="legend">
-      <span><i class="swatch st-ok"></i>就绪（显示剩余时长）</span>
-      <span><i class="swatch st-warn"></i>剩余不足 10 分钟</span>
-      <span><i class="swatch st-miss"></i>缺失或已过期</span>
-      <span><em class="outscope">斜体灰</em> 的行 / 列在探测范围之外：store 里有它的桶，下一轮不会去采</span>
-      <span>点格子可清空该桶</span>
-    </div>
-  </section>
-
-  <section>
-    <h2>决策计数</h2>
-    <div class="counters" id="counters"></div>
-    <div class="since" id="since"></div>
-  </section>
-
-  <section>
-    <h2>探测</h2>
-    <div class="card">
-      <div class="row">
-        <button class="btn primary" id="btnProbeStart" type="button">开始探测</button>
-        <button class="btn danger" id="btnProbeCancel" type="button">停止</button>
-        <span class="spacer"></span>
-        <span class="hint" id="probeProgress"></span>
-      </div>
-      <div id="probeLines"></div>
-      <div class="hint">
-        读每个账号自己的 token 直连上游采集，<b>不经过 CPA、不改 CPA 任何状态</b>
-        （启用位、<code>proxy_url</code> 都不动），所以账号全程照常跑业务、<b>无需停服</b>，
-        多个账号并行。每个桶按代理清单顺序换出口、发一条最小请求。<b class="warntext">会消耗额度。</b>
-        初始采齐后续期循环常驻，卡到期前 5 分钟自动重采；停止探测没有任何账号状态要还原。
-      </div>
-    </div>
-  </section>
-
-  <section>
-    <h2>操作</h2>
-    <div class="card">
-      <div class="row">
-        <button class="btn" id="btnDryRun" type="button">翻 dry_run</button>
-        <button class="btn" id="btnRole" type="button">切 role</button>
-        <button class="btn danger" id="btnClearAll" type="button">清空全部桶</button>
-      </div>
-      <div class="subtle">
-        <div class="row">
-          <span class="sublabel">诊断</span>
-          <select id="selftestAuth" aria-label="自检账号"></select>
-          <select id="selftestModel" aria-label="自检模型"></select>
-          <button class="btn ghost" id="btnSelftest" type="button">连通性自检</button>
-        </div>
-        <div class="hint">
-          只验证「请求能否打到上游、上游回了什么状态码」。<b>不会产生桶</b> ——
-          宿主会让插件自己发出的请求跳过本插件的响应钩子，所以自检永远采不到模板，
-          采集用上面「探测」里的「开始探测」。<b class="warntext">会消耗额度。</b>
-          定向到具体账号时<b>不需要</b>停用其它账号；也可以在桶矩阵里 hover 任一格子，
-          用右上角的角标直接自检那对（账号, 模型）。
-        </div>
-      </div>
-    </div>
-  </section>
+</div>
+<textarea aria-label="探测代理清单，一行一个 URL" autocomplete="off" id="scopeProxies" placeholder="一行一个 URL，空行忽略；顺序就是探测的尝试顺序" rows="6" spellcheck="false"></textarea>
+<div class="row addrow">
+<input aria-label="追加代理到清单" autocomplete="off" id="scopeProxyAdd" placeholder="贴一条或多条，追加到上面（空格/逗号/换行分隔）" spellcheck="false" type="text"/>
+<button class="btn ghost" id="btnAddProxy" type="button">追加</button>
+</div>
+<div class="hint" id="scopeProxyHint"></div>
+</div><div id="rotatingEditor"><div class="scopehead" style="margin-top:12px">
+<span class="sublabel">轮换代理（IP 每次都变）</span>
+<span class="hint" id="scopeRotNote"></span>
+</div>
+<textarea aria-label="轮换代理清单，一行一个 URL" autocomplete="off" id="scopeRotating" placeholder="住宅轮换网关放这里，一行一个" rows="6" spellcheck="false"></textarea>
+<div class="row addrow">
+<input aria-label="追加轮换代理到清单" autocomplete="off" id="scopeRotAdd" placeholder="贴一条或多条轮换代理，追加到上面" spellcheck="false" type="text"/>
+<button class="btn ghost" id="btnAddRot" type="button">追加</button>
 </div>
 
-<div id="modal" hidden>
-  <div class="box" role="dialog" aria-modal="true" aria-labelledby="modalTitle">
-    <h3 id="modalTitle"></h3>
-    <div class="lines" id="modalLines"></div>
-    <input id="modalInput" type="password" autocomplete="off" spellcheck="false" hidden>
-    <div class="acts">
-      <button class="btn" id="modalCancel" type="button">取消</button>
-      <button class="btn" id="modalOk" type="button"></button>
-    </div>
-  </div>
-</div>
 
+</div></div></div>
+<div id="proxyResults"><div id="proxyCheck"></div></div>
+<details class="help-details"><summary>查看尝试与冷却规则</summary><p>静态池按出口、账号和模型组合冷却 55 分钟。轮换池每桶一轮最多 10 次，成功后冷却 55 分钟，失败后冷却 10 分钟。轮换能力由代理服务提供。两个池均为空时使用服务器出口。代理地址保持明文可编辑。</p></details>
+</section>
+<div hidden="" id="sharedScopeEditor"><div id="sharedScopeErrors"><div id="scopeErrors"></div></div><div class="scope-savebar"><div class="row" id="saveActions"><button class="btn primary" id="btnScopeSave" type="button">保存全部改动</button><button class="btn" id="btnScopeReset" type="button">放弃改动</button></div><div id="sharedDirty"><span class="hint" id="scopeDirty"></span></div><p class="hint">统一保存探测范围和代理池的所有未保存改动，不会自动启动探测。</p></div></div>
+<section aria-labelledby="tab-settings" hidden="" id="panel-settings" role="tabpanel">
+<div class="panel-card"><div class="panel-head"><h2>运行参数</h2></div><div id="settingsBadges"><div class="badges" id="badges"></div></div>
+<div class="settings-row"><div><h3>请求改写</h3><p>开启模拟运行后仅记录决策，不实际改写请求。</p></div><div id="dryAction"><button class="btn" id="btnDryRun" type="button">翻 dry_run</button></div></div>
+<div class="settings-row"><div><h3>运行角色</h3><p>业务模式执行请求头改写，探测模式不改写请求。</p></div><div id="roleAction"><button class="btn" id="btnRole" type="button">切 role</button></div></div>
+</div>
+<div class="panel-card"><div class="panel-head"><div><h2>连通性自检</h2><p class="subtitle">验证上游可达性，不采集模板。会消耗账号额度。</p></div></div><div class="row panel-content" id="diagnosticActions"><select aria-label="自检账号" id="selftestAuth"></select><select aria-label="自检模型" id="selftestModel"></select><button class="btn ghost" id="btnSelftest" type="button">连通性自检</button></div></div>
+<div class="panel-card"><div class="settings-row"><div><h3>清空全部模板</h3><p>删除所有已存储模板，后续请求将等待重新采集。</p></div><div id="clearAction"><button class="btn danger" id="btnClearAll" type="button">清空全部桶</button></div></div></div>
+</section>
+<footer class="dashboard-footer"><span>Codex Turn-State</span><span>免密钥管理入口 · 请通过受控网络访问</span></footer>
+</div>
+<div hidden="" id="modal">
+<div aria-labelledby="modalTitle" aria-modal="true" class="box" role="dialog">
+<h3 id="modalTitle"></h3>
+<div class="lines" id="modalLines"></div>
+<input autocomplete="off" hidden="" id="modalInput" spellcheck="false" type="password"/>
+<div class="acts">
+<button class="btn" id="modalCancel" type="button">取消</button>
+<button class="btn" id="modalOk" type="button"></button>
+</div>
+</div>
+</div>
 <script>
 "use strict";
 
@@ -958,11 +1570,19 @@ function renderMatrix(d) {
         attrs: { type: "button", title: title },
         on: { click: function () { if (isReady) { doClearBucket(acct, m); } } }
       });
+      btn.setAttribute("aria-label", title);
+      if (isReady && typeof left === "number" && Number(d.ttl_seconds) > 0) {
+        var track = el("span", { cls: "ttl-track", attrs: { "aria-hidden": "true" } });
+        var fill = el("i");
+        fill.style.width = Math.max(0, Math.min(100, left / Number(d.ttl_seconds) * 100)) + "%";
+        track.appendChild(fill);
+        btn.appendChild(track);
+      }
       if (!isReady) { btn.disabled = true; }
       td.appendChild(btn);
       // 角标对缺桶的格子同样可用 —— 主按钮 disabled，它不受影响。
       td.appendChild(el("button", {
-        cls: "cellprobe", text: "试",
+        cls: "cellprobe", text: "自检",
         attrs: { type: "button", title: "自检 " + acct + " / " + m + "（不落盘，耗额度）" },
         on: {
           click: function (ev) {
@@ -990,6 +1610,8 @@ function renderMatrix(d) {
   }
   var targetCount = targetWhy ? null : (cfgAccts.length * cfgModels.length);
 
+  $("overviewReady").textContent = targetCount === null ? "—" : ready + " / " + targetCount;
+  $("overviewScope").textContent = targetCount === null ? "请先配置探测范围" : cfgAccts.length + " 个账号 · " + cfgModels.length + " 个模型";
   var s = $("summary");
   clear(s);
   if (allRows.length === 0 && allCols.length === 0) {
@@ -1025,7 +1647,7 @@ function renderCounters(d) {
     });
   var since = $("since");
   clear(since);
-  since.appendChild(el("span", { text: "统计自 " + fmtTime(c.since) + "（进程内计数，重启 CPA 会归零）" }));
+  since.appendChild(el("span", { text: "统计自 " + fmtTime(c.since || d.counters_since) + "（进程内计数，重启 CPA 会归零）" }));
 }
 
 function renderSelftestAuths(d) {
@@ -1790,7 +2412,7 @@ function scopeDiff(d) {
 // 保存完成之后【不】自动开始采集。范围改了就去点「开始探测」——
 // 保存和采集是两件事，把它们绑在一起会让人改一个模型名就烧掉一轮额度。
 function noticeSaved() {
-  notify("ok", "保存完成。要采集就点下面「探测」里的「开始探测」。");
+  notify("ok", "保存完成。需要采集时，请到「概览」点击「开始探测」。");
 }
 
 function doSaveScope() {
@@ -1822,16 +2444,16 @@ function doSaveScope() {
   // 清空一侧不是「探测范围变成零」，而是「这一侧不再限定范围」—— 两者差得很远，
   // 值得在按下去之前说清楚。
   if (!finalA.length) {
-    lines.push({ text: "注意：probe_accounts 会变成空的。那不等于「不采任何账号」，而是这一项不再限定范围，矩阵退回按 CPA 报的账号列。", em: true });
+    lines.push({ text: "注意：账号范围将为空，主动探测无法启动。已有模板不会被删除。", em: true });
   }
   if (!finalM.length) {
-    lines.push({ text: "注意：models 会变成空的。目标桶数从此算不出来，--until-complete 也没有清单可比对。", em: true });
+    lines.push({ text: "注意：模型范围将为空，主动探测无法启动。已有模板不会被删除。", em: true });
   }
-  lines.push({ text: "只发改动的键（" + keys.join("、") + "）。CPA 的 config 是浅合并，没列出的键不动。" });
+  lines.push({ text: "只发改动的键（" + keys.join("、") + "）。未修改的字段不提交。" });
   lines.push({ text: "这只是改配置：不会开始采集，也不影响业务端的替换。采集要点「开始探测」。" });
 
   confirmDialog({
-    title: "保存探测范围？",
+    title: "保存全部配置改动？",
     confirmText: "保存",
     lines: lines
   }).then(function (go) {
@@ -1957,6 +2579,7 @@ function render() {
   renderProbeRun(d);
   renderSelftestAuths(d);
   renderSelftestModels(d);
+  renderOverview(d);
   $("btnDryRun").textContent = d.dry_run ? "关闭 dry_run（开始改写流量）" : "开启 dry_run（停止改写）";
   $("btnRole").textContent = "切到 " + (d.role === "probe" ? "business" : "probe");
 }
@@ -2364,6 +2987,51 @@ $("scopeRotAdd").addEventListener("keydown", function (e) {
   if (e.key === "Enter") { e.preventDefault(); doAddRotating(); }
 });
 
+/* Presentation only: tab visibility and summaries never dispatch API actions. */
+function initDashboardTabs() {
+  var tabs = Array.prototype.slice.call(document.querySelectorAll('[data-panel]'));
+  function activate(tab, focus) {
+    tabs.forEach(function (item) {
+      var selected = item === tab;
+      item.setAttribute('aria-selected', selected ? 'true' : 'false');
+      item.tabIndex = selected ? 0 : -1;
+      $('panel-' + item.getAttribute('data-panel')).hidden = !selected;
+    });
+    var name = tab.getAttribute('data-panel');
+    $('sharedScopeEditor').hidden = name !== 'scope' && name !== 'proxies';
+    if (focus) { tab.focus(); }
+  }
+  tabs.forEach(function (tab, index) {
+    tab.addEventListener('click', function () { activate(tab, false); });
+    tab.addEventListener('keydown', function (event) {
+      var next;
+      if (event.key === 'ArrowRight') { next = (index + 1) % tabs.length; }
+      if (event.key === 'ArrowLeft') { next = (index + tabs.length - 1) % tabs.length; }
+      if (event.key === 'Home') { next = 0; }
+      if (event.key === 'End') { next = tabs.length - 1; }
+      if (next !== undefined) { event.preventDefault(); activate(tabs[next], true); }
+    });
+  });
+}
+
+function renderOverview(d) {
+  var role = $('headerRole');
+  role.textContent = d.role === 'business' ? '业务模式' : (d.role === 'probe' ? '探测模式' : '角色未知');
+  role.className = 'status-pill' + (d.role === 'business' ? ' is-ok' : '');
+  var run = probeRunOf(d);
+  $('overviewProbe').textContent = !run ? '状态不可用' : run.running ? '探测运行中' : run.error ? '探测异常' : '探测待命';
+  $('overviewProbeNote').textContent = !run ? '当前服务未返回任务状态' : run.error ? '详情见下方探测活动' : run.running ? '主动采集与续期任务已启动' : run.finished_at ? '任务已停止，可手动启动' : '尚未启动主动探测';
+  $('overviewProbe').className = 'stat-value text' + (run && run.error ? ' warntext' : '');
+  $('overviewMode').textContent = d.inject_mode === 'always' ? '始终注入' : d.inject_mode === 'replace-only' ? '按长度替换' : '—';
+  $('overviewModeNote').textContent = d.role === 'probe' ? '探测模式 · 不改写请求' : d.dry_run ? '模拟运行 · 不改写请求' : '实际请求改写已启用';
+  var fixed = typeof d.probe_proxy_count === 'number' ? d.probe_proxy_count : null;
+  var rotating = typeof d.probe_proxy_rotating_count === 'number' ? d.probe_proxy_rotating_count : null;
+  $('overviewExits').textContent = fixed === null || rotating === null ? '—' : String(fixed + rotating);
+  $('overviewExitNote').textContent = fixed === null || rotating === null ? '当前服务未返回完整出口统计' : fixed === 0 && rotating === 0 ? '未配置代理 · 使用服务器出口' : fixed + ' 个静态出口 · ' + rotating + ' 个轮换入口';
+}
+
+initDashboardTabs();
+
 (function boot() {
   // 没有登录门，也没有任何需要密钥的动作：看数据、四个操作、读可选清单、保存
   // 探测范围，全部走不鉴权的 resource 路由。代理明文由 status 回传，所以那条
@@ -2371,5 +3039,4 @@ $("scopeRotAdd").addEventListener("keydown", function (e) {
   refresh().then(startPolling);
 })();
 </script>
-</body>
-</html>
+</body></html>
