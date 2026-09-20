@@ -12,7 +12,8 @@
 // nothing stops a future edit from reaching back the other way. What it does is
 // put the boundary somewhere a reader can see it.
 //
-// Moved verbatim out of management.go and main.go. No behaviour changed.
+// Moved verbatim out of management.go and main.go in edd3de3; the type was
+// renamed from statusAccount in b9da52e. No behaviour changed in either.
 
 package main
 

@@ -963,7 +963,7 @@ func pluginRegistration() registration {
 					Name:        "role",
 					Type:        pluginapi.ConfigFieldTypeEnum,
 					EnumValues:  []string{roleProbe, roleBusiness},
-					Description: "\"probe\" harvests templates from upstream responses into store_dir; \"business\" only reads the store and substitutes. Empty means business.",
+					Description: "Whether this process rewrites requests. \"business\" substitutes a stored template into a matching request; \"probe\" leaves every request exactly as it found it, so the upstream keeps minting fresh state. Empty means business. Both roles harvest templates from upstream responses -- role does not switch that off.",
 				},
 				{
 					Name:        "store_dir",
@@ -988,7 +988,7 @@ func pluginRegistration() registration {
 				{
 					Name:        "harvest_inband",
 					Type:        pluginapi.ConfigFieldTypeBoolean,
-					Description: "Off by default and forced off for role=business. Harvesting from live business traffic is prohibited; that is the probe's job.",
+					Description: "Whether to harvest from the value a CLIENT sent on its own request header. Off by default and forced off for role=business, because a client-supplied value is not something the upstream minted and issued. This is not the response-side harvest: reading a template off the UPSTREAM's response is always on, in both roles.",
 				},
 				{
 					Name:        "inject_mode",
@@ -1326,39 +1326,53 @@ func harvestFromResponse(cfg pluginConfig, headers http.Header, metadata map[str
 	}
 	attribution := attributionObserved
 
-	// The host only publishes selected_auth_id when the request carried some
-	// metadata of its own: publishSelectedAuthMetadata returns early on an empty
-	// map (sdk/cliproxy/auth/conductor_execution.go:1726). A real Codex client
-	// sends session metadata so the name is there, but the probe's minimal
-	// request does not, and the account name is simply absent. Relating it back
-	// through the request hook does not help either -- the response interceptor
-	// is handed the same opts.Metadata (handlers_interceptors.go:590).
+	// Last resort, and it is genuinely last: the account is normally read off
+	// the metadata above, and failing that relayed by RequestID from what the
+	// request hook recorded (see pendingAuth). Only a request that carried no
+	// metadata at all reaches here, because the host publishes
+	// selected_auth_id only when the request brought a map of its own
+	// (publishSelectedAuthMetadata early-returns on an empty one,
+	// conductor_execution.go:1726).
 	//
-	// So fall back to a condition that can be checked instead: exactly one
-	// enabled Codex account, in which case the account is a property of the
-	// setup rather than something to read off the request. This used to rest
-	// on the sweep enabling one account at a time (spec §7 step 2); the
-	// offline probe does not touch account state at all, so nothing arranges
-	// for the condition to hold and it is read fresh on every call. Every
-	// condition is load bearing -- with two accounts enabled this would be a
-	// coin toss between them, and a wrong guess feeds one account's token to
-	// another.
+	// Which makes this branch close to unreachable in normal operation. Real
+	// Codex clients send session metadata. The probe's own minimal requests
+	// used to arrive without it, but the harvester went offline and no longer
+	// passes through CPA at all. What is left is hand-rolled curl and demos.
+	// It is kept because a silent unattributed harvest is worse than a rare
+	// one, not because it carries traffic.
+	//
+	// The condition is exactly one enabled Codex account, in which case the
+	// account is a property of the setup rather than something read off the
+	// request. It used to rest on the sweep enabling one account at a time
+	// (spec §7 step 2); the offline probe does not touch account state at all,
+	// so nothing arranges for it and soleEnabledCodexAuth re-reads the count on
+	// every call, returning empty for any count but one.
 	//
 	// Inference runs for any recognised length, 292 or 312, not only the template
 	// length. A 312 is never stored, but attributing it lets the degraded-state
 	// log below name the throttled account instead of printing auth=-, which is
 	// the difference between "this account is throttled" and "attribution broke".
 	//
-	// The role check is load bearing, and it is the only thing here that is.
-	// It used to be described as belt-and-braces on the grounds that response
-	// hooks were probe-only; they are not -- they are declared in both roles
-	// (see pluginRegistration), so business traffic reaches this function on
-	// every response. What business must not do is *infer*: its requests come
-	// from real clients across whatever accounts CPA selects, so a sole-account
-	// deduction there would attribute one customer's turn-state to another.
-	// Business still harvests everything CPA named or the request hook
-	// recorded; it just declines to guess. Removing this check would not make
-	// the plugin harvest more, it would make it harvest wrong.
+	// What the role check does, precisely. It is NOT what an earlier version of
+	// this comment claimed -- it said response hooks were probe-only, and they
+	// are declared in both roles (see pluginRegistration). Nor is it what
+	// stops a multi-account deployment guessing: soleEnabledCodexAuth returns
+	// empty above two enabled accounts, in either role.
+	//
+	// It makes inferred attribution read-only under business. The request hook
+	// infers from the same sole-account rule (and only under business -- it
+	// returns early for probe), so business already acts on a deduction: it
+	// picks a bucket and injects from it. This gate stops the same deduction
+	// being written back. The asymmetry is about how long a mistake lasts. A
+	// wrong read spoils the one request it was made for. A wrong write puts
+	// one account's template in another's bucket, where every subsequent
+	// request for that bucket reuses it until the TTL expires -- an hour by
+	// default.
+	//
+	// The response side also has less to go on than the request side did:
+	// enabled is !Disabled && !Unavailable behind a 2s cache (see
+	// cachedCodexAuths), so an account that entered cooldown between dispatch
+	// and the response header arriving can read as enabled here when it is not.
 	recognisedLen := len(value) == cfg.TemplateLength || len(value) == cfg.ReplaceLength
 	if authID == "" && model != "" && recognisedLen && cfg.isProbe() {
 		sole, enabledCount, errSole := soleEnabledCodexAuth()
