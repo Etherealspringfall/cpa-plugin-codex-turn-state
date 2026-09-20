@@ -25,8 +25,16 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
 )
 
-// statusAccount is one credential row of the readiness matrix.
-type statusAccount struct {
+// codexAuth is one Codex credential as the host reports it: the filename it is
+// stored under, and whether it can serve a request right now (a disabled
+// credential and an unavailable one are both reported as not enabled -- see
+// listCodexAuths for why the distinction is not kept).
+//
+// It carries no json tags and is never serialised. It was called statusAccount
+// while it lived in management.go, which read as though the catalog existed to
+// fill the status page; the status page is one caller. soleEnabledCodexAuth on
+// the request path is another, and that one is not a status concern at all.
+type codexAuth struct {
 	AuthID  string
 	Enabled bool
 }
@@ -44,7 +52,7 @@ const authListCacheTTL = 2 * time.Second
 
 var (
 	authListMu      sync.Mutex
-	authListCache   []statusAccount
+	authListCache   []codexAuth
 	authListErr     error
 	authListFetched time.Time
 )
@@ -60,7 +68,7 @@ var codexAuthLister = listCodexAuths
 // cachedCodexAuths is codexAuthLister behind a short cache. The lookup happens
 // under the mutex so a burst of concurrent responses produces one call rather
 // than one each.
-func cachedCodexAuths() ([]statusAccount, error) {
+func cachedCodexAuths() ([]codexAuth, error) {
 	authListMu.Lock()
 	defer authListMu.Unlock()
 	if !authListFetched.IsZero() && time.Since(authListFetched) < authListCacheTTL {
@@ -86,14 +94,14 @@ func resetAuthCache() {
 
 // listCodexAuths returns every Codex credential the host knows about, sorted by
 // name, with the enabled state it reports.
-func listCodexAuths() ([]statusAccount, error) {
+func listCodexAuths() ([]codexAuth, error) {
 	var listed struct {
 		Files []pluginapi.HostAuthFileEntry `json:"files"`
 	}
 	if errCall := hostCallJSON("host.auth.list", map[string]any{}, &listed); errCall != nil {
 		return nil, errCall
 	}
-	var out []statusAccount
+	var out []codexAuth
 	for _, file := range listed.Files {
 		if !isCodexAuth(file) {
 			continue
@@ -105,7 +113,7 @@ func listCodexAuths() ([]statusAccount, error) {
 		// An unavailable credential cannot answer a request either, so it is
 		// reported the same way a disabled one is: the operator's question is
 		// "can this bucket be filled right now", not "which flag is set".
-		out = append(out, statusAccount{AuthID: name, Enabled: !file.Disabled && !file.Unavailable})
+		out = append(out, codexAuth{AuthID: name, Enabled: !file.Disabled && !file.Unavailable})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].AuthID < out[j].AuthID })
 	return out, nil

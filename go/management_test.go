@@ -1661,9 +1661,9 @@ func TestWriteStoreRecordRefusesDegradedLength(t *testing.T) {
 // withAuthList installs a fake credential list for the duration of one test and
 // guarantees restoration. Centralising the swap/restore means no individual
 // test can forget the defer -- the failure mode the coordinator flagged.
-func withAuthList(t *testing.T, accounts []statusAccount, err error) {
+func withAuthList(t *testing.T, accounts []codexAuth, err error) {
 	t.Helper()
-	codexAuthLister = func() ([]statusAccount, error) {
+	codexAuthLister = func() ([]codexAuth, error) {
 		return accounts, err
 	}
 	resetAuthCache()
@@ -1694,10 +1694,10 @@ func readStoredRecord(t *testing.T, dir, authID, model string) storeRecord {
 	return rec
 }
 
-func enabledAccounts(names ...string) []statusAccount {
-	out := make([]statusAccount, len(names))
+func enabledAccounts(names ...string) []codexAuth {
+	out := make([]codexAuth, len(names))
 	for i, name := range names {
-		out[i] = statusAccount{AuthID: name, Enabled: true}
+		out[i] = codexAuth{AuthID: name, Enabled: true}
 	}
 	return out
 }
@@ -1769,7 +1769,7 @@ func TestHarvestRefusesToInferWithNoAccounts(t *testing.T) {
 	dir := t.TempDir()
 	mustConfigure(t, probeRoleConfig(dir))
 	resetHarvestState(t)
-	withAuthList(t, []statusAccount{{AuthID: "codex-off.json", Enabled: false}}, nil)
+	withAuthList(t, []codexAuth{{AuthID: "codex-off.json", Enabled: false}}, nil)
 
 	state.mu.Lock()
 	cfg := state.config
@@ -1879,7 +1879,7 @@ func TestEmptyRequestNeverInfersAccount(t *testing.T) {
 	// If inference is even attempted on an empty request, this lister records it
 	// -- and the test fails. The §0 guard must short-circuit before the call.
 	called := false
-	codexAuthLister = func() ([]statusAccount, error) {
+	codexAuthLister = func() ([]codexAuth, error) {
 		called = true
 		return enabledAccounts("codex-only.json"), nil
 	}

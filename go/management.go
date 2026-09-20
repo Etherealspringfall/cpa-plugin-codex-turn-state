@@ -1046,12 +1046,12 @@ func handleStatus() pluginapi.ManagementResponse {
 		for _, account := range accounts {
 			known[account.AuthID] = account.Enabled
 		}
-		scoped := make([]statusAccount, 0, len(cfg.ProbeAccounts))
+		scoped := make([]codexAuth, 0, len(cfg.ProbeAccounts))
 		for _, name := range cfg.ProbeAccounts {
 			enabled, seen := known[name]
 			// Unknown to the host means unreachable right now, which is what
 			// enabled=false means everywhere else on this page.
-			scoped = append(scoped, statusAccount{AuthID: name, Enabled: seen && enabled})
+			scoped = append(scoped, codexAuth{AuthID: name, Enabled: seen && enabled})
 		}
 		accounts = scoped
 	}
@@ -1334,14 +1334,14 @@ func sortedKeys(set map[string]bool) []string {
 //
 // Every Codex credential is returned, disabled ones included, each carrying its
 // state -- see statusBucket.Enabled for why a disabled account keeps its row.
-func statusAccounts(records []storeRecord) ([]statusAccount, string, error) {
+func statusAccounts(records []storeRecord) ([]codexAuth, string, error) {
 	accounts, errList := listCodexAuths()
 	if errList == nil {
 		return accounts, "host", nil
 	}
 
 	seen := make(map[string]bool)
-	var fallback []statusAccount
+	var fallback []codexAuth
 	for _, rec := range records {
 		if seen[rec.AuthID] {
 			continue
@@ -1351,7 +1351,7 @@ func statusAccounts(records []storeRecord) ([]statusAccount, string, error) {
 		// that produced a bucket was working at the time, and marking it
 		// disabled would assert something never observed; accounts_source is
 		// what tells the caller not to trust this field.
-		fallback = append(fallback, statusAccount{AuthID: rec.AuthID, Enabled: true})
+		fallback = append(fallback, codexAuth{AuthID: rec.AuthID, Enabled: true})
 	}
 	sort.Slice(fallback, func(i, j int) bool { return fallback[i].AuthID < fallback[j].AuthID })
 	return fallback, "store", errList
