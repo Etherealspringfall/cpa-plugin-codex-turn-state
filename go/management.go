@@ -483,8 +483,13 @@ type choiceAccount struct {
 	Label string `json:"label"`
 	// Disabled is CPA's own flag, passed through so the page can say "this one is
 	// switched off" rather than hiding the row. A disabled credential is still a
-	// legitimate probe target -- the sweep enables exactly one account at a time
-	// anyway -- so filtering it out here would remove a choice that works.
+	// legitimate probe target: the flag governs whether CPA routes business
+	// traffic to the account, and the probe does not go through CPA -- it reads
+	// the credential's own token and calls the upstream directly, so it never
+	// consults this. Filtering the row out would remove a choice that works.
+	//
+	// (The older reason given here was that the sweep enabled one account at a
+	// time anyway. The offline probe does not change account state at all.)
 	Disabled bool `json:"disabled"`
 	// Selected is whether the name is in cfg.ProbeAccounts right now, so the page
 	// renders the saved scope rather than an empty form the operator would have to

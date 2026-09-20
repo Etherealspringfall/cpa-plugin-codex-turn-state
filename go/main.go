@@ -1,17 +1,31 @@
 // Package main implements a CLIProxyAPI native plugin that reuses official
 // Codex X-Codex-Turn-State values within a single (account, model) bucket.
 //
-// The plugin has two roles, and one process is only ever one of them:
+// There are three paths into and out of the store, and they run concurrently
+// in one process. role selects between the two request behaviours; it no
+// longer partitions the plugin into mutually exclusive deployments.
 //
-//   - role: probe    harvests the official template from upstream responses and
-//     writes it to the on-disk store. It never rewrites a
-//     request, because sending a recycled state upstream would
-//     stop a fresh one from being minted, which is exactly what
-//     the probe is there to collect.
-//   - role: business reads that store and, on a request already carrying a
-//     degraded replace_length state for the same bucket, swaps
-//     in the stored template. It never writes the store and
-//     never harvests from live traffic.
+//   - active harvest  the probe runner calls the upstream directly, using the
+//     selected account's own credential through a chosen exit,
+//     and writes what comes back to the on-disk store. It is
+//     offline: it does not pass through CPA's request path and
+//     touches none of the hooks below.
+//   - passive harvest the response hooks read a template off the upstream
+//     response of ordinary traffic and write it to the store.
+//     Declared and active in BOTH roles -- see pluginRegistration
+//     for why the old probe-only exclusion was removed. It spends
+//     no quota, because the request was happening anyway.
+//   - substitution    on a request already carrying a degraded replace_length
+//     state for the same bucket, the request hook swaps in the
+//     stored template. role: business does this; role: probe
+//     deliberately does not, because sending a recycled state
+//     upstream would stop a fresh one from being minted.
+//
+// What role still decides, exactly: whether the request hook rewrites
+// (business yes, probe no), and whether a response whose account CPA did not
+// name may be attributed by inference (probe only). Harvesting from the
+// client's own request header -- harvest_inband -- is a third thing again, off
+// by default and forced off for business.
 //
 // Rules enforced here, per the agreed spec:
 //  1. state is never shared across accounts
@@ -891,9 +905,15 @@ func swapConfigLocked(cfg pluginConfig) (cleared, roleChanged bool) {
 		state.storeMod = time.Time{}
 		state.storeChecked = time.Time{}
 	}
-	// Tallies describe one role's behaviour. Carrying a probe's harvest count
-	// into a business generation would make the status page read as though the
-	// business role had been harvesting, which is the one thing it must not do.
+	// Tallies describe one role's behaviour, and the two roles cannot produce
+	// the same mix: probe never substitutes or injects, because its request
+	// hook returns untouched. Carrying a count across the switch would leave
+	// the status page attributing one role's decisions to the other, with no
+	// way to tell from the page which side of the switch a tally came from.
+	//
+	// Harvests are not the reason. Both roles harvest from responses, so a
+	// harvest count surviving the switch would be accurate -- it is dropped
+	// only because the tallies reset as a set or not at all.
 	if roleChanged {
 		state.counts = decisionCounters{}
 		state.countsAt = time.Now()
@@ -1069,12 +1089,16 @@ func interceptAfterAuth(raw []byte) ([]byte, error) {
 	// deployment would otherwise never be substituted -- a real defect, and it
 	// also blocks a minimal-request substitution demo.
 	//
-	// Inferred under the same invariant harvesting uses: exactly one enabled Codex
-	// account (spec §7). With two enabled, a guess would inject one account's 292
-	// into another's request -- rule 1 -- so anything but a clean sole account
-	// leaves authID empty and the request untouched. The inferred account is used
-	// only for the bucket-key lookup; every substitution rule below (replace-only,
-	// dry_run, TTL, length) is unchanged.
+	// Inferred under the same condition harvesting uses: exactly one enabled
+	// Codex account. Note what that is now and is not. The offline probe no
+	// longer switches accounts on and off, so a single enabled account is a
+	// property of how the operator happens to have CPA configured, not an
+	// invariant this plugin establishes or can rely on. It is checked on every
+	// call for that reason. With two enabled, a guess would inject one
+	// account's 292 into another's request -- rule 1 -- so anything but a clean
+	// sole account leaves authID empty and the request untouched. The inferred
+	// account is used only for the bucket-key lookup; every substitution rule
+	// below (replace-only, dry_run, TTL, length) is unchanged.
 	//
 	// Gated on a present value for two reasons: an empty request has nothing to
 	// replace in replace-only mode, so a host lookup would be wasted; and it means
@@ -1311,22 +1335,31 @@ func harvestFromResponse(cfg pluginConfig, headers http.Header, metadata map[str
 	// through the request hook does not help either -- the response interceptor
 	// is handed the same opts.Metadata (handlers_interceptors.go:590).
 	//
-	// So fall back to the invariant the spec already imposes: probing enables
-	// exactly one Codex account at a time (spec §7 step 2), which makes the
-	// account a property of the setup rather than something to read off the
-	// request. Every condition is load bearing -- with two accounts enabled this
-	// would be a coin toss between them, and a wrong guess feeds one account's
-	// token to another.
+	// So fall back to a condition that can be checked instead: exactly one
+	// enabled Codex account, in which case the account is a property of the
+	// setup rather than something to read off the request. This used to rest
+	// on the sweep enabling one account at a time (spec §7 step 2); the
+	// offline probe does not touch account state at all, so nothing arranges
+	// for the condition to hold and it is read fresh on every call. Every
+	// condition is load bearing -- with two accounts enabled this would be a
+	// coin toss between them, and a wrong guess feeds one account's token to
+	// another.
 	//
 	// Inference runs for any recognised length, 292 or 312, not only the template
 	// length. A 312 is never stored, but attributing it lets the degraded-state
 	// log below name the throttled account instead of printing auth=-, which is
 	// the difference between "this account is throttled" and "attribution broke".
 	//
-	// The role check is belt-and-braces: response hooks are only registered for
-	// the probe and in-band harvest is forced off for business, so this path is
-	// already unreachable there. It is written out anyway so the rule reads
-	// completely here instead of resting on a registration elsewhere.
+	// The role check is load bearing, and it is the only thing here that is.
+	// It used to be described as belt-and-braces on the grounds that response
+	// hooks were probe-only; they are not -- they are declared in both roles
+	// (see pluginRegistration), so business traffic reaches this function on
+	// every response. What business must not do is *infer*: its requests come
+	// from real clients across whatever accounts CPA selects, so a sole-account
+	// deduction there would attribute one customer's turn-state to another.
+	// Business still harvests everything CPA named or the request hook
+	// recorded; it just declines to guess. Removing this check would not make
+	// the plugin harvest more, it would make it harvest wrong.
 	recognisedLen := len(value) == cfg.TemplateLength || len(value) == cfg.ReplaceLength
 	if authID == "" && model != "" && recognisedLen && cfg.isProbe() {
 		sole, enabledCount, errSole := soleEnabledCodexAuth()
