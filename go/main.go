@@ -936,7 +936,7 @@ func pluginRegistration() registration {
 		SchemaVersion: pluginabi.SchemaVersion,
 		Metadata: pluginapi.Metadata{
 			Name:             "codex-turn-state",
-			Version:          "0.1.0",
+			Version:          "0.2.0",
 			Author:           "arden-aaai",
 			GitHubRepository: "https://github.com/arden-aaai/cpa-plugin-codex-turn-state",
 			ConfigFields: []pluginapi.ConfigField{
