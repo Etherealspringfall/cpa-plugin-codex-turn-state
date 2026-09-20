@@ -1459,30 +1459,6 @@ func harvestFromResponse(cfg pluginConfig, headers http.Header, metadata map[str
 	logDecision("harvest", authID, model, len(value), "template stored")
 }
 
-// soleEnabledCodexAuth returns the name of the only enabled Codex credential.
-// It reports the enabled count alongside so a refusal can say why, and returns
-// an empty name whenever the count is anything but one -- the caller must not
-// guess, so "none" and "several" are the same answer here.
-func soleEnabledCodexAuth() (string, int, error) {
-	accounts, errList := cachedCodexAuths()
-	if errList != nil {
-		return "", 0, errList
-	}
-	name := ""
-	count := 0
-	for _, account := range accounts {
-		if !account.Enabled {
-			continue
-		}
-		count++
-		name = account.AuthID
-	}
-	if count != 1 {
-		return "", count, nil
-	}
-	return name, 1, nil
-}
-
 // decideHeader chooses the outgoing X-Codex-Turn-State given the value the
 // request arrived with and the freshest live template for its bucket. It
 // returns a decision label, a human-readable reason, and the replacement value

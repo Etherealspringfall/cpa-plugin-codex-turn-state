@@ -43,7 +43,6 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
@@ -943,12 +942,6 @@ type statusResponse struct {
 	ProbeRun probeRunState `json:"probe_run"`
 }
 
-// statusAccount is one credential row of the readiness matrix.
-type statusAccount struct {
-	AuthID  string
-	Enabled bool
-}
-
 // handleStatus reports configuration, bucket readiness and decision tallies.
 //
 // Reachable both authenticated (/v0/management/...) and anonymously
@@ -1362,97 +1355,6 @@ func statusAccounts(records []storeRecord) ([]statusAccount, string, error) {
 	}
 	sort.Slice(fallback, func(i, j int) bool { return fallback[i].AuthID < fallback[j].AuthID })
 	return fallback, "store", errList
-}
-
-// The credential list is cached for the harvest path, which would otherwise ask
-// the host once per upstream response. The window is deliberately tiny: the one
-// thing that changes during a probe run is exactly which account is enabled, and
-// attributing a template to an account that was switched off two seconds ago is
-// the failure this cache must not cause.
-//
-// handleStatus deliberately does not use it. The dashboard is read by a person
-// deciding what to do next, it is requested rarely, and it should show the
-// credential states as they are rather than as they were.
-const authListCacheTTL = 2 * time.Second
-
-var (
-	authListMu      sync.Mutex
-	authListCache   []statusAccount
-	authListErr     error
-	authListFetched time.Time
-)
-
-// codexAuthLister returns the current Codex credentials. It is a package
-// variable rather than a direct call so tests can inject a fixed list and
-// exercise the attribution fallbacks on both the harvest and substitution
-// paths -- above all the two-accounts case, where refusing to guess is what
-// keeps one account's template off another account's request. Production leaves
-// it pointed at the real host-backed lister.
-var codexAuthLister = listCodexAuths
-
-// cachedCodexAuths is codexAuthLister behind a short cache. The lookup happens
-// under the mutex so a burst of concurrent responses produces one call rather
-// than one each.
-func cachedCodexAuths() ([]statusAccount, error) {
-	authListMu.Lock()
-	defer authListMu.Unlock()
-	if !authListFetched.IsZero() && time.Since(authListFetched) < authListCacheTTL {
-		return authListCache, authListErr
-	}
-	authListCache, authListErr = codexAuthLister()
-	authListFetched = time.Now()
-	return authListCache, authListErr
-}
-
-// resetAuthCache clears the cached credential list so the next cachedCodexAuths
-// call goes back to codexAuthLister immediately. It exists for tests: after
-// injecting a new codexAuthLister they must drop the 2-second cache, or a stale
-// entry from a previous case would answer instead. Not used in production, where
-// the cache is meant to persist for its full window.
-func resetAuthCache() {
-	authListMu.Lock()
-	defer authListMu.Unlock()
-	authListCache = nil
-	authListErr = nil
-	authListFetched = time.Time{}
-}
-
-// listCodexAuths returns every Codex credential the host knows about, sorted by
-// name, with the enabled state it reports.
-func listCodexAuths() ([]statusAccount, error) {
-	var listed struct {
-		Files []pluginapi.HostAuthFileEntry `json:"files"`
-	}
-	if errCall := hostCallJSON("host.auth.list", map[string]any{}, &listed); errCall != nil {
-		return nil, errCall
-	}
-	var out []statusAccount
-	for _, file := range listed.Files {
-		if !isCodexAuth(file) {
-			continue
-		}
-		name := strings.TrimSpace(file.Name)
-		if name == "" {
-			continue
-		}
-		// An unavailable credential cannot answer a request either, so it is
-		// reported the same way a disabled one is: the operator's question is
-		// "can this bucket be filled right now", not "which flag is set".
-		out = append(out, statusAccount{AuthID: name, Enabled: !file.Disabled && !file.Unavailable})
-	}
-	sort.Slice(out, func(i, j int) bool { return out[i].AuthID < out[j].AuthID })
-	return out, nil
-}
-
-func isCodexAuth(file pluginapi.HostAuthFileEntry) bool {
-	if strings.EqualFold(strings.TrimSpace(file.Provider), "codex") ||
-		strings.EqualFold(strings.TrimSpace(file.Type), "codex") {
-		return true
-	}
-	// Provider is not always populated on file-backed credentials; the naming
-	// convention is the fallback the harvester uses too.
-	name := strings.ToLower(strings.TrimSpace(file.Name))
-	return strings.HasPrefix(name, "codex-") && strings.HasSuffix(name, ".json")
 }
 
 // bucketStatus renders one cell. A record that is expired, future-stamped or the
