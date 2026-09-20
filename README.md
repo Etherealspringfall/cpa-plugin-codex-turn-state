@@ -370,16 +370,23 @@ expires_at = issued_at + ttl_seconds
 
 ```text
 go/
-├── main.go                 # 插件入口、请求处理、采集与存储
+├── main.go                 # 插件入口（CGO ABI）、配置、请求与响应拦截
+├── store.go                # 模板存储：桶文件、index.json、读取与过期
+├── auth_catalog.go         # 账号目录：向 host 查询凭据清单及其短缓存
 ├── probe_runner.go         # 独立探测、代理调度、冷却与续期
 ├── proxy_check.go          # 代理连通性与出口检查
 ├── management.go           # 管理与资源路由
 ├── ui.html                 # 内置管理面板
+├── contract_test.go        # 公开面断言：匿名字段集、免密路由、配置字段
 ├── *_test.go               # 单元与回归测试
 └── go.mod                  # Go 与 CPA SDK 依赖版本
 scripts/
 └── build.sh                # Docker 构建脚本
 ```
+
+`auth_catalog.go` 单独成文件是因为依赖方向：账号目录是能力，管理路由和请求拦截器都是它的调用方。同一个 package 内文件边界不具强制力，这里只是把边界放在读得到的位置。
+
+`contract_test.go` 的断言是刻意脆弱的：它锁定匿名 `/status` 能输出的全部字段、免密资源路由的全集和声明的配置字段。改动这些字面量等同于一次公开面变更，需要同时确认新增字段不携带密钥。
 
 ### 执行检查
 
