@@ -14,13 +14,16 @@
 | 项 | 值 |
 |---|---|
 | CPA 容器 | `cli-proxy-api`（**以 root 跑**） |
-| 插件路径 | `/home/dnc/cpamp-deploy/cpa-plugins/linux/amd64/codex-turn-state-v0.1.0.so` |
+| 插件路径 | `/home/dnc/cpamp-deploy/cpa-plugins/linux/amd64/codex-turn-state-v0.2.0.so`（会随发版改名，以 `ls` 为准） |
 | store | 容器内 `/data/turn-state-store`，宿主 `/home/dnc/cpamp-deploy/cpa-data/turn-state-store` |
 | config | `/home/dnc/cpamp-deploy/cpa-data/config.yaml` |
 | 角色 | `role=business`、`inject_mode=always`、`dry_run=false` |
 | 看板 | CPAMP 菜单 `Codex Turn-State`，**全程免密钥** |
 
-三条路径同时在跑：离线探测（主动）、业务顺带采集（免费）、业务替换。
+日常跑的是两条：业务顺带采集（免费）和业务替换。**主动探测默认不开、也不要常开**
+——它是手动去看板点的，给账号发它没要过的流量正是封号的成因。能力留着，平时休眠。
+代价是被上游限流的桶自己填不满：限流中的出口只会拿回降级状态，采不到可用模板。
+
 架构说明见 [README.md](README.md)。
 
 ---
@@ -94,10 +97,15 @@ cd $BUILD && git log -1 --format="HEAD: %h %s"
 bash scripts/build.sh                      # -> build/linux/amd64/codex-turn-state.so
 
 DIR=/home/dnc/cpamp-deploy/cpa-plugins/linux/amd64
-LIVE=$DIR/codex-turn-state-v0.1.0.so
+
+# 现存的 .so 靠发现，不要写死版本号——它会随发版改名（v0.1.0 → v0.2.0 已经发生
+# 过一次，而这份文档当时没跟上，照着跑会在下面第一条 cp 就失败）。
+LIVE=$(ls -1 $DIR/codex-turn-state-v*.so 2>/dev/null)
+test "$(echo "$LIVE" | wc -l)" = 1 -a -f "$LIVE" || { echo "期望恰好一个 codex-turn-state-v*.so，实际：$LIVE"; exit 1; }
+echo "现役: $LIVE"
 
 # 滚动备份：只留一个回滚点，否则这里会堆到上百 MB
-rm -f $DIR/codex-turn-state-v0.1.0.so.bak-*
+rm -f $DIR/codex-turn-state-v*.so.bak-*
 cp -p "$LIVE" "$LIVE.bak-$(date +%Y%m%d-%H%M)"
 
 # 原子换：先 cp 到临时名，再 mv 覆盖
@@ -109,6 +117,30 @@ curl -s -o /dev/null -w "healthz: %{http_code}\n" http://127.0.0.1:8317/healthz
 
 set +e                                     # ← 见下，清理失败不能中断部署
 chmod -R u+rwX $BUILD 2>/dev/null; rm -rf $BUILD 2>/dev/null
+```
+
+#### ⚠️ 想让文件名带上新版本号？必须在同一步删掉旧的
+
+CPA **扫描 `plugins/` 目录**加载插件，`config.yaml` 里不按文件名引用任何一个。
+所以目录里有几个匹配的 `.so`，它就加载几个——两个 `codex-turn-state-v*.so`
+同时存在，就是两份 `plugin_id=codex-turn-state` 注册同一批路由。
+
+上面的流程之所以安全，是因为它**覆盖同一个文件名**，版本号只是个标签。真要改名：
+
+```bash
+NEW=$DIR/codex-turn-state-v0.3.0.so
+cp $BUILD/build/linux/amd64/codex-turn-state.so "$DIR/.cts.new"
+mv -f "$DIR/.cts.new" "$NEW"
+rm -f "$LIVE"                              # ← 这一步不能省
+ls -1 $DIR/codex-turn-state-v*.so          # 确认只剩一个
+```
+
+`.bak-<时间戳>` 后缀不以 `.so` 结尾，不会被加载，可以安放。
+
+重启后在日志里核对实际加载了几个：
+
+```bash
+docker logs cli-proxy-api --since 2m 2>&1 | grep "plugin loaded plugin_id=codex-turn-state"
 ```
 
 #### 为什么用 `mv` 不用 `cp` 覆盖
@@ -184,8 +216,9 @@ docker logs cli-proxy-api --since 2m 2>&1 | grep -i "codex-turn-state.*configure
 
 ```bash
 DIR=/home/dnc/cpamp-deploy/cpa-plugins/linux/amd64
-LIVE=$DIR/codex-turn-state-v0.1.0.so
-BAK=$(ls -1t $DIR/codex-turn-state-v0.1.0.so.bak-* | head -1)
+LIVE=$(ls -1 $DIR/codex-turn-state-v*.so)          # 同样靠发现，别写死版本号
+BAK=$(ls -1t $DIR/codex-turn-state-v*.so.bak-* | head -1)
+test -f "$LIVE" -a -f "$BAK" || { echo "现役或备份对不上：LIVE=$LIVE BAK=$BAK"; exit 1; }
 cp "$BAK" "$DIR/.cts.rollback" && mv -f "$DIR/.cts.rollback" "$LIVE"
 docker restart cli-proxy-api
 ```
