@@ -5,27 +5,43 @@
 // in one process. role selects between the two request behaviours; it no
 // longer partitions the plugin into mutually exclusive deployments.
 //
-//   - active harvest  the probe runner calls the upstream directly, using the
-//     selected account's own credential through a chosen exit,
-//     and writes what comes back to the on-disk store. It is
-//     offline: it does not pass through CPA's request path and
-//     touches none of the hooks below.
 //   - passive harvest the response hooks read a template off the upstream
 //     response of ordinary traffic and write it to the store.
-//     Declared and active in BOTH roles -- see pluginRegistration
-//     for why the old probe-only exclusion was removed. It spends
-//     no quota, because the request was happening anyway.
-//   - substitution    on a request already carrying a degraded replace_length
-//     state for the same bucket, the request hook swaps in the
-//     stored template. role: business does this; role: probe
-//     deliberately does not, because sending a recycled state
-//     upstream would stop a fresh one from being minted.
+//     This is the normal mode and the only one that runs
+//     unattended. It spends no quota, because the request was
+//     happening anyway. Declared and active in BOTH roles -- see
+//     pluginRegistration for why the old probe-only exclusion was
+//     removed. Its limit is that a bucket whose account the
+//     upstream is throttling only ever sees degraded state, so
+//     that bucket cannot refill itself.
+//   - active harvest   the probe runner calls the upstream directly, using the
+//     selected account's own credential through a chosen exit, and
+//     writes what comes back. It is offline: it does not pass
+//     through CPA's request path and touches none of the hooks.
+//     It is the only way to refill a throttled bucket, because a
+//     different exit is a different IP.
+//     OFF BY DEFAULT AND LEFT OFF. It is started by hand through
+//     /ops/probe/start, never on a schedule and never at startup.
+//     Sending traffic an account did not ask for is the kind of
+//     thing accounts get banned for, so the standing policy is
+//     passive-only: take a template if one arrives, do without if
+//     not. Keep this capability, keep it dormant.
+//   - substitution    the request hook writes the stored template onto the
+//     outgoing request. Under inject_mode "always" it adds one to
+//     a request that carried no state at all, which in practice is
+//     every request -- clients do not send this header. Under
+//     "replace-only" it swaps only a degraded replace_length value
+//     it finds already there. role: business does this; role:
+//     probe deliberately does not, because sending a recycled
+//     state upstream would stop a fresh one from being minted.
 //
 // What role still decides, exactly: whether the request hook rewrites
 // (business yes, probe no), and whether a response whose account CPA did not
-// name may be attributed by inference (probe only). Harvesting from the
-// client's own request header -- harvest_inband -- is a third thing again, off
-// by default and forced off for business.
+// name may be attributed by inference (probe only). Note that role is not how
+// a probe run is started -- see harvestFromResponse -- so a deployment can and
+// does sit on business permanently. Harvesting from the client's own request
+// header -- harvest_inband -- is a third thing again, off by default and
+// forced off for business.
 //
 // Rules enforced here, per the agreed spec:
 //  1. state is never shared across accounts
@@ -1326,53 +1342,40 @@ func harvestFromResponse(cfg pluginConfig, headers http.Header, metadata map[str
 	}
 	attribution := attributionObserved
 
-	// Last resort, and it is genuinely last: the account is normally read off
-	// the metadata above, and failing that relayed by RequestID from what the
-	// request hook recorded (see pendingAuth). Only a request that carried no
-	// metadata at all reaches here, because the host publishes
-	// selected_auth_id only when the request brought a map of its own
-	// (publishSelectedAuthMetadata early-returns on an empty one,
+	// Last resort for the account name, and dead code under role: business.
+	//
+	// Normally the name comes off the metadata above, or is relayed by
+	// RequestID from what the request hook recorded (see pendingAuth). Only a
+	// request that carried no metadata at all gets this far, because the host
+	// publishes selected_auth_id only when the request brought a map of its
+	// own (publishSelectedAuthMetadata early-returns on an empty one,
 	// conductor_execution.go:1726).
 	//
-	// Which makes this branch close to unreachable in normal operation. Real
-	// Codex clients send session metadata. The probe's own minimal requests
-	// used to arrive without it, but the harvester went offline and no longer
-	// passes through CPA at all. What is left is hand-rolled curl and demos.
-	// It is kept because a silent unattributed harvest is worse than a rare
-	// one, not because it carries traffic.
+	// The isProbe gate then closes it entirely on the deployment this runs in:
+	// role is business permanently, and the probe is triggered through
+	// /ops/probe/start rather than by switching role, so nothing sets probe.
+	// Measured 2026-09-20 over 3.3h of live traffic: 15 buckets, every one
+	// attributed observed, none inferred. Do not spend effort here.
 	//
-	// The condition is exactly one enabled Codex account, in which case the
-	// account is a property of the setup rather than something read off the
-	// request. It used to rest on the sweep enabling one account at a time
-	// (spec §7 step 2); the offline probe does not touch account state at all,
-	// so nothing arranges for it and soleEnabledCodexAuth re-reads the count on
-	// every call, returning empty for any count but one.
+	// It stays because the gate is the right shape if the role is ever set.
+	// Inference is allowed to pick a bucket to read from -- the request hook
+	// does exactly that, and only under business, since it returns early for
+	// probe -- but not to write one. A wrong read spoils the request it was
+	// made for; a wrong write puts one account's template in another's bucket
+	// and every request for that bucket reuses it until the TTL expires.
+	// Response-side inference is also the weaker of the two: enabled is
+	// !Disabled && !Unavailable behind a 2s cache (cachedCodexAuths), so an
+	// account that entered cooldown after dispatch still reads as enabled.
 	//
-	// Inference runs for any recognised length, 292 or 312, not only the template
-	// length. A 312 is never stored, but attributing it lets the degraded-state
-	// log below name the throttled account instead of printing auth=-, which is
-	// the difference between "this account is throttled" and "attribution broke".
+	// The condition is exactly one enabled account, re-read per call --
+	// soleEnabledCodexAuth returns empty for any other count. It used to rest
+	// on the sweep enabling one at a time (spec §7 step 2); the offline probe
+	// does not touch account state, so nothing arranges for it.
 	//
-	// What the role check does, precisely. It is NOT what an earlier version of
-	// this comment claimed -- it said response hooks were probe-only, and they
-	// are declared in both roles (see pluginRegistration). Nor is it what
-	// stops a multi-account deployment guessing: soleEnabledCodexAuth returns
-	// empty above two enabled accounts, in either role.
-	//
-	// It makes inferred attribution read-only under business. The request hook
-	// infers from the same sole-account rule (and only under business -- it
-	// returns early for probe), so business already acts on a deduction: it
-	// picks a bucket and injects from it. This gate stops the same deduction
-	// being written back. The asymmetry is about how long a mistake lasts. A
-	// wrong read spoils the one request it was made for. A wrong write puts
-	// one account's template in another's bucket, where every subsequent
-	// request for that bucket reuses it until the TTL expires -- an hour by
-	// default.
-	//
-	// The response side also has less to go on than the request side did:
-	// enabled is !Disabled && !Unavailable behind a 2s cache (see
-	// cachedCodexAuths), so an account that entered cooldown between dispatch
-	// and the response header arriving can read as enabled here when it is not.
+	// Runs for 292 and 312 alike. A 312 is never stored, but attributing it
+	// lets the degraded-state log name the throttled account rather than
+	// printing auth=-, which separates "this account is throttled" from
+	// "attribution broke".
 	recognisedLen := len(value) == cfg.TemplateLength || len(value) == cfg.ReplaceLength
 	if authID == "" && model != "" && recognisedLen && cfg.isProbe() {
 		sole, enabledCount, errSole := soleEnabledCodexAuth()
