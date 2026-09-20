@@ -3,23 +3,34 @@ package main
 // Contract tests for the shapes this plugin publishes rather than merely uses.
 //
 // The other test files assert behaviour: given this request, expect that
-// decision. These assert *surface*: the exact set of JSON keys the anonymous
-// status document can emit, the exact set of paths reachable without a key, and
-// the exact set of config fields the host is told about. They are deliberately
-// brittle. A behavioural test answers "does it still work"; these answer "did
-// the published surface change", and the only correct way to make one fail is
-// to change the literal alongside the code and think about what it now exposes.
+// decision. These assert *surface*: the exact set of JSON keys each
+// anonymously readable document can emit, the exact set of paths reachable
+// without a key, and the exact set of config fields the host is told about.
+// They are deliberately brittle. A behavioural test answers "does it still
+// work"; these answer "did the published surface change", and the only correct
+// way to make one fail is to change the literal alongside the code and think
+// about what it now exposes.
 //
-// Why this file exists: statusResponse carries a long comment warning that
-// every field on it is anonymously readable, and managementRegister carries
-// another warning that anything in Resources is keyless. Both were prose. The
-// nearest thing to enforcement was TestAnonymousStatusOmitsTemplateValues,
-// which greps the response for the specific tokens it seeded -- a denylist,
-// which by construction cannot catch a field nobody thought to seed. A new
-// field carrying a proxy password or an unmasked credential path would pass
-// every existing test while being served to anything that can reach the port.
+// SHAPE, NOT CONTENT. Every assertion here is about which keys exist. None of
+// it can tell whether a value put into one of them is safe. Several fields are
+// free-text channels -- probe_run.lines, store_error, accounts_error,
+// config_errors, and every "detail"/"note" on the proxy check -- and those rest
+// entirely on probeRedact, maskProxyURL and the denylist assertions in
+// TestAnonymousStatusResourceNeverLeaksTokenValues. Do not read a green run
+// here as "nothing leaks".
+//
+// Why the file exists: statusResponse carries a long comment warning that every
+// field on it is anonymously readable, and managementRegister carries another
+// warning that anything in Resources is keyless. Both were prose. The nearest
+// thing to enforcement was TestAnonymousStatusResourceNeverLeaksTokenValues
+// (management_test.go), which greps the response for the specific tokens it
+// seeded -- a denylist, which by construction cannot catch a field nobody
+// thought to seed. Verified: grafting a probe_management_key field onto
+// statusResponse passes that test and every other test in the suite.
 
 import (
+	"encoding"
+	"encoding/json"
 	"reflect"
 	"sort"
 	"strings"
@@ -89,70 +100,156 @@ var statusResponsePublicFields = []string{
 	"ttl_seconds",
 }
 
-// TestAnonymousStatusFieldSetIsPinned walks the statusResponse type -- not a
+// choicesResponsePublicFields is the scope editor's menu, served keyless on
+// /ops/choices. accounts.name is the credential filename in full, which carries
+// a customer email; accounts.label is the masked form the page displays. Both
+// are published -- the route answers without a key and the page needs the real
+// filename to post back -- which is exactly why the shape is pinned.
+var choicesResponsePublicFields = []string{
+	"accounts",
+	"accounts.disabled",
+	"accounts.label",
+	"accounts.name",
+	"accounts.selected",
+	"error",
+	"models",
+	"models.name",
+	"models.selected",
+}
+
+// proxyCheckResponsePublicFields is the exit diagnostic, served keyless on
+// /ops/proxy-check. results.proxy is a proxy URL and goes out through
+// probeShowProxy; results.detail is free text off an upstream error. Neither
+// is protected by this assertion -- see the SHAPE, NOT CONTENT note above --
+// but a new field on this document is a new keyless field either way.
+var proxyCheckResponsePublicFields = []string{
+	"blocked",
+	"checked",
+	"dead",
+	"direct",
+	"distinct_ips",
+	"mismatches",
+	"ms",
+	"note",
+	"ok",
+	"other",
+	"results",
+	"results.colo",
+	"results.country",
+	"results.detail",
+	"results.exit_ip",
+	"results.index",
+	"results.mismatch",
+	"results.ms",
+	"results.pool",
+	"results.proxy",
+	"results.rotated",
+	"results.status_code",
+	"results.verdict",
+	"static_checked",
+	"timed_out",
+}
+
+// TestAnonymouslyReadableShapesArePinned walks each document's type -- not a
 // marshalled instance -- so that omitempty fields are counted too. An instance
 // only shows what happened to be populated, and "the leak is in a field that is
 // empty in the fixture" is exactly the case worth catching.
-func TestAnonymousStatusFieldSetIsPinned(t *testing.T) {
-	got := jsonFieldPaths(t, reflect.TypeOf(statusResponse{}), "")
-
-	want := make(map[string]bool, len(statusResponsePublicFields))
-	for _, field := range statusResponsePublicFields {
-		want[field] = true
-	}
-
-	for _, field := range got {
-		if !want[field] {
-			t.Errorf("statusResponse gained the field %q.\n"+
-				"That field is now readable without a credential, on the anonymous\n"+
-				"resource route. If that is intended, add it to\n"+
-				"statusResponsePublicFields; if it can carry a secret, it does not\n"+
-				"belong on this struct at all.", field)
-		}
-		delete(want, field)
-	}
-	for field := range want {
-		t.Errorf("statusResponse lost the field %q, which the dashboard may still be reading; "+
-			"remove it from statusResponsePublicFields if the removal is intended", field)
+func TestAnonymouslyReadableShapesArePinned(t *testing.T) {
+	for _, doc := range []struct {
+		name  string
+		typ   reflect.Type
+		want  []string
+		route string
+	}{
+		{"statusResponse", reflect.TypeOf(statusResponse{}), statusResponsePublicFields, "/status"},
+		{"choicesResponse", reflect.TypeOf(choicesResponse{}), choicesResponsePublicFields, "/ops/choices"},
+		{"proxyCheckResponse", reflect.TypeOf(proxyCheckResponse{}), proxyCheckResponsePublicFields, "/ops/proxy-check"},
+	} {
+		t.Run(doc.name, func(t *testing.T) {
+			got := jsonFieldPaths(t, doc.typ, "")
+			assertSetEqual(t, doc.name+" fields", got, doc.want,
+				"this document is served on "+doc.route+", which needs no credential; "+
+					"if the new field can carry a secret it does not belong on this struct at all")
+		})
 	}
 }
 
-// TestStatusFieldPinIsNotVacuous guards the guard: a jsonFieldPaths that
-// silently returned nothing would make the test above pass forever.
-func TestStatusFieldPinIsNotVacuous(t *testing.T) {
-	if len(statusResponsePublicFields) < 40 {
-		t.Fatalf("the pinned field list holds %d entries, which is too few to be the real status document", len(statusResponsePublicFields))
+// --- 2. the walker itself -------------------------------------------------
+
+// The pins above are only worth their brittleness if the walk underneath them
+// actually descends. A jsonFieldPaths that quietly returned the top level would
+// keep every assertion green while publishing whole nested structs unchecked,
+// so it gets its own fixture rather than being trusted.
+
+type walkerProbeInner struct {
+	Alpha  string `json:"alpha"`
+	Omit   string `json:"-"`
+	hidden string //nolint:unused // present so the walk is seen to skip it
+}
+
+type walkerProbeOuter struct {
+	Top      int                `json:"top"`
+	Nested   walkerProbeInner   `json:"nested"`
+	List     []walkerProbeInner `json:"list"`
+	Pointer  *walkerProbeInner  `json:"pointer"`
+	Names    []string           `json:"names"`
+	Untagged bool
+}
+
+func TestJSONFieldPathsDescends(t *testing.T) {
+	got := jsonFieldPaths(t, reflect.TypeOf(walkerProbeOuter{}), "")
+	want := []string{
+		"Untagged", // no tag: encoding/json falls back to the Go field name
+		"list",
+		"list.alpha", // slice elements flatten onto the slice key
+		"names",      // a []string is a leaf
+		"nested",
+		"nested.alpha",
+		"pointer", // a *struct is followed
+		"pointer.alpha",
+		"top",
 	}
-	got := jsonFieldPaths(t, reflect.TypeOf(statusResponse{}), "")
-	if len(got) != len(statusResponsePublicFields) {
-		t.Fatalf("walked %d field paths but pinned %d; the walk and the literal disagree", len(got), len(statusResponsePublicFields))
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("the walk does not descend as the pins above assume.\n got: %v\nwant: %v", got, want)
+	}
+	for _, path := range got {
+		if strings.Contains(path, "Omit") || strings.Contains(path, "hidden") {
+			t.Errorf("walk emitted %q; json:\"-\" and unexported fields are never serialised", path)
+		}
 	}
 }
 
 // jsonFieldPaths returns every JSON key path encoding/json can produce for typ,
-// recursing through structs, pointers and slice/array elements. It fails the
-// test on any shape it does not model (a map, an interface, an embedded
-// struct), because silently skipping one would make the pin above under-report
-// and the whole file would be theatre.
+// recursing through structs, pointers and slice/array elements.
+//
+// It fails the test on any shape whose keys cannot be read off the type: a map,
+// an interface, a []byte (json.RawMessage serialises as whatever it holds), or
+// anything with its own MarshalJSON/MarshalText. Silently treating one of those
+// as a leaf would make every pin above under-report, which is the one failure
+// this file cannot afford.
 func jsonFieldPaths(t *testing.T, typ reflect.Type, prefix string) []string {
 	t.Helper()
-
-	for typ.Kind() == reflect.Pointer {
-		typ = typ.Elem()
-	}
-	if typ.Kind() != reflect.Struct {
-		t.Fatalf("jsonFieldPaths called on %s, which is not a struct", typ)
-	}
-
 	var out []string
+	collectJSONFields(t, typ, prefix, &out)
+	sort.Strings(out)
+	return out
+}
+
+func collectJSONFields(t *testing.T, typ reflect.Type, prefix string, out *[]string) {
+	t.Helper()
+
+	typ = derefType(typ)
+	if typ.Kind() != reflect.Struct {
+		t.Fatalf("collectJSONFields called on %s, which is not a struct", typ)
+	}
+
 	for i := 0; i < typ.NumField(); i++ {
 		field := typ.Field(i)
 		if field.Anonymous {
 			t.Fatalf("%s embeds %s; encoding/json inlines embedded fields and this walk does not model that", typ, field.Type)
 		}
 		if field.PkgPath != "" {
-			// Unexported: encoding/json never emits it.
-			continue
+			continue // unexported: never serialised
 		}
 
 		tag := field.Tag.Get("json")
@@ -161,7 +258,6 @@ func jsonFieldPaths(t *testing.T, typ reflect.Type, prefix string) []string {
 		}
 		name := strings.Split(tag, ",")[0]
 		if name == "" {
-			// No tag: encoding/json falls back to the Go field name.
 			name = field.Name
 		}
 
@@ -169,34 +265,67 @@ func jsonFieldPaths(t *testing.T, typ reflect.Type, prefix string) []string {
 		if prefix != "" {
 			path = prefix + "." + name
 		}
-		out = append(out, path)
+		*out = append(*out, path)
 
-		elem := field.Type
-		for elem.Kind() == reflect.Pointer {
-			elem = elem.Elem()
-		}
-		switch elem.Kind() {
-		case reflect.Slice, reflect.Array:
-			elem = elem.Elem()
-			for elem.Kind() == reflect.Pointer {
-				elem = elem.Elem()
-			}
-			if elem.Kind() == reflect.Struct {
-				out = append(out, jsonFieldPaths(t, elem, path)...)
-			}
-		case reflect.Struct:
-			out = append(out, jsonFieldPaths(t, elem, path)...)
-		case reflect.Map, reflect.Interface:
-			t.Fatalf("%s.%s is a %s, whose keys cannot be pinned by walking the type; "+
-				"an open-ended container on an anonymously readable document needs its own assertion",
-				typ, field.Name, elem.Kind())
-		}
+		descendJSONField(t, field.Type, path, out, typ.String()+"."+field.Name)
 	}
-	sort.Strings(out)
-	return out
 }
 
-// --- 2. the keyless surface ----------------------------------------------
+func descendJSONField(t *testing.T, typ reflect.Type, path string, out *[]string, where string) {
+	t.Helper()
+
+	typ = derefType(typ)
+	rejectOpaque(t, typ, where)
+
+	switch typ.Kind() {
+	case reflect.Struct:
+		collectJSONFields(t, typ, path, out)
+	case reflect.Slice, reflect.Array:
+		// Elements flatten onto the slice's own key: one entry per field, not
+		// one per element. A nested slice keeps flattening.
+		descendJSONField(t, typ.Elem(), path, out, where+" element")
+	}
+}
+
+// rejectOpaque fails on a type whose emitted keys are not determined by the
+// type. Called at every level, including slice elements, because []map[string]X
+// hides exactly as much as map[string]X does.
+func rejectOpaque(t *testing.T, typ reflect.Type, where string) {
+	t.Helper()
+
+	var (
+		jsonMarshaler = reflect.TypeOf((*json.Marshaler)(nil)).Elem()
+		textMarshaler = reflect.TypeOf((*encoding.TextMarshaler)(nil)).Elem()
+	)
+	for _, iface := range []reflect.Type{jsonMarshaler, textMarshaler} {
+		if typ.Implements(iface) || reflect.PointerTo(typ).Implements(iface) {
+			t.Fatalf("%s is a %s with its own %s; its JSON keys are not readable off the type. "+
+				"If it serialises to a single scalar (time.Time does, as an RFC3339 string), say so here "+
+				"and allow it; if it serialises to an object, its fields need pinning of their own.",
+				where, typ, iface.Name())
+		}
+	}
+
+	switch typ.Kind() {
+	case reflect.Map, reflect.Interface:
+		t.Fatalf("%s is a %s, whose keys cannot be pinned by walking the type; "+
+			"an open-ended container on an anonymously readable document needs its own assertion", where, typ.Kind())
+	case reflect.Slice:
+		if typ.Elem().Kind() == reflect.Uint8 {
+			t.Fatalf("%s is a %s (json.RawMessage or []byte); it serialises as whatever it happens to hold, "+
+				"which is not something this walk can pin", where, typ)
+		}
+	}
+}
+
+func derefType(typ reflect.Type) reflect.Type {
+	for typ.Kind() == reflect.Pointer {
+		typ = typ.Elem()
+	}
+	return typ
+}
+
+// --- 3. the keyless surface ----------------------------------------------
 
 // keylessResourcePaths is every path registered under the resource prefix.
 // Registration *is* the grant: the host serves that prefix without
@@ -232,6 +361,8 @@ var authenticatedRoutes = []string{
 	"POST /codex-turn-state/selftest",
 }
 
+// The registration does not vary by role -- managementRegister reads nothing
+// off the config -- so one configured role exercises it fully.
 func TestKeylessSurfaceIsPinned(t *testing.T) {
 	dir := t.TempDir()
 	mustConfigure(t, probeRoleConfig(dir))
@@ -253,11 +384,15 @@ func TestKeylessSurfaceIsPinned(t *testing.T) {
 		"moving one of these to the resource list would publish it")
 }
 
-// --- 3. the declared configuration ----------------------------------------
+// --- 4. the declared configuration ----------------------------------------
 
 // configFieldNames is what the host is told this plugin accepts, in order. The
 // host renders these, so a rename is a user-visible change to a YAML key and a
 // removal silently stops the field being offered.
+//
+// This pins names, not descriptions. The descriptions are prose shown to an
+// operator and they drift like any other prose -- two of them were wrong about
+// roles until the commit that added this file's sibling fixes.
 var configFieldNames = []string{
 	"role",
 	"store_dir",
