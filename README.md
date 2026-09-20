@@ -122,7 +122,7 @@ bash scripts/build.sh
 ```bash
 install -d /srv/cpa/plugins/linux/amd64
 install -m 0755 build/linux/amd64/codex-turn-state.so \
-  /srv/cpa/plugins/linux/amd64/codex-turn-state-v0.1.0.so
+  /srv/cpa/plugins/linux/amd64/codex-turn-state-v0.2.0.so
 ```
 
 使用其他发布版本时同步调整文件名中的版本后缀；替换同一插件时避免在扫描目录中保留多个版本。
